@@ -1,0 +1,9 @@
+build/
+*.o
+*.dylib
+*.kext/
+.DS_Store
+xcuserdata/
+DerivedData/
+# extracted Apple binaries for reversing must never be committed
+reversing/
