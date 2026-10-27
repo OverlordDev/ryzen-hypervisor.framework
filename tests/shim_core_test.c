@@ -1,0 +1,345 @@
+/*
+ * shim_core_test.c - tests for shim/rhv_core.c with a fake kernel behind it. Also compares our copies of the API's
+ * constants (error codes, register numbers, capability numbers) with the real SDK header.
+ */
+#include <Hypervisor/Hypervisor.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "../shim/rhv_core.h"
+
+static int fails;
+#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
+
+/* ---- constants must equal Apple's ---- */
+_Static_assert(RHV_HV_SUCCESS == HV_SUCCESS, "HV_SUCCESS");
+_Static_assert(RHV_HV_ERROR == HV_ERROR, "HV_ERROR");
+_Static_assert(RHV_HV_BUSY == HV_BUSY, "HV_BUSY");
+_Static_assert(RHV_HV_BAD_ARGUMENT == HV_BAD_ARGUMENT, "HV_BAD_ARGUMENT");
+_Static_assert(RHV_HV_NO_RESOURCES == HV_NO_RESOURCES, "HV_NO_RESOURCES");
+_Static_assert(RHV_HV_NO_DEVICE == HV_NO_DEVICE, "HV_NO_DEVICE");
+_Static_assert(RHV_HV_DENIED == HV_DENIED, "HV_DENIED");
+_Static_assert(RHV_HV_UNSUPPORTED == HV_UNSUPPORTED, "HV_UNSUPPORTED");
+#define SAME(a, b) _Static_assert((int)(a) == (int)(b), #a)
+SAME(RHV_X86_RIP, HV_X86_RIP); SAME(RHV_X86_RFLAGS, HV_X86_RFLAGS); SAME(RHV_X86_RAX, HV_X86_RAX);
+SAME(RHV_X86_RSP, HV_X86_RSP); SAME(RHV_X86_R15, HV_X86_R15); SAME(RHV_X86_CS, HV_X86_CS); SAME(RHV_X86_GS, HV_X86_GS);
+SAME(RHV_X86_IDT_BASE, HV_X86_IDT_BASE); SAME(RHV_X86_GDT_LIMIT, HV_X86_GDT_LIMIT); SAME(RHV_X86_LDTR, HV_X86_LDTR);
+SAME(RHV_X86_LDT_AR, HV_X86_LDT_AR); SAME(RHV_X86_TR, HV_X86_TR); SAME(RHV_X86_TSS_AR, HV_X86_TSS_AR);
+SAME(RHV_X86_CR0, HV_X86_CR0); SAME(RHV_X86_CR1, HV_X86_CR1); SAME(RHV_X86_CR2, HV_X86_CR2); SAME(RHV_X86_CR3, HV_X86_CR3);
+SAME(RHV_X86_CR4, HV_X86_CR4); SAME(RHV_X86_DR0, HV_X86_DR0); SAME(RHV_X86_DR3, HV_X86_DR3); SAME(RHV_X86_DR4, HV_X86_DR4);
+SAME(RHV_X86_DR6, HV_X86_DR6); SAME(RHV_X86_DR7, HV_X86_DR7); SAME(RHV_X86_TPR, HV_X86_TPR); SAME(RHV_X86_XCR0, HV_X86_XCR0);
+SAME(RHV_X86_REGISTERS_MAX, HV_X86_REGISTERS_MAX);
+SAME(RHV_VMX_CAP_PINBASED, HV_VMX_CAP_PINBASED); SAME(RHV_VMX_CAP_PROCBASED, HV_VMX_CAP_PROCBASED);
+SAME(RHV_VMX_CAP_PROCBASED2, HV_VMX_CAP_PROCBASED2); SAME(RHV_VMX_CAP_ENTRY, HV_VMX_CAP_ENTRY);
+SAME(RHV_VMX_CAP_EXIT, HV_VMX_CAP_EXIT); SAME(RHV_VMX_CAP_BASIC, HV_VMX_CAP_BASIC);
+SAME(RHV_VMX_CAP_TRUE_PROCBASED, HV_VMX_CAP_TRUE_PROCBASED); SAME(RHV_VMX_CAP_MISC, HV_VMX_CAP_MISC);
+SAME(RHV_VMX_CAP_CR0_FIXED0, HV_VMX_CAP_CR0_FIXED0); SAME(RHV_VMX_CAP_CR4_FIXED1, HV_VMX_CAP_CR4_FIXED1);
+SAME(RHV_HV_MEMORY_MASK, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+
+/* ---- the fake kernel ---- */
+#define IOR_BAD   0xe00002c2
+#define IOR_BUSY  0xe00002d5
+#define IOR_UNSUP 0xe00002c7
+
+static struct {
+    int vmCreated, vmDestroyed, kicks, runs;
+    uint32_t createFlags;
+    struct { uint64_t uva, gpa, size; uint32_t flags; } map;
+    struct { uint64_t gpa, size; } unmap;
+    struct { uint64_t gpa, size; uint32_t flags; } prot;
+    uint64_t vmcs[0x10000];                 /* indexed by field encoding */
+    RHVRegs regs;
+    RHVFpuState fpu;
+    uint64_t msrs[16][2];                   /* msr number, value */
+    int msrCount;
+    int nativeMsr;                          /* last native op */
+    uint32_t nativeMsrNum;
+    uint64_t hostTsc, now;
+    unsigned long thread;
+    int failNext;
+} K;
+
+static int f_vm_create(void *c, uint32_t flags) { (void)c; K.vmCreated++; K.createFlags = flags; return 0; }
+static int f_vm_destroy(void *c) { (void)c; K.vmDestroyed++; return 0; }
+static int f_vm_map(void *c, uint64_t u, uint64_t g, uint64_t s, uint32_t f)
+{ (void)c; K.map.uva = u; K.map.gpa = g; K.map.size = s; K.map.flags = f; return s == 0 ? IOR_BAD : (g == 0x7000 ? IOR_BUSY : 0); }
+static int f_vm_unmap(void *c, uint64_t g, uint64_t s) { (void)c; K.unmap.gpa = g; K.unmap.size = s; return 0; }
+static int f_vm_protect(void *c, uint64_t g, uint64_t s, uint32_t f) { (void)c; K.prot.gpa = g; K.prot.size = s; K.prot.flags = f; return 0xe00002f0; }
+static int f_vmcs_read(void *c, uint32_t f, uint64_t *v) { (void)c; if (f >= 0x10000) return IOR_BAD; *v = K.vmcs[f]; return 0; }
+static int f_vmcs_write(void *c, uint32_t f, uint64_t v) { (void)c; if (f >= 0x10000) return IOR_BAD; K.vmcs[f] = v; return 0; }
+static int f_get_regs(void *c, RHVRegs *r) { (void)c; *r = K.regs; return 0; }
+static int f_set_regs(void *c, const RHVRegs *r) { (void)c; K.regs = *r; return 0; }
+static int f_get_fpu(void *c, RHVFpuState *f) { (void)c; *f = K.fpu; return 0; }
+static int f_set_fpu(void *c, const RHVFpuState *f) { (void)c; if (f->xcr0 == 0) return IOR_BAD; K.fpu = *f; return 0; }
+static int f_msr(void *c, uint32_t op, uint32_t msr, uint64_t value, uint64_t *out)
+{
+    (void)c;
+    if (msr == 0x1B) return IOR_BAD;
+    if (op == RHV_MSR_NATIVE_ENABLE || op == RHV_MSR_NATIVE_DISABLE) { K.nativeMsr = (int)op; K.nativeMsrNum = msr; return 0; }
+    for (int i = 0; i < K.msrCount; i++)
+        if (K.msrs[i][0] == msr) {
+            if (op == RHV_MSR_READ) *out = K.msrs[i][1]; else K.msrs[i][1] = value;
+            return 0;
+        }
+    if (op == RHV_MSR_WRITE) { K.msrs[K.msrCount][0] = msr; K.msrs[K.msrCount][1] = value; K.msrCount++; return 0; }
+    *out = 0;
+    return 0;
+}
+static int f_run(void *c, RHVExit *e) { (void)c; K.runs++; K.now += 1000; e->reason = RHV_EXIT_HLT; return K.failNext ? (int)0xe00002d8 : 0; }
+static int f_kick(void *c) { (void)c; K.kicks++; return 0; }
+static uint64_t f_now(void *c) { (void)c; return K.now; }
+static uint64_t f_tsc(void *c) { (void)c; return K.hostTsc; }
+static unsigned long f_thread(void *c) { (void)c; return K.thread; }
+
+static void fresh(void)
+{
+    memset(&K, 0, sizeof(K));
+    K.fpu.xcr0 = 1;
+    K.fpu.size = 832;
+    K.thread = 1;
+    RhvBackend b = { NULL, f_vm_create, f_vm_destroy, f_vm_map, f_vm_unmap, f_vm_protect, f_vmcs_read, f_vmcs_write,
+                     f_get_regs, f_set_regs, f_get_fpu, f_set_fpu, f_msr, f_run, f_kick, f_now, f_tsc, f_thread };
+    rhv_core_init(&b);
+}
+
+static uint32_t makeVcpu(void)
+{
+    uint32_t v = 99;
+    CHECK(rhv_vm_create(0) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_create(&v, 0) == RHV_HV_SUCCESS);
+    return v;
+}
+
+static void testLifecycle(void)
+{
+    fresh();
+    uint32_t v = 0;
+    uint64_t x;
+    /* Nothing works without a VM. */
+    CHECK(rhv_vcpu_create(&v, 0) == RHV_HV_NO_DEVICE);
+    CHECK(rhv_vm_map(0x1000, 0, 4096, 7) == RHV_HV_NO_DEVICE);
+    CHECK(rhv_vm_destroy() == RHV_HV_NO_DEVICE);
+    CHECK(rhv_vcpu_read_register(0, RHV_X86_RIP, &x) == RHV_HV_NO_DEVICE);
+
+    CHECK(rhv_vm_create(0) == RHV_HV_SUCCESS);
+    CHECK(K.vmCreated == 1 && (K.createFlags & RHV_VMCREATE_VMX) && (K.createFlags & RHV_VMCREATE_NO_RAM));
+    CHECK(rhv_vm_create(0) == RHV_HV_BUSY && K.vmCreated == 1);                    /* one VM per process */
+
+    CHECK(rhv_vcpu_create(NULL, 0) == RHV_HV_BAD_ARGUMENT);
+    CHECK(rhv_vcpu_create(&v, 8) == RHV_HV_BAD_ARGUMENT);                           /* unknown option bits */
+    CHECK(rhv_vcpu_create(&v, 0) == RHV_HV_SUCCESS && v == 0);
+    uint32_t v2;
+    CHECK(rhv_vcpu_create(&v2, 0) == RHV_HV_NO_RESOURCES);                          /* one vCPU */
+    CHECK(rhv_vm_destroy() == RHV_HV_BUSY);                                         /* vCPU still there */
+    CHECK(rhv_vcpu_read_register(5, RHV_X86_RIP, &x) == RHV_HV_BAD_ARGUMENT);       /* wrong vCPU id */
+    CHECK(rhv_vcpu_destroy(0) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_destroy(0) == RHV_HV_BAD_ARGUMENT);
+    CHECK(rhv_vm_destroy() == RHV_HV_SUCCESS && K.vmDestroyed == 1);
+    CHECK(rhv_vm_destroy() == RHV_HV_NO_DEVICE);
+    CHECK(rhv_vm_create(0) == RHV_HV_SUCCESS);                                      /* and again */
+}
+
+static void testMemory(void)
+{
+    fresh();
+    CHECK(rhv_vm_create(0) == RHV_HV_SUCCESS);
+    CHECK(rhv_vm_map(0xabc000, 0x100000, 0x2000, 3) == RHV_HV_SUCCESS);
+    CHECK(K.map.uva == 0xabc000 && K.map.gpa == 0x100000 && K.map.size == 0x2000 && K.map.flags == 3);
+    CHECK(rhv_vm_map(0xabc000, 0, 4096, 8) == RHV_HV_BAD_ARGUMENT);                 /* HV_MEMORY_UEXEC et al. */
+    CHECK(rhv_vm_map(0xabc000, 0, 0, 7) == RHV_HV_BAD_ARGUMENT);                    /* kernel BadArgument */
+    CHECK(rhv_vm_map(0xabc000, 0x7000, 4096, 7) == RHV_HV_BUSY);                    /* kernel Busy */
+    CHECK(rhv_vm_unmap(0x100000, 0x1000) == RHV_HV_SUCCESS && K.unmap.gpa == 0x100000 && K.unmap.size == 0x1000);
+    CHECK(rhv_vm_protect(0x100000, 0x1000, 1) == RHV_HV_BAD_ARGUMENT && K.prot.flags == 1);   /* kernel NotFound */
+    CHECK(rhv_vm_protect(0x100000, 0x1000, 16) == RHV_HV_BAD_ARGUMENT);
+}
+
+static void testRegisters(void)
+{
+    fresh();
+    uint32_t v = makeVcpu();
+    uint64_t x;
+
+    /* General purpose registers go through RHVRegs, each to its own slot. */
+    for (uint32_t r = RHV_X86_RIP; r <= RHV_X86_R15; r++)
+        CHECK(rhv_vcpu_write_register(v, r, 0x1000 + r) == RHV_HV_SUCCESS);
+    CHECK(K.regs.rip == 0x1000 && K.regs.rflags == 0x1001 && K.regs.rax == 0x1002 && K.regs.rcx == 0x1003 &&
+          K.regs.rdx == 0x1004 && K.regs.rbx == 0x1005 && K.regs.rsi == 0x1006 && K.regs.rdi == 0x1007 &&
+          K.regs.rsp == 0x1008 && K.regs.rbp == 0x1009 && K.regs.r8 == 0x100a && K.regs.r15 == 0x1011);
+    for (uint32_t r = RHV_X86_RIP; r <= RHV_X86_R15; r++)
+        CHECK(rhv_vcpu_read_register(v, r, &x) == RHV_HV_SUCCESS && x == 0x1000 + r);
+
+    /* Writing one register must not disturb the others. */
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_RAX, 0xAA) == RHV_HV_SUCCESS && K.regs.rbx == 0x1005 && K.regs.rax == 0xAA);
+
+    /* Everything else is a VMCS (or extension) field, each to its own encoding. */
+    struct { uint32_t reg, field; } map[] = {
+        { RHV_X86_CS, 0x802 }, { RHV_X86_SS, 0x804 }, { RHV_X86_DS, 0x806 }, { RHV_X86_ES, 0x800 }, { RHV_X86_FS, 0x808 },
+        { RHV_X86_GS, 0x80a }, { RHV_X86_IDT_BASE, 0x6818 }, { RHV_X86_IDT_LIMIT, 0x4812 }, { RHV_X86_GDT_BASE, 0x6816 },
+        { RHV_X86_GDT_LIMIT, 0x4810 }, { RHV_X86_LDTR, 0x80c }, { RHV_X86_LDT_BASE, 0x6812 }, { RHV_X86_LDT_LIMIT, 0x480c },
+        { RHV_X86_LDT_AR, 0x4820 }, { RHV_X86_TR, 0x80e }, { RHV_X86_TSS_BASE, 0x6814 }, { RHV_X86_TSS_LIMIT, 0x480e },
+        { RHV_X86_TSS_AR, 0x4822 }, { RHV_X86_CR0, 0x6800 }, { RHV_X86_CR3, 0x6802 }, { RHV_X86_CR4, 0x6804 },
+        { RHV_X86_CR2, 0xF000 }, { RHV_X86_DR0, 0xF010 }, { RHV_X86_DR1, 0xF012 }, { RHV_X86_DR2, 0xF014 },
+        { RHV_X86_DR3, 0xF016 }, { RHV_X86_DR6, 0xF002 }, { RHV_X86_DR7, 0x681a }, { RHV_X86_TPR, 0xF004 },
+    };
+    for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+        CHECK(rhv_core_register_field(map[i].reg) == map[i].field);
+        CHECK(rhv_vcpu_write_register(v, map[i].reg, 0x5000 + i) == RHV_HV_SUCCESS);
+        CHECK(K.vmcs[map[i].field] == 0x5000 + i);
+        CHECK(rhv_vcpu_read_register(v, map[i].reg, &x) == RHV_HV_SUCCESS && x == 0x5000 + i);
+    }
+    /* DR4/DR5 alias DR6/DR7. */
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_DR4, 0xD6) == RHV_HV_SUCCESS && K.vmcs[0xF002] == 0xD6);
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_DR5, &x) == RHV_HV_SUCCESS && x == K.vmcs[0x681a]);
+    /* Registers the hardware does not have. */
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_CR1, &x) == RHV_HV_BAD_ARGUMENT);
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_CR1, 0) == RHV_HV_BAD_ARGUMENT);
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_REGISTERS_MAX, &x) == RHV_HV_BAD_ARGUMENT);
+    CHECK(rhv_vcpu_read_register(v, 9999, &x) == RHV_HV_BAD_ARGUMENT);
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_RIP, NULL) == RHV_HV_BAD_ARGUMENT);
+
+    /* XCR0 is in the FPU state. */
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_XCR0, &x) == RHV_HV_SUCCESS && x == 1);
+    uint64_t bv = 7;
+    memcpy(K.fpu.area + 512, &bv, 8);                      /* the saved image says AVX state is in use */
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_XCR0, 7) == RHV_HV_SUCCESS && K.fpu.xcr0 == 7);
+    memcpy(&bv, K.fpu.area + 512, 8);
+    CHECK(bv == 7);
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_XCR0, 3) == RHV_HV_SUCCESS);
+    memcpy(&bv, K.fpu.area + 512, 8);
+    CHECK(bv == 3);                                        /* AVX no longer marked in use */
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_XCR0, 0) == RHV_HV_BAD_ARGUMENT);   /* kernel refuses */
+}
+
+static void testFpuMsrVmcs(void)
+{
+    fresh();
+    uint32_t v = makeVcpu();
+    uint8_t buf[1024];
+    for (int i = 0; i < 832; i++) K.fpu.area[i] = (uint8_t)i;
+    CHECK(rhv_vcpu_read_fpstate(v, buf, 831) == RHV_HV_BAD_ARGUMENT);              /* buffer too small */
+    CHECK(rhv_vcpu_read_fpstate(v, NULL, 1024) == RHV_HV_BAD_ARGUMENT);
+    memset(buf, 0, sizeof(buf));
+    CHECK(rhv_vcpu_read_fpstate(v, buf, sizeof(buf)) == RHV_HV_SUCCESS);
+    CHECK(memcmp(buf, K.fpu.area, 832) == 0 && buf[832] == 0);                      /* exactly size bytes */
+    for (int i = 0; i < 832; i++) buf[i] = (uint8_t)(255 - (i & 0xFF));
+    memset(buf + 512, 0, 64);                                                       /* a valid, empty header */
+    CHECK(rhv_vcpu_write_fpstate(v, buf, 100) == RHV_HV_BAD_ARGUMENT);
+    CHECK(rhv_vcpu_write_fpstate(v, buf, 832) == RHV_HV_SUCCESS && memcmp(K.fpu.area, buf, 832) == 0);
+
+    uint64_t x = 0;
+    CHECK(rhv_vcpu_write_msr(v, 0xC0000082, 0xdead) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_read_msr(v, 0xC0000082, &x) == RHV_HV_SUCCESS && x == 0xdead);
+    CHECK(rhv_vcpu_read_msr(v, 0x1B, &x) == RHV_HV_BAD_ARGUMENT);                   /* kernel refuses unknown MSRs */
+    CHECK(rhv_vcpu_enable_native_msr(v, 0xC0000081, 1) == RHV_HV_SUCCESS && K.nativeMsr == RHV_MSR_NATIVE_ENABLE && K.nativeMsrNum == 0xC0000081);
+    CHECK(rhv_vcpu_enable_native_msr(v, 0xC0000081, 0) == RHV_HV_SUCCESS && K.nativeMsr == RHV_MSR_NATIVE_DISABLE);
+
+    CHECK(rhv_vmx_vcpu_write_vmcs(v, 0x4002, 0x8401E172) == RHV_HV_SUCCESS);
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x4002, &x) == RHV_HV_SUCCESS && x == 0x8401E172);
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0xFFFFF, &x) == RHV_HV_BAD_ARGUMENT);          /* kernel refuses */
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x4002, NULL) == RHV_HV_BAD_ARGUMENT);
+
+    CHECK(rhv_vcpu_flush(v) == RHV_HV_SUCCESS && rhv_vcpu_invalidate_tlb(v) == RHV_HV_SUCCESS);
+    K.hostTsc = 1000;
+    CHECK(rhv_vm_sync_tsc(5000) == RHV_HV_SUCCESS && K.vmcs[0x2010] == 4000);       /* guest TSC = host TSC + 4000 */
+}
+
+static void *otherThread(void *arg)
+{
+    int *results = arg;
+    uint64_t x;
+    K.thread = 2;                                          /* now the "calling thread" is a different one */
+    results[0] = rhv_vcpu_run(0);
+    results[1] = rhv_vcpu_read_register(0, RHV_X86_RIP, &x);
+    uint32_t v = 0;
+    results[2] = rhv_vcpu_interrupt(&v, 1);                /* this one is allowed from anywhere */
+    return NULL;
+}
+
+static void testRunAndThreads(void)
+{
+    fresh();
+    uint32_t v = makeVcpu();
+    CHECK(rhv_vcpu_run(v) == RHV_HV_SUCCESS && K.runs == 1);
+    uint64_t t = 0;
+    CHECK(rhv_vcpu_get_exec_time(v, &t) == RHV_HV_SUCCESS && t == 1000);
+    CHECK(rhv_vcpu_run(v) == RHV_HV_SUCCESS && rhv_vcpu_get_exec_time(v, &t) == RHV_HV_SUCCESS && t == 2000);
+    K.failNext = 1;
+    CHECK(rhv_vcpu_run(v) == RHV_HV_NO_DEVICE);            /* kernel NotReady */
+    K.failNext = 0;
+
+    /* hv_vcpu_interrupt arguments. */
+    uint32_t ids[2] = { 0, 0 }, bad = 3;
+    CHECK(rhv_vcpu_interrupt(ids, 2) == RHV_HV_SUCCESS && K.kicks == 1);
+    CHECK(rhv_vcpu_interrupt(&bad, 1) == RHV_HV_BAD_ARGUMENT);
+    CHECK(rhv_vcpu_interrupt(NULL, 1) == RHV_HV_BAD_ARGUMENT && rhv_vcpu_interrupt(ids, 0) == RHV_HV_BAD_ARGUMENT);
+
+    /* vCPU calls belong to the creating thread; hv_vcpu_interrupt does not. */
+    int res[3] = { 0, 0, 0 };
+    pthread_t th;
+    pthread_create(&th, NULL, otherThread, res);
+    pthread_join(th, NULL);
+    CHECK(res[0] == RHV_HV_BAD_ARGUMENT);
+    CHECK(res[1] == RHV_HV_BAD_ARGUMENT);
+    CHECK(res[2] == RHV_HV_SUCCESS);
+    K.thread = 1;
+    CHECK(rhv_vcpu_run(v) == RHV_HV_SUCCESS);
+}
+
+static void testErrorMapping(void)
+{
+    CHECK(rhv_hv_from_ioreturn(0) == RHV_HV_SUCCESS);
+    CHECK(rhv_hv_from_ioreturn((int)0xe00002bd) == RHV_HV_NO_RESOURCES);
+    CHECK(rhv_hv_from_ioreturn((int)0xe00002c1) == RHV_HV_DENIED);
+    CHECK(rhv_hv_from_ioreturn((int)0xe00002c2) == RHV_HV_BAD_ARGUMENT);
+    CHECK(rhv_hv_from_ioreturn((int)0xe00002c7) == RHV_HV_UNSUPPORTED);
+    CHECK(rhv_hv_from_ioreturn((int)0xe00002d5) == RHV_HV_BUSY);
+    CHECK(rhv_hv_from_ioreturn((int)0xe00002c0) == RHV_HV_NO_DEVICE);
+    CHECK(rhv_hv_from_ioreturn((int)0xe0000999) == RHV_HV_ERROR);
+    CHECK(rhv_hv_from_ioreturn(-1) == RHV_HV_ERROR);
+}
+
+static void testCapabilities(void)
+{
+    uint64_t v;
+    CHECK(rhv_vmx_read_capability(999, &v) == RHV_HV_BAD_ARGUMENT);
+    CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_PINBASED, NULL) == RHV_HV_BAD_ARGUMENT);
+
+    /* Every control capability: the bits that must be 1 must also be allowed to be 1. */
+    for (uint32_t c = RHV_VMX_CAP_PINBASED; c <= RHV_VMX_CAP_TRUE_EXIT; c++) {
+        if (c == RHV_VMX_CAP_BASIC)
+            continue;
+        CHECK(rhv_vmx_read_capability(c, &v) == RHV_HV_SUCCESS);
+        uint32_t must1 = (uint32_t)v, may1 = (uint32_t)(v >> 32);
+        CHECK((must1 & ~may1) == 0);
+    }
+
+    /* The way QEMU's cap2ctrl builds controls from them: (wanted | must1) & may1. */
+    CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_PROCBASED, &v) == RHV_HV_SUCCESS);
+    uint32_t wanted = (1u << 7) | (1u << 10) | (1u << 3) | (1u << 21) | (1u << 22);      /* HLT MWAIT TSC_OFFSET TPR_SHADOW NMI_WINDOW */
+    uint32_t ctl = (wanted | (uint32_t)v) & (uint32_t)(v >> 32);
+    CHECK((ctl & (1u << 7)) && (ctl & (1u << 10)) && (ctl & (1u << 3)));                  /* what we implement: kept */
+    CHECK(!(ctl & (1u << 21)) && !(ctl & (1u << 22)));                                    /* TPR shadow, NMI window: dropped */
+    CHECK(!(ctl & (1u << 15)) && !(ctl & (1u << 16)));                                    /* CR3 exiting is not forced */
+    CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_PROCBASED2, &v) == RHV_HV_SUCCESS);
+    CHECK(!(((uint32_t)(v >> 32)) & (1u << 0)));                                          /* no APIC virtualization */
+    CHECK(((uint32_t)(v >> 32)) & (1u << 7));                                             /* unrestricted guest */
+    CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_PINBASED, &v) == RHV_HV_SUCCESS);
+    CHECK(!(((uint32_t)(v >> 32)) & (1u << 6)));                                          /* no preemption timer */
+    CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_CR4_FIXED1, &v) == RHV_HV_SUCCESS && !(v & (1u << 13)));   /* VMXE is reserved on AMD */
+    CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_CR4_FIXED0, &v) == RHV_HV_SUCCESS && v == 0);
+}
+
+int main(void)
+{
+    testLifecycle();
+    testMemory();
+    testRegisters();
+    testFpuMsrVmcs();
+    testRunAndThreads();
+    testErrorMapping();
+    testCapabilities();
+    if (fails) { printf("shim_core_test: %d FAILED\n", fails); return 1; }
+    printf("shim_core_test: OK\n");
+    return 0;
+}

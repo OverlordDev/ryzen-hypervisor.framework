@@ -1,6 +1,7 @@
 #include <IOKit/IOLib.h>
 
 #include "KernelDecls.hpp"
+#include "MsrMap.hpp"
 #include "X86.hpp"
 #include "Log.hpp"
 #include "SVM.hpp"
@@ -146,6 +147,7 @@ bool com_overlorddev_RyzenHVVm::init()
     fGuestXcr0     = rhv::fpu::XCR0_X87;
     fXcr0Supported = 0;
     fFpuSize       = 0;
+    fKick          = 0;
     fFirstRun    = true;
     fHaveNextRip = false;
 
@@ -570,6 +572,11 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
     bool timeslice = false;
 
     for (;;) {
+        if (fKick) {                  /* hv_vcpu_interrupt from another thread */
+            fKick = 0;
+            timeslice = true;
+            break;
+        }
         v->control.exitCode = 0;
         v->control.tlbCtl   = TLB_FLUSH_ALL;
         v->control.clean    = 0;      /* every field is dirty, we never use clean bits yet */
@@ -612,7 +619,29 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             rhv::fpu::xsetbv0(guestX);
         rhv::fpu::xrstor(fGuestFpu.va, guestX);
 
+        /*
+         * Debug registers: VMRUN swaps the guest's DR6/DR7 through the VMCB but neither DR0-DR3 nor the host's own
+         * values (a debugger may have set breakpoints on the calling process). Swap them by hand in VMX mode, where
+         * the client lets the guest use them; in the raw modes every DR access is intercepted.
+         */
+        uint64_t hostDr[6] = { 0, 0, 0, 0, 0, 0 };
+        if (fVmx) {
+            hostDr[0] = rhv_read_dr(0); hostDr[1] = rhv_read_dr(1); hostDr[2] = rhv_read_dr(2);
+            hostDr[3] = rhv_read_dr(3); hostDr[4] = rhv_read_dr(6); hostDr[5] = rhv_read_dr(7);
+            rhv_write_dr(7, 0);                       /* no breakpoint can fire while the registers change */
+            for (unsigned i = 0; i < 4; i++)
+                rhv_write_dr(i, fVmcs.dr(i));
+        }
+
         rhv_svm_vmrun(&fGprs, fVmcb.pa, fHostVmcb.pa);
+
+        if (fVmx) {
+            for (unsigned i = 0; i < 4; i++)
+                fVmcs.setDr(i, rhv_read_dr(i));
+            rhv_write_dr(7, 0);
+            rhv_write_dr(0, hostDr[0]); rhv_write_dr(1, hostDr[1]); rhv_write_dr(2, hostDr[2]);
+            rhv_write_dr(3, hostDr[3]); rhv_write_dr(6, hostDr[4]); rhv_write_dr(7, hostDr[5]);
+        }
 
         rhv::fpu::xsave(fGuestFpu.va, guestX);
         if (guestX != hostX)
@@ -629,6 +658,16 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 
         code = v->control.exitCode;
         RHV_STAT_INC(vmExits);
+
+        /*
+         * The guest executed an SVM instruction (VMRUN, VMLOAD, VMSAVE, STGI, CLGI, SKINIT). A Hypervisor.framework
+         * client's guest has no such instructions, so what it would see on Intel with VMX off is #UD: inject that
+         * and let the guest handle it.
+         */
+        if (fVmx && (code == 0x80 || (code >= 0x82 && code <= 0x86))) {
+            v->control.eventInj = (1u << 31) | (3u << 8) | 6;
+            continue;
+        }
 
         if (code == EXIT_INTR || code == EXIT_NMI) {
             /* An event that was being delivered when the host interrupt came in must be injected again. */
@@ -650,6 +689,8 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         bzero(out, sizeof(*out));
         if (timeslice) {
             out->reason = RHV_EXIT_TIMESLICE;
+            if (fVmx)
+                fVmcs.recordSynthetic(rhv::vmx::VMX_EXT_INTR);
         } else {
             out->reason   = classify(code);
             if (out->reason == RHV_EXIT_NPF)
@@ -681,6 +722,54 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         }
     }
 
+    IOLockUnlock(fLock);
+    return rc;
+}
+
+IOReturn com_overlorddev_RyzenHVVm::msrOp(uint32_t op, uint32_t msrNum, uint64_t value, uint64_t *out)
+{
+    using namespace rhv::msr;
+    if (!fVmx)
+        return kIOReturnUnsupported;
+    Info mi = info(msrNum);
+    if (mi.kind == K_UNKNOWN)
+        return kIOReturnBadArgument;
+
+    IOReturn rc = kIOReturnSuccess;
+    IOLockLock(fLock);
+    switch (op) {
+    case RHV_MSR_READ: {
+        uint64_t tsc = 0;
+        if (mi.kind == K_TSC) {
+            uint32_t lo, hi;
+            __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+            tsc = ((uint64_t)hi << 32) | lo;
+        }
+        *out = 0;
+        if (fVmcs.readMsr(msrNum, tsc, out) != rhv::vmx::R_OK)
+            rc = kIOReturnBadArgument;
+        break;
+    }
+    case RHV_MSR_WRITE: {
+        uint64_t tsc = 0;
+        if (mi.kind == K_TSC) {
+            uint32_t lo, hi;
+            __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+            tsc = ((uint64_t)hi << 32) | lo;
+        }
+        if (fVmcs.writeMsr(msrNum, tsc, value) != rhv::vmx::R_OK)
+            rc = kIOReturnBadArgument;
+        break;
+    }
+    case RHV_MSR_NATIVE_ENABLE:
+    case RHV_MSR_NATIVE_DISABLE:
+        /* The guest EFER must keep SVME set, so it can never be written without an exit. */
+        if (mi.kind == K_EFER || !setNative((uint8_t *)fMsrpm.va, msrNum, op == RHV_MSR_NATIVE_ENABLE))
+            rc = kIOReturnBadArgument;
+        break;
+    default:
+        rc = kIOReturnBadArgument;
+    }
     IOLockUnlock(fLock);
     return rc;
 }
@@ -724,6 +813,9 @@ IOReturn com_overlorddev_RyzenHVVm::vmcsWrite(uint32_t field, uint64_t value)
 {
     if (!fVmx)
         return kIOReturnUnsupported;
+    /* MOV to DR0-DR3 faults on a non-canonical address, and the kext loads these in kernel mode. */
+    if (field >= rhv::vmx::X_DR0 && field <= rhv::vmx::X_DR3 && (uint64_t)(((int64_t)(value << 16)) >> 16) != value)
+        return kIOReturnBadArgument;
     IOLockLock(fLock);
     rhv::vmx::Result r = fVmcs.write(field, value);
     if (r == rhv::vmx::R_OK && field == rhv::vmx::F_GUEST_RIP)

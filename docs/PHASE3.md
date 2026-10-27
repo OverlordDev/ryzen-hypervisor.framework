@@ -37,10 +37,17 @@ APIC/IOAPIC (скорее всего да, раз API появился) и не�
    - **Ещё нет:** `TSC_AUX`, MSR хоста и гостя (`KERNEL_GS_BASE`, `STAR` и т. д. переключаются `VMSAVE`/`VMLOAD`, остальные
      нужно проверить), несколько vCPU, `hv_vcpus_exit`/`hv_vcpu_interrupt` из другого потока, спекулятивные
      защиты (IBPB и др.), `hv_vcpu_enable_native_msr`.
-4. **Шим.** Все `hv_*` форвардятся в кекст, коды `hv_return_t`, ограничение «vCPU принадлежит потоку, создавшему его».
-   Сейчас в шиме 11 заглушек с трассировкой.
-5. **Свой дымовой тест на публичном API** (`hvf-smoke`): тот же бинарник работает на настоящем Intel Mac и на
-   Ryzen через шим. Он же регрессионный тест на будущее.
+4. **Шим (сделано и проверено на железе: `hvf-smoke` PASS через `scripts/run-with-shim.sh`).** `shim/rhv_core.c` — семантика API поверх абстрактного бэкенда
+   (проверяется на хосте с поддельным ядром: `tests/shim_core_test.c`, плюс сверка всех констант с SDK); `rhv_iokit.c` —
+   бэкенд к кексту; `hv_shim.c` — подмена через dyld interpose; `hv_stubs.inc` — сгенерированные заглушки
+   `HV_UNSUPPORTED` для всего остального x86 API, чтобы вызов не уходил в настоящий фреймворк.
+   Реализовано: `hv_vm_{create,destroy,map,unmap,protect,sync_tsc}`, `hv_vcpu_{create,destroy,run,run_until,interrupt,
+   read/write_register,read/write_fpstate,read/write_msr,enable_native_msr,enable_managed_msr,flush,invalidate_tlb,
+   get_exec_time}`, `hv_vmx_vcpu_{read,write}_vmcs`, `hv_vmx_read_capability`. Ограничения: одна ВМ на процесс, один
+   vCPU; ядро пока пускает только root; `hv_vcpu_interrupt` срабатывает на ближайшем прерывании хоста (до ~10 мс).
+   Запуск: `scripts/run-with-shim.sh ./build/hvf-smoke`.
+5. **Свой дымовой тест на публичном API** (`tools/hvf-smoke`, написан): тот же бинарник работает на настоящем Intel
+   Mac и на Ryzen через шим. Он же регрессионный тест на будущее.
 6. **QEMU.** Собрать из исходников с `--enable-hvf` (на машине нет brew), загрузить Linux.
 7. Встроенные APIC/IOAPIC/ATPIC и всё, что потребует Parallels.
 

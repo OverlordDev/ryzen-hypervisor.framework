@@ -1,7 +1,7 @@
 # Top-level build. Run on the Ryzentosh (needs Xcode command line tools).
 #
 #   make test     host-side unit tests, works on any OS with a C compiler
-#   make tools    build/rhv-info, build/rhv-guest-test, build/rhv-map-test, build/rhv-vmx-test, build/rhv-long-test
+#   make tools    build/rhv-info, build/rhv-guest-test, build/rhv-map-test, build/rhv-vmx-test, build/rhv-long-test, build/hvf-smoke
 #   make shim     build/libryzenhv.dylib
 #   make kext     build/RyzenHV.kext   (see kext/Makefile, best effort)
 #   make all      tools + shim + kext
@@ -31,6 +31,10 @@ test: | $(BUILD)
 	$(BUILD)/vmcs_state_test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -mavx2 -fsanitize=address,undefined -g -o $(BUILD)/fpu_state_test tests/fpu_state_test.cpp
 	$(BUILD)/fpu_state_test
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -g -o $(BUILD)/msr_map_test tests/msr_map_test.cpp
+	$(BUILD)/msr_map_test
+	$(CC) -arch x86_64 -Wall -Wextra -Werror -Wno-nullability-completeness -fsanitize=address,undefined -g -o $(BUILD)/shim_core_test tests/shim_core_test.c shim/rhv_core.c -framework Hypervisor
+	$(BUILD)/shim_core_test
 
 tools: | $(BUILD)
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-info tools/rhv-info/main.c \
@@ -43,10 +47,14 @@ tools: | $(BUILD)
 		-framework IOKit -framework CoreFoundation
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-long-test tools/rhv-long-test/main.c \
 		-framework IOKit -framework CoreFoundation
+	$(CC) -arch x86_64 -Wall -Wextra -Wno-nullability-completeness -O2 -o $(BUILD)/hvf-smoke tools/hvf-smoke/main.c \
+		-framework Hypervisor
+
+SHIM_SRC := shim/hv_shim.c shim/rhv_core.c shim/rhv_iokit.c
 
 shim: | $(BUILD)
-	$(CC) -arch x86_64 -Wall -Wextra -Wno-deprecated-declarations -O2 -dynamiclib \
-		-o $(BUILD)/libryzenhv.dylib shim/hv_shim.c -framework Hypervisor
+	$(CC) -arch x86_64 -Wall -Wextra -Wno-deprecated-declarations -Wno-nullability-completeness -O2 -dynamiclib \
+		-o $(BUILD)/libryzenhv.dylib $(SHIM_SRC) -framework Hypervisor -framework IOKit -framework CoreFoundation
 
 kext:
 	$(MAKE) -C kext

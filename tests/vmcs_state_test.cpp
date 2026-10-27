@@ -9,6 +9,7 @@
 
 using namespace rhv::vmx;
 using namespace rhv::vmcb;
+namespace msr = rhv::msr;
 
 namespace {
 
@@ -122,9 +123,9 @@ void testControls()
     /* Nothing asked: only what the host needs. */
     f.st.applyControls();
     const Control &c = f.vmcb.control;
-    uint32_t base3 = V3_INTR | V3_NMI | V3_SMI | V3_INIT | V3_CPUID | V3_INVD | V3_SHUTDOWN | V3_MSR;
-    CHECK((c.interceptVec3 & base3) == base3);
-    CHECK(!(c.interceptVec3 & (V3_HLT | V3_IOIO | V3_RDTSC | V3_PAUSE | V3_INVLPG | V3_VINTR)));
+    uint32_t base3 = V3_INTR | V3_NMI | V3_SMI | V3_INIT | V3_CPUID | V3_INVD | V3_SHUTDOWN | V3_MSR | V3_IOIO;
+    CHECK((c.interceptVec3 & base3) == base3);                  /* port I/O always goes to the client */
+    CHECK(!(c.interceptVec3 & (V3_HLT | V3_RDTSC | V3_PAUSE | V3_INVLPG | V3_VINTR)));
     CHECK((c.interceptVec4 & (V4_VMRUN | V4_VMMCALL | V4_VMLOAD | V4_VMSAVE | V4_STGI | V4_CLGI | V4_SKINIT)) ==
           (V4_VMRUN | V4_VMMCALL | V4_VMLOAD | V4_VMSAVE | V4_STGI | V4_CLGI | V4_SKINIT));
     CHECK(c.interceptVec4 & V4_XSETBV_BIT);
@@ -146,7 +147,7 @@ void testControls()
     f.st.write(0x4002, 0);
     f.st.write(0x401e, 0);
     f.st.applyControls();
-    CHECK(!(c.interceptVec3 & (V3_HLT | V3_IOIO | V3_PAUSE)) && !(c.interceptVec4 & (V4_MWAIT | V4_WBINVD)) && c.interceptDr == 0);
+    CHECK(!(c.interceptVec3 & (V3_HLT | V3_PAUSE)) && (c.interceptVec3 & V3_IOIO) && !(c.interceptVec4 & (V4_MWAIT | V4_WBINVD)) && c.interceptDr == 0);
 
     /* The client can never switch the host's own intercepts off. */
     f.st.write(0x4000, 0);                                      /* "no external-interrupt exiting" */
@@ -250,6 +251,46 @@ void testRecordExit()
     CHECK(rd(f, 0x4402) == VMX_HLT);
 }
 
+void testExtensionsAndMsrs()
+{
+    Fixture f;
+    uint64_t v;
+
+    /* CR2, DR6, TPR live in the VMCB; DR0-DR3 are the kext's. */
+    CHECK(f.st.write(X_CR2, 0xdeadbeef000ull) == R_OK && f.vmcb.save.cr2 == 0xdeadbeef000ull && rd(f, X_CR2) == 0xdeadbeef000ull);
+    CHECK(f.st.write(X_DR6, 0xFFFF0FF1ull) == R_OK && f.vmcb.save.dr6 == 0xFFFF0FF1ull);
+    f.vmcb.control.intCtl = INT_CTL_V_INTR_MASKING | 0x77;
+    CHECK(f.st.write(X_TPR, 0xB) == R_OK && (f.vmcb.control.intCtl & 0xFF) == 0xB && (f.vmcb.control.intCtl & INT_CTL_V_INTR_MASKING));
+    CHECK(rd(f, X_TPR) == 0xB);
+    for (unsigned i = 0; i < 4; i++) {
+        CHECK(f.st.write(X_DR0 + 2 * i, 0x1000 * (i + 1)) == R_OK);
+        CHECK(f.st.dr(i) == 0x1000 * (i + 1) && rd(f, X_DR0 + 2 * i) == 0x1000 * (i + 1));
+    }
+    CHECK(f.st.read(0xF006, &v) == R_INVALID_FIELD && f.st.read(0xF011, &v) == R_INVALID_FIELD && f.st.read(0xF018, &v) == R_INVALID_FIELD);
+
+    /* MSRs: native ones are VMCB slots. */
+    CHECK(f.st.writeMsr(msr::MSR_LSTAR, 0, 0xffffff8000001234ull) == R_OK && f.vmcb.save.lstar == 0xffffff8000001234ull);
+    uint64_t out = 0;
+    CHECK(f.st.readMsr(msr::MSR_LSTAR, 0, &out) == R_OK && out == 0xffffff8000001234ull);
+    CHECK(f.st.writeMsr(msr::MSR_KERNEL_GS_BASE, 0, 0x55) == R_OK && f.vmcb.save.kernelGsBase == 0x55);
+    CHECK(f.st.writeMsr(msr::MSR_FS_BASE, 0, 0x7000) == R_OK && f.vmcb.save.fs.base == 0x7000);
+    CHECK(f.st.writeMsr(msr::MSR_SYSENTER_CS, 0, 0x1FFFFFF08ull) == R_OK && f.vmcb.save.sysenterCs == 0xFFFFFF08);   /* 32-bit MSR */
+    CHECK(f.st.writeMsr(msr::MSR_EFER, 0, 0xD01) == R_OK && (f.vmcb.save.efer & EFER_SVME));
+    CHECK(f.st.readMsr(msr::MSR_EFER, 0, &out) == R_OK && out == 0xD01);
+    CHECK(f.st.writeMsr(0x1B, 0, 1) == R_INVALID_FIELD && f.st.readMsr(0xC0000103, 0, &out) == R_INVALID_FIELD);
+    /* The guest TSC is the host TSC plus the offset; writing it sets the offset. */
+    CHECK(f.st.writeMsr(msr::MSR_TSC, 1000, 5000) == R_OK && f.vmcb.control.tscOffset == 4000);
+    CHECK(f.st.readMsr(msr::MSR_TSC, 1500, &out) == R_OK && out == 5500);
+    CHECK(f.st.writeMsr(msr::MSR_TSC, 9000, 100) == R_OK && f.vmcb.control.tscOffset == (uint64_t)(100 - 9000));   /* wraps like hardware */
+
+    /* A synthetic exit looks like an external interrupt and clears the rest. */
+    f.vmcb.control.exitCode = EXIT_IOIO;
+    f.vmcb.control.exitInfo1 = ((uint64_t)0x3F8 << 16) | (1u << 4);
+    CHECK(f.st.recordExit(0) && rd(f, 0x4402) == VMX_IO);
+    f.st.recordSynthetic(VMX_EXT_INTR);
+    CHECK(rd(f, 0x4402) == VMX_EXT_INTR && rd(f, 0x6400) == 0 && rd(f, 0x440c) == 0 && rd(f, 0x4404) == 0);
+}
+
 } // namespace
 
 int main()
@@ -260,6 +301,7 @@ int main()
     testControls();
     testEventInjection();
     testRecordExit();
+    testExtensionsAndMsrs();
     if (fails) {
         printf("vmcs_state_test: %d FAILED\n", fails);
         return 1;

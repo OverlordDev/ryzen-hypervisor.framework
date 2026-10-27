@@ -4,6 +4,7 @@
  * When the Hypervisor.framework SDK headers are available (any Mac with Xcode) every field in
  * VmcsFields.def is compared against Apple's own constant of the same name.
  */
+#include <initializer_list>
 #include <stdio.h>
 #include <string.h>
 
@@ -105,6 +106,24 @@ void testMapField()
     }
     /* Read-only exit fields are all real fields. */
     CHECK(fieldIndex(0x4402) >= 0 && fieldIndex(0x6400) >= 0 && fieldIndex(0x2400) >= 0);
+}
+
+void testExtensionFields()
+{
+    CHECK(isExtField(X_CR2) && isExtField(X_DR6) && isExtField(X_TPR));
+    CHECK(isExtField(X_DR0) && isExtField(X_DR3));
+    CHECK(!isExtField(0xF001) && !isExtField(0xF006) && !isExtField(0xF018) && !isExtField(0x681e));
+    for (unsigned e : { (unsigned)X_CR2, (unsigned)X_DR6, (unsigned)X_TPR, (unsigned)X_DR0, (unsigned)X_DR3 }) {
+        CHECK(fieldIndex(e) == -1);                     /* never confused with an Intel field */
+        CHECK(fieldBytes(e) == 8);
+    }
+    StateMap m = mapField(X_CR2);   CHECK(m.kind == KIND_VMCB && m.vmcbOff == 0x400 + 0x240 && m.vmcbSize == 8);
+    m = mapField(X_DR6);            CHECK(m.kind == KIND_VMCB && m.vmcbOff == 0x400 + 0x168);
+    m = mapField(X_TPR);            CHECK(m.kind == KIND_VMCB && m.vmcbOff == 0x060 && m.vmcbSize == 1);
+    for (unsigned i = 0; i < 4; i++) {
+        m = mapField(X_DR0 + 2 * i);
+        CHECK(m.kind == KIND_EXT_DR && m.vmcbOff == i);
+    }
 }
 
 void testAccessRights()
@@ -212,6 +231,7 @@ int main()
 {
     testFieldList();
     testMapField();
+    testExtensionFields();
     testAccessRights();
     testExits();
     if (fails) {

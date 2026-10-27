@@ -48,14 +48,14 @@
 
 **Готово, когда:** `rhv-map-test` проходит на железе, а гость с paging (long mode) исполняет код из замапленной памяти.
 
-## Фаза 3: VMX-совместимость (в работе: этапы 1–2 пройдены на железе, см. `docs/PHASE3.md`)
+## Фаза 3: VMX-совместимость (в работе: этапы 1–5 пройдены на железе, дальше QEMU, см. `docs/PHASE3.md`)
 
 - [x] Таблица соответствия полей VMCS → VMCB, чтение/запись через `hv_vmx_vcpu_*` (в ядре: `VmcsRead`/`VmcsWrite`; `rhv-vmx-test` PASS)
 - [x] Синтез VMX exit reason и qualification (I/O, MSR, CPUID, HLT, EPT-нарушение, исключения, CR/DR)
 - [ ] Эмуляция `hv_vmx_read_capability`
 - [x] Инъекция прерываний (`event_inj`, окно прерываний), хост-прерывания доходят до ядра во время работы гостя; [ ] таймер, `hv_vcpu_interrupt` из другого потока
 - [x] x87/SSE/AVX и XCR0 гостя и хоста (`rhv-long-test`), long mode с paging
-- [ ] Шим форвардит все вызовы в кекст
+- [x] Шим форвардит основной API в кекст (`hvf-smoke` на публичном API PASS)
 
 **Готово, когда:** QEMU с `-accel hvf` грузит Linux до шелла.
 

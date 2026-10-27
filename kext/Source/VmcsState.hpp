@@ -16,6 +16,7 @@
 
 #include <string.h>
 
+#include "MsrMap.hpp"
 #include "VmxMap.hpp"
 
 namespace rhv {
@@ -115,19 +116,26 @@ static inline uint32_t eventInjFromVmx(uint32_t info, bool *isSoftware)
 
 class VmcsState {
 public:
-    VmcsState() : fVmcb(nullptr) { memset(fShadow, 0, sizeof(fShadow)); }
-    explicit VmcsState(rhv::vmcb::Vmcb *vmcb) : fVmcb(vmcb) { memset(fShadow, 0, sizeof(fShadow)); }
+    VmcsState() : fVmcb(nullptr) { memset(fShadow, 0, sizeof(fShadow)); memset(fDr, 0, sizeof(fDr)); }
+    explicit VmcsState(rhv::vmcb::Vmcb *vmcb) : fVmcb(vmcb) { memset(fShadow, 0, sizeof(fShadow)); memset(fDr, 0, sizeof(fDr)); }
 
     void attach(rhv::vmcb::Vmcb *vmcb) { fVmcb = vmcb; }
-    void reset() { memset(fShadow, 0, sizeof(fShadow)); }
+    void reset() { memset(fShadow, 0, sizeof(fShadow)); memset(fDr, 0, sizeof(fDr)); }
+
+    /* DR0-DR3 of the guest. The kext loads them into the CPU around VMRUN, VMRUN itself does not. */
+    uint64_t dr(unsigned i) const { return fDr[i & 3]; }
+    void     setDr(unsigned i, uint64_t v) { fDr[i & 3] = v; }
 
     Result read(uint32_t enc, uint64_t *out) const
     {
         int idx = fieldIndex(enc);
-        if (idx < 0)
+        if (idx < 0 && !isExtField(enc))
             return R_INVALID_FIELD;
         StateMap m = mapField(enc);
         switch (m.kind) {
+        case KIND_EXT_DR:
+            *out = fDr[m.vmcbOff];
+            return R_OK;
         case KIND_VMCB: {
             uint64_t v = loadBytes(m.vmcbOff, m.vmcbSize);
             *out = v & mask(fieldBytes(enc));
@@ -158,11 +166,14 @@ public:
     Result write(uint32_t enc, uint64_t value)
     {
         int idx = fieldIndex(enc);
-        if (idx < 0)
+        if (idx < 0 && !isExtField(enc))
             return R_INVALID_FIELD;
         StateMap m = mapField(enc);
         value &= mask(fieldBytes(enc));
         switch (m.kind) {
+        case KIND_EXT_DR:
+            fDr[m.vmcbOff] = value;
+            return R_OK;
         case KIND_VMCB:
             storeBytes(m.vmcbOff, m.vmcbSize, value);
             return R_OK;
@@ -210,7 +221,7 @@ public:
         if (cpu & CPU_RDPMC_EXIT)   v3 |= V3_RDPMC;
         if (cpu & CPU_RDTSC_EXIT)   v3 |= V3_RDTSC;
         if (cpu & CPU_PAUSE_EXIT)   v3 |= V3_PAUSE;
-        if (cpu & (CPU_IO_EXIT | CPU_IO_BITMAPS)) v3 |= V3_IOIO;   /* with bitmaps we treat every port as intercepted */
+        v3 |= V3_IOIO;      /* Hypervisor.framework always hands port I/O to the client, whatever CPU_BASED says */
         v3 |= V3_MSR;                                              /* all MSRs exit; see Vm::fMsrpm for native ones */
         if (cpu & CPU_MWAIT_EXIT)   v4 |= V4_MWAIT;
         if (cpu & CPU_MONITOR_EXIT) v4 |= V4_MONITOR;
@@ -289,6 +300,57 @@ public:
         return true;
     }
 
+    /*
+     * Guest MSR access for hv_vcpu_read_msr / hv_vcpu_write_msr: only MSRs the VMCB holds (MsrMap.hpp). `hostTsc` is
+     * the host's current TSC, needed for the TSC MSR. R_INVALID_FIELD for MSRs we do not keep.
+     */
+    Result readMsr(uint32_t msr, uint64_t hostTsc, uint64_t *out) const
+    {
+        msr::Info mi = msr::info(msr);
+        switch (mi.kind) {
+        case msr::K_VMCB:
+            *out = loadBytes(mi.vmcbOff, 8) & (mi.valueBits >= 64 ? ~0ull : ((1ull << mi.valueBits) - 1));
+            return R_OK;
+        case msr::K_EFER:
+            return read(F_GUEST_EFER, out);
+        case msr::K_TSC:
+            *out = hostTsc + fVmcb->control.tscOffset;
+            return R_OK;
+        default:
+            return R_INVALID_FIELD;
+        }
+    }
+
+    Result writeMsr(uint32_t msr, uint64_t hostTsc, uint64_t value)
+    {
+        msr::Info mi = msr::info(msr);
+        switch (mi.kind) {
+        case msr::K_VMCB:
+            storeBytes(mi.vmcbOff, 8, value & (mi.valueBits >= 64 ? ~0ull : ((1ull << mi.valueBits) - 1)));
+            return R_OK;
+        case msr::K_EFER:
+            return write(F_GUEST_EFER, value);
+        case msr::K_TSC:
+            fVmcb->control.tscOffset = value - hostTsc;
+            return R_OK;
+        default:
+            return R_INVALID_FIELD;
+        }
+    }
+
+    /*
+     * VmRun returned without a guest-caused exit (time slice over, or hv_vcpu_interrupt): to a Hypervisor.framework
+     * client that looks like an external-interrupt exit, which is what the real framework reports.
+     */
+    void recordSynthetic(uint32_t reason)
+    {
+        set(F_RO_EXIT_REASON, reason);
+        set(F_RO_QUALIFICATION, 0);
+        set(F_RO_INSTR_LEN, 0);
+        set(F_RO_IRQ_INFO, 0);
+        set(F_RO_IRQ_ERROR, 0);
+    }
+
 private:
     static uint64_t mask(unsigned bytes) { return bytes >= 8 ? ~0ull : ((1ull << (bytes * 8)) - 1); }
 
@@ -314,6 +376,7 @@ private:
 
     rhv::vmcb::Vmcb *fVmcb;
     uint64_t         fShadow[kNumFields];
+    uint64_t         fDr[4];
 };
 
 } // namespace vmx

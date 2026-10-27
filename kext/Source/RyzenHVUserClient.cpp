@@ -123,6 +123,10 @@ IOReturn com_overlorddev_RyzenHVUserClient::externalMethod(uint32_t selector,
         { (IOExternalMethodAction)&C::sVmGetFpu, 0, 0, 0, sizeof(RHVFpuState) },
         /* kRHVMethodVmSetFpu: struct in */
         { (IOExternalMethodAction)&C::sVmSetFpu, 0, sizeof(RHVFpuState), 0, 0 },
+        /* kRHVMethodVmMsr: 3 scalars in (op, msr, value), 1 scalar out */
+        { (IOExternalMethodAction)&C::sVmMsr, 3, 0, 1, 0 },
+        /* kRHVMethodVmKick */
+        { (IOExternalMethodAction)&C::sVmKick, 0, 0, 0, 0 },
     };
 
     static_assert(sizeof(kMethods) / sizeof(kMethods[0]) == kRHVMethodCount,
@@ -426,4 +430,30 @@ IOReturn com_overlorddev_RyzenHVUserClient::sVmSetFpu(OSObject *target, void *,
     IOReturn rc = vm->setFpu((const RHVFpuState *)args->structureInput);
     vm->release();
     return rc;
+}
+
+IOReturn com_overlorddev_RyzenHVUserClient::sVmMsr(OSObject *target, void *,
+                                                   IOExternalMethodArguments *args)
+{
+    RHV_ME();
+    RHV_ADMIN();
+    if (args->scalarInput[0] > 0xFF || args->scalarInput[1] > 0xFFFFFFFFull)
+        return kIOReturnBadArgument;
+    RHV_RETAIN_VM(vm);
+    uint64_t out = 0;
+    IOReturn rc = vm->msrOp((uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1], args->scalarInput[2], &out);
+    vm->release();
+    args->scalarOutput[0] = out;
+    return rc;
+}
+
+IOReturn com_overlorddev_RyzenHVUserClient::sVmKick(OSObject *target, void *,
+                                                    IOExternalMethodArguments *)
+{
+    RHV_ME();
+    RHV_ADMIN();
+    RHV_RETAIN_VM(vm);
+    vm->kick();
+    vm->release();
+    return kIOReturnSuccess;
 }

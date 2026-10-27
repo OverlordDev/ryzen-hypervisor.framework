@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define RHV_ABI_VERSION 6
+#define RHV_ABI_VERSION 7
 #define RHV_SERVICE_NAME "com_overlorddev_RyzenHV"
 #define RHV_MAX_CPUS 64
 
@@ -66,6 +66,14 @@ extern "C" {
  *                host's; area is the XSAVE standard format (the same layout hv_vcpu_read_fpstate returns), and
  *                `size` must equal what VmGetFpu reported. kIOReturnBadArgument otherwise.
  *                A client emulating the guest's XSETBV (VMX exit reason 55) sets xcr0 this way.
+ *
+ * Guest MSRs (VMX-mode VMs). Only MSRs the vCPU keeps: SYSENTER_*, STAR, LSTAR, CSTAR, SFMASK, KERNEL_GS_BASE,
+ * FS_BASE, GS_BASE, PAT, EFER and TSC. Everything else the client emulates itself from the MSR exits.
+ *   VmMsr        in: scalar[0] = RHV_MSR_*, scalar[1] = MSR number, scalar[2] = value (WRITE)
+ *                out: scalar[0] = value (READ)
+ *                kIOReturnBadArgument for an MSR the vCPU does not keep (and for NATIVE on EFER)
+ *   VmKick       no arguments. Makes a running VmRun (on another thread) return soon with RHV_EXIT_TIMESLICE, which a
+ *                VMX-mode client sees as an external-interrupt exit, like hv_vcpu_interrupt does. Does not wait.
  */
 enum {
     kRHVMethodGetInfo = 0,
@@ -86,6 +94,8 @@ enum {
     kRHVMethodVmcsWrite,
     kRHVMethodVmGetFpu,
     kRHVMethodVmSetFpu,
+    kRHVMethodVmMsr,
+    kRHVMethodVmKick,
     kRHVMethodCount
 };
 
@@ -93,6 +103,14 @@ enum {
 enum { kRHVMemGuestRam = 0 };
 
 #define RHV_GUEST_RAM_SIZE (1u << 20)   /* built-in RAM: 1 MiB at guest physical 0 */
+
+/* VmMsr operations. */
+enum {
+    RHV_MSR_READ           = 0,
+    RHV_MSR_WRITE          = 1,
+    RHV_MSR_NATIVE_ENABLE  = 2,   /* the guest accesses the MSR without exits, the value lives in the vCPU */
+    RHV_MSR_NATIVE_DISABLE = 3
+};
 
 /* Guest extended state. The area is the XSAVE standard format; `size` is the host's XSAVE size for its XCR0. */
 #define RHV_FPU_AREA_MAX 3072

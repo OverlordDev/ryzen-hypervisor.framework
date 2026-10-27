@@ -69,6 +69,9 @@ public:
     IOReturn vmcsWrite(uint32_t field, uint64_t value);
 
     /* Guest x87/SSE/AVX state and XCR0. */
+    IOReturn msrOp(uint32_t op, uint32_t msr, uint64_t value, uint64_t *out);
+    void     kick() { fKick = 1; }     /* no lock: called while another thread sits in run() */
+
     IOReturn getFpu(RHVFpuState *out);
     IOReturn setFpu(const RHVFpuState *in);
 
@@ -99,6 +102,7 @@ private:
     uint64_t                  fGuestXcr0;
     uint64_t                  fXcr0Supported;    /* CPUID.0xD.0 EDX:EAX */
     uint32_t                  fFpuSize;
+    volatile uint32_t         fKick;
     bool                      fVmx;
     uint64_t                  fPagesMapped;
     rhv::GuestGprs            fGprs;

@@ -38,4 +38,33 @@ static inline void rhv_wrmsr(uint32_t msr, uint64_t value)
                      : "c"(msr), "a"((uint32_t)value), "d"((uint32_t)(value >> 32)));
 }
 
+/* Debug registers. VMRUN loads and stores the guest's DR6 and DR7 but not DR0-DR3, and it does not keep the host's. */
+static inline uint64_t rhv_read_dr(unsigned n)
+{
+    uint64_t v = 0;
+    switch (n) {
+    case 0: __asm__ volatile("movq %%dr0, %0" : "=r"(v)); break;
+    case 1: __asm__ volatile("movq %%dr1, %0" : "=r"(v)); break;
+    case 2: __asm__ volatile("movq %%dr2, %0" : "=r"(v)); break;
+    case 3: __asm__ volatile("movq %%dr3, %0" : "=r"(v)); break;
+    case 6: __asm__ volatile("movq %%dr6, %0" : "=r"(v)); break;
+    case 7: __asm__ volatile("movq %%dr7, %0" : "=r"(v)); break;
+    default: break;
+    }
+    return v;
+}
+
+static inline void rhv_write_dr(unsigned n, uint64_t v)
+{
+    switch (n) {
+    case 0: __asm__ volatile("movq %0, %%dr0" : : "r"(v)); break;
+    case 1: __asm__ volatile("movq %0, %%dr1" : : "r"(v)); break;
+    case 2: __asm__ volatile("movq %0, %%dr2" : : "r"(v)); break;
+    case 3: __asm__ volatile("movq %0, %%dr3" : : "r"(v)); break;
+    case 6: __asm__ volatile("movq %0, %%dr6" : : "r"(v)); break;
+    case 7: __asm__ volatile("movq %0, %%dr7" : : "r"(v)); break;
+    default: break;
+    }
+}
+
 #endif /* RYZENHV_X86_HPP */

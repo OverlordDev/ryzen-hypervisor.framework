@@ -26,6 +26,8 @@ tools/rhv-info/           утилита: инфо, лог, счётчики, с
 tools/rhv-guest-test/     приёмочный тест фазы 1: гость печатает строку, делает CPUID, останавливается
 tools/rhv-map-test/       приёмочный тест фазы 2: память гостя = память процесса, protect/unmap, NPF
 tools/rhv-vmx-test/       фаза 3: гость ведётся через поля VMCS, как это делает клиент Hypervisor.framework
+tools/rhv-long-test/      фаза 3: 64-бит гость с paging, x87/SSE/AVX, прерывания хоста
+tools/hvf-smoke/          фаза 3: мини-VMM на ПУБЛИЧНОМ API Hypervisor.framework, работает через шим (scripts/run-with-shim.sh)
 scripts/                  collect-debug.sh (отчёт для разбора), install-to-efi.sh
 tests/host_test.c         unit-тесты чистых функций, запускаются где угодно
 docs/                     архитектура, roadmap, Ryzentosh, отладка, реверс

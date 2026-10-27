@@ -76,8 +76,22 @@ enum Kind : uint8_t {
     KIND_VMCB,         /* lives in a VMCB field: `vmcbOff`, `vmcbSize` */
     KIND_SEG_AR,       /* segment access rights, needs conversion */
     KIND_EFER,         /* guest EFER, SVME is kept set on the AMD side */
-    KIND_READONLY      /* exit information, written by the kext on each exit */
+    KIND_READONLY,     /* exit information, written by the kext on each exit */
+    KIND_EXT_DR        /* DR0-DR3: not in the VMCB, the kext swaps them around VMRUN; vmcbOff is the index */
 };
+
+/*
+ * Our own "fields" for guest state that Intel's VMCS does not have but Hypervisor.framework's register API does
+ * (hv_vcpu_read_register for CR2, DR0-DR3, DR6, TPR). The numbers are outside Intel's encoding space.
+ */
+enum : uint32_t {
+    X_CR2 = 0xF000, X_DR6 = 0xF002, X_TPR = 0xF004,
+    X_DR0 = 0xF010, X_DR1 = 0xF012, X_DR2 = 0xF014, X_DR3 = 0xF016
+};
+static inline bool isExtField(uint32_t enc)
+{
+    return enc == X_CR2 || enc == X_DR6 || enc == X_TPR || (enc >= X_DR0 && enc <= X_DR3 && !(enc & 1));
+}
 
 struct StateMap {
     Kind     kind;
@@ -137,6 +151,15 @@ static inline StateMap mapField(uint32_t enc)
     /* Controls that are a direct VMCB field. */
     case 0x2010: return { KIND_VMCB, RHV_CTL_OFF(tscOffset), 8 };      /* CTRL_TSC_OFFSET */
     case 0x4004: return { KIND_VMCB, RHV_CTL_OFF(interceptExc), 4 };   /* CTRL_EXC_BITMAP: bit n = vector n on both */
+
+    /* Registers the Hypervisor.framework register API has and the VMCS does not. */
+    case X_CR2: return { KIND_VMCB, RHV_SAVE_OFF(cr2), 8 };
+    case X_DR6: return { KIND_VMCB, RHV_SAVE_OFF(dr6), 8 };
+    case X_TPR: return { KIND_VMCB, RHV_CTL_OFF(intCtl), 1 };         /* V_TPR is the low byte of int_ctl */
+    case X_DR0: return { KIND_EXT_DR, 0, 8 };
+    case X_DR1: return { KIND_EXT_DR, 1, 8 };
+    case X_DR2: return { KIND_EXT_DR, 2, 8 };
+    case X_DR3: return { KIND_EXT_DR, 3, 8 };
 
     /* Exit information, set by the kext. */
     case 0x4402: case 0x4404: case 0x4406: case 0x4408: case 0x440a: case 0x440c: case 0x4400:
