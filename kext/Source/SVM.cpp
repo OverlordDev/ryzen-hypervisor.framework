@@ -33,6 +33,9 @@ IOBufferMemoryDescriptor *gHostSave[RHV_MAX_CPUS];
 uint64_t                  gHostSavePa[RHV_MAX_CPUS];
 uint32_t                  gNCpus;
 volatile SInt32           gActive;
+volatile SInt32           gSeen;      /* CPUs that ran probeAction */
+volatile SInt32           gMaxIndex;  /* highest cpu_number() seen */
+volatile bool             gReadMsrs = true;   /* set before the probe rendezvous */
 bool                      gSuspended;
 
 bool cpuUsable(const CpuProbe &p)
@@ -47,6 +50,9 @@ bool cpuUsable(const CpuProbe &p)
 void probeAction(void *)
 {
     int cpu = cpu_number();
+    OSIncrementAtomic(&gSeen);
+    if (cpu > gMaxIndex)
+        gMaxIndex = cpu;      /* every CPU runs this with interrupts off, so a plain store is enough */
     if (cpu < 0 || cpu >= RHV_MAX_CPUS)
         return;
 
@@ -77,6 +83,9 @@ void probeAction(void *)
         p.numAsids    = r[1];
         p.features    = r[3];
     }
+
+    if (!gReadMsrs)
+        return;
 
     if (p.svmSupported) {
         uint64_t vmcr = rhv_rdmsr(RHV_MSR_VM_CR);
@@ -187,18 +196,27 @@ uint32_t usableCount()
 namespace rhv {
 namespace svm {
 
-void probe(RHVInfo *out)
+void probe(RHVInfo *out, bool readMsrs)
 {
     bzero(gProbe, sizeof(gProbe));
+    gReadMsrs = readMsrs;
 
-    gNCpus = ml_get_max_cpus();
+    /*
+     * The CPU count is not exported to kexts (ml_get_max_cpus does not exist on Sequoia), so count
+     * the CPUs that take part in the rendezvous. Indices are contiguous from 0.
+     */
+    gSeen     = 0;
+    gMaxIndex = 0;
+    mp_rendezvous_no_intrs(probeAction, nullptr);
+    RHV_STAT_INC(probeRuns);
+
+    gNCpus = (uint32_t)gMaxIndex + 1;
+    if ((uint32_t)gSeen != gNCpus)
+        RHV_WARN("rendezvous ran on %d CPUs but the highest cpu_number is %d", (int)gSeen, (int)gMaxIndex);
     if (gNCpus > RHV_MAX_CPUS) {
         RHV_WARN("machine reports %u CPUs, only the first %u are handled", gNCpus, RHV_MAX_CPUS);
         gNCpus = RHV_MAX_CPUS;
     }
-
-    mp_rendezvous_no_intrs(probeAction, nullptr);
-    RHV_STAT_INC(probeRuns);
 
     bzero(out, sizeof(*out));
     out->abiVersion = RHV_ABI_VERSION;

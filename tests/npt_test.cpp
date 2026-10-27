@@ -330,6 +330,156 @@ void testAllocationFailure()
     }
 }
 
+/* A fake buffer: a list of physically contiguous runs, like IOMemoryDescriptor::getPhysicalSegment sees. */
+struct Run { uint64_t pa; uint64_t pages; };
+struct FakeBuf { const Run *runs; unsigned n; unsigned calls; };
+
+bool fakeSegment(void *c, uint64_t offset, uint64_t *pa, uint64_t *len)
+{
+    FakeBuf *b = static_cast<FakeBuf *>(c);
+    b->calls++;
+    uint64_t base = 0;
+    for (unsigned i = 0; i < b->n; i++) {
+        uint64_t bytes = b->runs[i].pages * 4096;
+        if (offset < base + bytes) {
+            *pa  = b->runs[i].pa + (offset - base);
+            *len = bytes - (offset - base);
+            return true;
+        }
+        base += bytes;
+    }
+    return false;
+}
+
+uint64_t expectedPa(const Run *runs, unsigned n, uint64_t offset)
+{
+    uint64_t base = 0;
+    for (unsigned i = 0; i < n; i++) {
+        uint64_t bytes = runs[i].pages * 4096;
+        if (offset < base + bytes)
+            return runs[i].pa + (offset - base);
+        base += bytes;
+    }
+    return ~0ull;
+}
+
+/* The bug this guards against: pages of a multi-page physical run landing at the wrong guest address. */
+void testMapRange()
+{
+    Fake f;
+    {
+        Table t(allocatorFor(&f));
+        CHECK(t.init());
+
+        /* Runs of 1, 2, 16, 3 and 7 pages at scattered physical addresses: 29 pages. */
+        const Run runs[] = { { 0x10000000, 1 }, { 0x30000000, 2 }, { 0x50000000, 16 }, { 0x20000000, 3 }, { 0x70000000, 7 } };
+        const unsigned n = sizeof(runs) / sizeof(runs[0]);
+        uint64_t total = 0;
+        for (unsigned i = 0; i < n; i++) total += runs[i].pages * 4096;
+        FakeBuf buf = { runs, n, 0 };
+
+        uint64_t mapped = 99;
+        CHECK(t.mapRange(0x100000, total, PERM_R | PERM_W, OWN1, fakeSegment, &buf, &mapped) == OK);
+        CHECK(mapped == total);
+        for (uint64_t off = 0; off < total; off += 4096) {
+            uint64_t h = 0;
+            uint32_t p = 0;
+            CHECK(t.lookup(0x100000 + off, &h, &p) == OWN1);
+            CHECK(h == expectedPa(runs, n, off));          /* every page where it belongs, none skipped */
+            CHECK(p == (PERM_R | PERM_W));
+            uint64_t hh;
+            uint32_t pp;
+            CHECK(hwWalk(t.rootPa(), 0x100000 + off, &hh, &pp) && hh == h);
+        }
+        CHECK(!t.isMapped(0x100000 + total));                /* and nothing beyond the end */
+        CHECK(t.mappedPages() == total / 4096);
+
+        /* The same range again is refused before anything changes. */
+        FakeBuf buf2 = { runs, n, 0 };
+        CHECK(t.mapRange(0x100000, total, PERM_R, OWN2, fakeSegment, &buf2, &mapped) == BUSY && mapped == 0);
+        CHECK(t.mapRange(0x100000 + 5 * 4096, 4096, PERM_R, OWN2, fakeSegment, &buf2, &mapped) == BUSY);
+        CHECK(t.lookup(0x100000, nullptr, nullptr) == OWN1);
+
+        /* Argument checks. */
+        CHECK(t.mapRange(0x100001, 4096, PERM_R, OWN2, fakeSegment, &buf2, &mapped) == BAD_ARG);
+        CHECK(t.mapRange(0x900000, 4097, PERM_R, OWN2, fakeSegment, &buf2, &mapped) == BAD_ARG);
+        CHECK(t.mapRange(0x900000, 0, PERM_R, OWN2, fakeSegment, &buf2, &mapped) == BAD_ARG);
+
+        /* The buffer is shorter than the range we ask for: BAD_SEGMENT, and `mapped` tells what to roll back. */
+        FakeBuf shortBuf = { runs, 2, 0 };                    /* 3 pages */
+        CHECK(t.mapRange(0x800000, 8 * 4096, PERM_R, OWN2, fakeSegment, &shortBuf, &mapped) == BAD_SEGMENT);
+        CHECK(mapped == 3 * 4096);
+        for (uint64_t q = 0; q < mapped; q += 4096)
+            CHECK(t.unmap(0x800000 + q) == OWN2);
+        CHECK(!t.isMapped(0x800000));
+    }
+    CHECK(f.pagesLive == 0 && f.memLive == 0);
+}
+
+/* Many random fragmentations, same invariant each time. */
+void testMapRangeRandom()
+{
+    unsigned seed = 12345;
+    auto rnd = [&seed]() { seed = seed * 1103515245u + 12345u; return (seed >> 16) & 0x7FFF; };
+    Fake f;
+    {
+        Table t(allocatorFor(&f));
+        CHECK(t.init());
+        for (int round = 0; round < 200; round++) {
+            Run runs[40];
+            unsigned n = 1 + rnd() % 40;
+            uint64_t total = 0;
+            for (unsigned i = 0; i < n; i++) {
+                runs[i].pages = 1 + rnd() % 40;
+                runs[i].pa    = (0x100000000ull + (uint64_t)(rnd() % 4096) * 0x1000000ull) & E_ADDR_MASK;
+                total += runs[i].pages * 4096;
+            }
+            FakeBuf buf = { runs, n, 0 };
+            uint64_t gpa = ((uint64_t)(rnd() % 1000)) * 0x4000000ull;     /* spread over the address space */
+            uint64_t mapped = 0;
+            CHECK(t.mapRange(gpa, total, PERM_R | PERM_X, OWN1, fakeSegment, &buf, &mapped) == OK && mapped == total);
+            for (uint64_t off = 0; off < total; off += 4096) {
+                uint64_t h = 0;
+                if (t.lookup(gpa + off, &h, nullptr) != OWN1 || h != expectedPa(runs, n, off)) {
+                    CHECK(false);
+                    break;
+                }
+            }
+            for (uint64_t off = 0; off < total; off += 4096)
+                CHECK(t.unmap(gpa + off) == OWN1);
+            CHECK(t.tablePages() == 1);
+        }
+    }
+    CHECK(f.pagesLive == 0 && f.memLive == 0);
+}
+
+/* An allocation failure in the middle of a range: `mapped` must match what is really mapped. */
+void testMapRangeFailureAccounting()
+{
+    for (long limit = 1; limit < 40; limit += 3) {
+        Fake f;
+        {
+            Table t(allocatorFor(&f));
+            CHECK(t.init());
+            const Run runs[] = { { 0x10000000, 300 } };           /* one run spanning a page-table boundary soon */
+            FakeBuf buf = { runs, 1, 0 };
+            f.failAfter = f.allocs + limit;
+            uint64_t mapped = 0;
+            Status s = t.mapRange(0x1FF000, 300 * 4096, PERM_R, OWN1, fakeSegment, &buf, &mapped);
+            if (s == OK) {
+                CHECK(mapped == 300 * 4096);
+            } else {
+                CHECK(s == NO_MEMORY);
+                CHECK(t.mappedPages() == mapped / 4096);
+                for (uint64_t q = 0; q < mapped; q += 4096)
+                    CHECK(t.unmap(0x1FF000 + q) == OWN1);
+                CHECK(t.mappedPages() == 0 && t.tablePages() == 1);
+            }
+        }
+        CHECK(f.pagesLive == 0 && f.memLive == 0);
+    }
+}
+
 } // namespace
 
 int main()
@@ -341,6 +491,9 @@ int main()
     testPartialPrune();
     testClear();
     testAllocationFailure();
+    testMapRange();
+    testMapRangeRandom();
+    testMapRangeFailureAccounting();
     if (fails) {
         printf("npt_test: %d FAILED\n", fails);
         return 1;

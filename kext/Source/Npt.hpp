@@ -95,7 +95,14 @@ struct Allocator {
     void (*freeMem)(void *ctx, void *p, size_t bytes);
 };
 
-enum Status { OK = 0, BAD_ARG, NO_MEMORY, BUSY, NOT_MAPPED };
+enum Status { OK = 0, BAD_ARG, NO_MEMORY, BUSY, NOT_MAPPED, BAD_SEGMENT };
+
+/*
+ * Describes where byte `offset` of a buffer lives: *pa is the physical address of that byte and *len how many
+ * bytes follow contiguously. Returns false when the buffer has no such byte. This is what
+ * IOMemoryDescriptor::getPhysicalSegment gives the kext; tests supply fake, fragmented ones.
+ */
+typedef bool (*SegmentFn)(void *ctx, uint64_t offset, uint64_t *pa, uint64_t *len);
 
 class Table {
 public:
@@ -161,6 +168,42 @@ public:
         n->table[idx[3]] = encodeLeaf(hpa, perm);
         n->used++;
         fMapped++;
+        return OK;
+    }
+
+    /*
+     * Maps `size` bytes of a buffer (offset 0 .. size) at guest physical `gpa`, one page at a time, following
+     * the buffer's physical segments. The range must be free. On any failure the pages mapped so far are left in
+     * place and *mapped says how many bytes that is (always a multiple of the page size), so the caller can
+     * unmap exactly those and release the buffer.
+     */
+    Status mapRange(uint64_t gpa, uint64_t size, uint32_t perm, void *owner, SegmentFn segment, void *ctx,
+                    uint64_t *mapped)
+    {
+        *mapped = 0;
+        if ((gpa & 0xFFF) || (size & 0xFFF) || size == 0)
+            return BAD_ARG;
+        for (uint64_t off = 0; off < size; off += kPageSize) {
+            if (isMapped(gpa + off))
+                return BUSY;
+        }
+        while (*mapped < size) {
+            uint64_t pa = 0, len = 0;
+            if (!segment(ctx, *mapped, &pa, &len) || (pa & 0xFFF))
+                return BAD_SEGMENT;
+            if (len > size - *mapped)
+                len = size - *mapped;
+            len &= ~(uint64_t)0xFFF;
+            if (len == 0)
+                return BAD_SEGMENT;
+            const uint64_t base = *mapped;     // where this segment starts in the buffer
+            for (uint64_t p = 0; p < len; p += kPageSize) {
+                Status st = map(gpa + base + p, pa + p, perm, owner);
+                if (st != OK)
+                    return st;
+                *mapped = base + p + kPageSize;
+            }
+        }
         return OK;
     }
 

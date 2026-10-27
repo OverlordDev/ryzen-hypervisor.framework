@@ -11,14 +11,16 @@
  *   6  a VM created with NO_RAM runs code that lives only in a VmMap'ed buffer
  *   7  after VmDestroy the kernel's mapped-page counter is back where it started (no pinned pages leak)
  *
- * Guest layout: built-in RAM holds the code at 0x1000/0x1100. Real mode with DS=0xFFFF
- * reaches linear 0x100000.. (the HMA), which is where the mapped buffers live:
- *   DS:0x0010 -> 0x100010,  DS:0x1010 -> 0x101010,  DS:0x2010 -> 0x102010.
+ * Guest layout: built-in RAM holds the code at 0x1000/0x1100. Real mode with DS=0xFFFF has segment
+ * base 0xFFFF0, so offset 0x20 is linear 0x100010 (the HMA, above 1 MiB), where the mapped buffers live:
+ *   DS:0x0020 -> 0x100010,  DS:0x1020 -> 0x101010,  DS:0x2020 -> 0x102010.
+ * (Careful: base + offset, not offset + 0x100000. DS:0x1010 would be 0x101000, the very start of the page.)
  *
  * Needs root and a kext booted with rhv_enable_svm=1:
  *     sudo ./build/rhv-map-test
  */
 #include <IOKit/IOKitLib.h>
+#include <emmintrin.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -54,21 +56,21 @@ static int failures;
 static const uint8_t kProgA[] = {
     0xB8, 0xFF, 0xFF,                   /* 1000 mov ax, 0xFFFF           */
     0x8E, 0xD8,                         /* 1003 mov ds, ax               */
-    0xC6, 0x06, 0x10, 0x00, 0xAB,       /* 1005 mov byte [0x0010], 0xAB  */
-    0xA0, 0x10, 0x00,                   /* 100A mov al, [0x0010]         */
-    0xC6, 0x06, 0x10, 0x10, 0xCD,       /* 100D mov byte [0x1010], 0xCD  */
+    0xC6, 0x06, 0x20, 0x00, 0xAB,       /* 1005 mov byte [0x0020], 0xAB  */
+    0xA0, 0x20, 0x00,                   /* 100A mov al, [0x0020]         */
+    0xC6, 0x06, 0x20, 0x10, 0xCD,       /* 100D mov byte [0x1020], 0xCD  */
     0xF4,                               /* 1012 hlt                      */
-    0xC6, 0x06, 0x10, 0x10, 0xEF,       /* 1013 mov byte [0x1010], 0xEF  */
-    0xC6, 0x06, 0x10, 0x20, 0x77,       /* 1018 mov byte [0x2010], 0x77  */
+    0xC6, 0x06, 0x20, 0x10, 0xEF,       /* 1013 mov byte [0x1020], 0xEF  */
+    0xC6, 0x06, 0x20, 0x20, 0x77,       /* 1018 mov byte [0x2020], 0x77  */
     0xF4,                               /* 101D hlt                      */
     0xEB, 0xFE,                         /* 101E jmp $                    */
 };
 
-/* Program B at 0x1100: read DS:0x0010 into AL and stop. */
+/* Program B at 0x1100: read DS:0x0020 (= 0x100010) into AL and stop. */
 static const uint8_t kProgB[] = {
     0xB8, 0xFF, 0xFF,                   /* 1100 mov ax, 0xFFFF   */
     0x8E, 0xD8,                         /* 1103 mov ds, ax       */
-    0xA0, 0x10, 0x00,                   /* 1105 mov al, [0x0010] */
+    0xA0, 0x20, 0x00,                   /* 1105 mov al, [0x0020] */
     0xF4,                               /* 1108 hlt              */
 };
 
@@ -166,6 +168,33 @@ static void describe_exit(const RHVExit *ex)
            reason_name(ex->reason), ex->exitCode, ex->info1, ex->info2, ex->rip);
 }
 
+/*
+ * Guest and process look at the same physical page. If the guest accesses it with a different memory type than
+ * our WB mapping, our cache can hold a stale copy. peek() reads a byte, flushes its cache line, reads again, and
+ * counts how often the two differ: that is direct evidence of incoherence, and the flushed value is the truth.
+ */
+static int staleReads;
+
+static void flush_buf(const void *p, size_t bytes)
+{
+    for (size_t o = 0; o < bytes; o += 64)
+        _mm_clflush((const uint8_t *)p + o);
+    _mm_mfence();
+}
+
+static uint8_t peek(const uint8_t *buf, size_t off)
+{
+    uint8_t cached = *(volatile const uint8_t *)(buf + off);
+    _mm_clflush(buf + off);
+    _mm_mfence();
+    uint8_t fresh = *(volatile const uint8_t *)(buf + off);
+    if (cached != fresh) {
+        staleReads++;
+        printf("  note: stale cache line at offset 0x%zx: cached 0x%02x, memory 0x%02x\n", off, cached, fresh);
+    }
+    return fresh;
+}
+
 static uint8_t *alloc_buffer(size_t bytes)
 {
     uint8_t *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -174,6 +203,7 @@ static uint8_t *alloc_buffer(size_t bytes)
         return NULL;
     }
     memset(p, 0, bytes);   /* touch every page so it is resident */
+    flush_buf(p, bytes);
     return p;
 }
 
@@ -235,8 +265,9 @@ int main(void)
         goto done;
     describe_exit(&ex);
     EXPECT(ex.reason == RHV_EXIT_HLT, "guest ran to its first HLT");
-    EXPECT(buf[0x10] == 0xAB, "guest byte landed in our buffer (page 0: 0x%02x)", buf[0x10]);
-    EXPECT(buf[0x1010] == 0xCD, "guest byte landed in our buffer (page 1: 0x%02x)", buf[0x1010]);
+    uint8_t b0 = peek(buf, 0x10), b1 = peek(buf, 0x1010);
+    EXPECT(b0 == 0xAB, "guest byte landed in our buffer (page 0: 0x%02x)", b0);
+    EXPECT(b1 == 0xCD, "guest byte landed in our buffer (page 1: 0x%02x)", b1);
     if (!get_regs(conn, &regs))
         EXPECT((regs.rax & 0xFF) == 0xAB, "guest read its own write back (al=0x%02" PRIx64 ")",
                regs.rax & 0xFF);
@@ -252,7 +283,7 @@ int main(void)
     EXPECT(ex.info2 == HMA_BASE + PAGE + 0x10, "fault address is 0x%" PRIx64, ex.info2);
     EXPECT(rhv_npf_present(ex.info1) && rhv_npf_is_write(ex.info1) && !rhv_npf_is_fetch(ex.info1),
            "fault is a write to a present page (info1=0x%" PRIx64 ")", ex.info1);
-    EXPECT(buf[0x1010] == 0xCD, "the write did not go through (0x%02x)", buf[0x1010]);
+    EXPECT(peek(buf, 0x1010) == 0xCD, "the blocked write did not change the page (0x%02x)", peek(buf, 0x1010));
     kr = vm_protect_call(conn, HMA_BASE + PAGE, PAGE, RHV_MEM_READ | RHV_MEM_WRITE);
     EXPECT(kr == KERN_SUCCESS, "VmProtect read-write returned 0x%x", kr);
     kr = vm_protect_call(conn, HMA_BASE + 8 * PAGE, PAGE, RHV_MEM_READ);
@@ -263,7 +294,7 @@ int main(void)
     if (run_guest(conn, 0, &ex))      /* retry the faulting instruction */
         goto done;
     describe_exit(&ex);
-    EXPECT(buf[0x1010] == 0xEF, "retried write went through (0x%02x)", buf[0x1010]);
+    EXPECT(peek(buf, 0x1010) == 0xEF, "retried write went through (0x%02x)", peek(buf, 0x1010));
     EXPECT(ex.reason == RHV_EXIT_NPF && ex.info2 == HMA_BASE + 2 * PAGE + 0x10,
            "touching the unmapped page exits with NPF at 0x%" PRIx64, ex.info2);
     EXPECT(!rhv_npf_present(ex.info1) && rhv_npf_is_write(ex.info1),
@@ -274,8 +305,8 @@ int main(void)
         goto done;
     describe_exit(&ex);
     EXPECT(ex.reason == RHV_EXIT_HLT, "guest reached its second HLT");
-    EXPECT(buf[2 * PAGE + 0x10] == 0x77, "lazily mapped page received the write (0x%02x)",
-           buf[2 * PAGE + 0x10]);
+    EXPECT(peek(buf, 2 * PAGE + 0x10) == 0x77, "lazily mapped page received the write (0x%02x)",
+           peek(buf, 2 * PAGE + 0x10));
 
     /* ---- Stage 4: unmap, fault, remap a different buffer ---- */
     printf("stage 4: unmap, then map a different buffer at the same address\n");
@@ -288,6 +319,7 @@ int main(void)
                !rhv_npf_is_write(ex.info1),
            "read after unmap exits with a not-present read fault");
     buf2[0x10] = 0x5A;
+    flush_buf(buf2, PAGE);     /* push our write to memory so a guest with a different cache type sees it */
     kr = vm_map_call(conn, buf2, HMA_BASE, PAGE, RHV_MEM_READ);
     EXPECT(kr == KERN_SUCCESS, "VmMap of a different buffer returned 0x%x", kr);
     if (run_guest(conn, 0, &ex))
@@ -331,6 +363,7 @@ int main(void)
     if (kr != KERN_SUCCESS)
         goto done;
     memcpy(buf3, kProgC, sizeof(kProgC));
+    flush_buf(buf3, PAGE);
     kr = vm_map_call(conn, buf3, 0, PAGE, RHV_MEM_READ | RHV_MEM_EXEC);
     EXPECT(kr == KERN_SUCCESS, "VmMap of the code page at guest address 0 returned 0x%x", kr);
     if (run_guest(conn, 0, &ex))
@@ -366,6 +399,9 @@ done:
     }
     IOServiceClose(conn);
 
+    if (staleReads)
+        printf("NOTE: %d read(s) saw a stale cache line: the guest and this process disagree about the memory type "
+               "of the shared pages\n", staleReads);
     if (failures) {
         printf("FAIL: %d check(s) failed, see `rhv-info log` for the kernel side\n", failures);
         return 1;

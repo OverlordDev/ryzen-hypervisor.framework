@@ -11,7 +11,6 @@
 extern "C" {
 void         mp_rendezvous_no_intrs(void (*action)(void *), void *arg);
 int          cpu_number(void);
-unsigned int ml_get_max_cpus(void);
 uint64_t     mach_absolute_time(void);
 void         nanoseconds_to_absolutetime(uint64_t nanoseconds, uint64_t *result);
 struct task *current_task(void);

@@ -11,8 +11,12 @@
 namespace rhv {
 namespace svm {
 
-/* Reads CPUID/MSRs on every logical CPU and fills `out`. Read-only, safe to call anytime. */
-void probe(RHVInfo *out);
+/*
+ * Reads CPUID (and, with readMsrs, VM_CR and EFER) on every logical CPU and fills `out`.
+ * Read-only. Without readMsrs the BIOS-disabled/locked flags are unknown and reported as 0:
+ * that mode exists to bisect a crash (see boot-arg rhv_stage).
+ */
+void probe(RHVInfo *out, bool readMsrs);
 
 /*
  * Sets EFER.SVME and VM_HSAVE_PA on every CPU where SVM is supported and not

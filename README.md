@@ -7,11 +7,11 @@
 Android, современные VMware/Parallels), не запускается. Здесь строится слой на **AMD-V (SVM)**,
 который предоставляет тот же API.
 
-> **Статус: фазы 0, 1 и 2 написаны, всё собирается на Sequoia (`make test tools shim kext`), но в ядре пока
-> ничего не запускалось.** Кекст умеет проверить SVM, включить его, запустить крошечного real-mode гостя
-> (`rhv-guest-test`) и отдать ему память процесса через `VmMap`/`VmUnmap`/`VmProtect` (`rhv-map-test`).
-> Логика дерева NPT проверена хост-тестами, остальное (VMRUN, закрепление страниц, NPF) проверяется только
-> на железе, там возможны паники ядра: начинай с фазы 0, затем `docs/PHASE1.md`, затем `docs/PHASE2.md`.
+> **Статус: фазы 0, 1 и 2 пройдены на железе (Ryzen 7 5800H, Sequoia 15.8.1, OpenCore).** SVM включается на всех
+> 16 ядрах (`selftest 16 of 16`), `rhv-guest-test` и `rhv-map-test` печатают `PASS`: гость исполняет код, отвечает
+> на `CPUID`, работает с памятью процесса через `VmMap`/`VmUnmap`/`VmProtect`, NPT-fault'ы приходят с точным адресом.
+> Не проверено: час стабильности под нагрузкой, сон/пробуждение, `kextunload`. Дальше фаза 3 (совместимость с VMX API).
+> Если что-то падает при загрузке, начни с `docs/DEBUGGING.md` (`rhv_stage`, лог OpenCore, `check-kext-symbols.sh`).
 
 Целевое железо: Ryzen 7 5800H (Zen 3, Cezanne, family 19h model 50h), macOS Sequoia (15), OpenCore.
 
@@ -51,7 +51,7 @@ sudo rhv-info level 0-5   уровень лога на лету
 sudo rhv-info selftest    проверить EFER/VM_HSAVE_PA на каждом ядре
 ```
 
-Boot-args: `-rhv_off`, `rhv_enable_svm`, `rhv_selftest`, `rhv_loglevel`, `rhv_iolog`. Подробности в `docs/DEBUGGING.md`.
+Boot-args: `-rhv_off`, `rhv_enable_svm`, `rhv_selftest`, `rhv_loglevel`, `rhv_iolog`, `rhv_stage`, `rhv_slow`. Подробности в `docs/DEBUGGING.md`.
 
 Если на шаге 5 написано `SVM: supported`, `BIOS disable: no`, `NPT: [x]`, значит фаза 0 пройдена
 и можно писать VMCB и `VMRUN` (см. `docs/ROADMAP.md`).

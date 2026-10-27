@@ -217,6 +217,21 @@ void com_overlorddev_RyzenHVVm::releaseOwner(void *ctx, void *owner)
     dropPage(static_cast<Backing *>(owner));
 }
 
+/* Where byte `offset` of `ctx` (an IOMemoryDescriptor) lives in physical memory, see rhv::npt::SegmentFn. */
+static bool mdSegment(void *ctx, uint64_t offset, uint64_t *pa, uint64_t *len)
+{
+    IOMemoryDescriptor *md = static_cast<IOMemoryDescriptor *>(ctx);
+    IOByteCount seg = 0;
+    addr64_t addr = md->getPhysicalSegment(offset, &seg, kIOMemoryMapperNone);
+    if (!addr || !seg) {
+        RHV_ERR("VM map: no physical segment at offset 0x%llx", (unsigned long long)offset);
+        return false;
+    }
+    *pa  = addr;
+    *len = seg;
+    return true;
+}
+
 /*
  * Maps [0, size) of `md` at guest physical `gpa`, page by page, all or nothing.
  * Wires `md` (prepare) and holds a reference on it until the last page is unmapped.
@@ -247,31 +262,21 @@ IOReturn com_overlorddev_RyzenHVVm::mapDescriptorLocked(IOMemoryDescriptor *md, 
     b->live = 1;          /* the builder's own reference, dropped below */
 
     uint64_t done = 0;    /* bytes of the range that are mapped so far */
-    while (done < size && rc == kIOReturnSuccess) {
-        IOByteCount seg = 0;
-        addr64_t pa = md->getPhysicalSegment(done, &seg, kIOMemoryMapperNone);
-        uint64_t n = seg;
-        if (n > size - done)
-            n = size - done;
-        n &= ~(uint64_t)0xFFF;
-        if (!pa || (pa & 0xFFF) || n == 0) {
-            RHV_ERR("VM map: bad physical segment at offset 0x%llx: pa=0x%llx len=%llu",
-                    (unsigned long long)done, (unsigned long long)pa, (unsigned long long)seg);
-            rc = kIOReturnVMError;
-            break;
-        }
-        for (uint64_t p = 0; p < n; p += 4096) {
-            rhv::npt::Status st = fNpt.map(gpa + done + p, pa + p, perm, b);
-            if (st != rhv::npt::OK) {
-                rc = st == rhv::npt::NO_MEMORY ? kIOReturnNoMemory : kIOReturnBadArgument;
-                break;
-            }
-            b->live++;
-            fPagesMapped++;
-            RHV_STAT_ADD(vmPagesMapped, 1);
-            done += 4096;
+    rhv::npt::Status st = fNpt.mapRange(gpa, size, perm, b, &mdSegment, md, &done);
+    if (st != rhv::npt::OK) {
+        RHV_ERR("VM map: NPT mapRange failed (status %d) after %llu of %llu bytes at gpa 0x%llx", (int)st,
+                (unsigned long long)done, (unsigned long long)size, (unsigned long long)gpa);
+        switch (st) {
+        case rhv::npt::NO_MEMORY:   rc = kIOReturnNoMemory; break;
+        case rhv::npt::BUSY:        rc = kIOReturnBusy; break;
+        case rhv::npt::BAD_SEGMENT: rc = kIOReturnVMError; break;
+        default:                    rc = kIOReturnBadArgument; break;
         }
     }
+    /* Count what was actually mapped. */
+    fPagesMapped += done / 4096;
+    RHV_STAT_ADD(vmPagesMapped, done / 4096);
+    b->live += done / 4096;
 
     if (rc != kIOReturnSuccess) {
         /* Take back what was mapped so far. */
