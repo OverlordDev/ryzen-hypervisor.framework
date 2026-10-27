@@ -53,7 +53,8 @@
 - [x] Таблица соответствия полей VMCS → VMCB, чтение/запись через `hv_vmx_vcpu_*` (в ядре: `VmcsRead`/`VmcsWrite`; `rhv-vmx-test` PASS)
 - [x] Синтез VMX exit reason и qualification (I/O, MSR, CPUID, HLT, EPT-нарушение, исключения, CR/DR)
 - [ ] Эмуляция `hv_vmx_read_capability`
-- [ ] Инъекция прерываний, таймер, `hv_vcpu_interrupt`
+- [x] Инъекция прерываний (`event_inj`, окно прерываний), хост-прерывания доходят до ядра во время работы гостя; [ ] таймер, `hv_vcpu_interrupt` из другого потока
+- [x] x87/SSE/AVX и XCR0 гостя и хоста (`rhv-long-test`), long mode с paging
 - [ ] Шим форвардит все вызовы в кекст
 
 **Готово, когда:** QEMU с `-accel hvf` грузит Linux до шелла.

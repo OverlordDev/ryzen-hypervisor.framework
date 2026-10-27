@@ -119,6 +119,10 @@ IOReturn com_overlorddev_RyzenHVUserClient::externalMethod(uint32_t selector,
         { (IOExternalMethodAction)&C::sVmcsRead, 1, 0, 1, 0 },
         /* kRHVMethodVmcsWrite: 2 scalars in (field, value) */
         { (IOExternalMethodAction)&C::sVmcsWrite, 2, 0, 0, 0 },
+        /* kRHVMethodVmGetFpu: struct out */
+        { (IOExternalMethodAction)&C::sVmGetFpu, 0, 0, 0, sizeof(RHVFpuState) },
+        /* kRHVMethodVmSetFpu: struct in */
+        { (IOExternalMethodAction)&C::sVmSetFpu, 0, sizeof(RHVFpuState), 0, 0 },
     };
 
     static_assert(sizeof(kMethods) / sizeof(kMethods[0]) == kRHVMethodCount,
@@ -398,6 +402,28 @@ IOReturn com_overlorddev_RyzenHVUserClient::sVmcsWrite(OSObject *target, void *,
         return kIOReturnBadArgument;
     RHV_RETAIN_VM(vm);
     IOReturn rc = vm->vmcsWrite((uint32_t)args->scalarInput[0], args->scalarInput[1]);
+    vm->release();
+    return rc;
+}
+
+IOReturn com_overlorddev_RyzenHVUserClient::sVmGetFpu(OSObject *target, void *,
+                                                      IOExternalMethodArguments *args)
+{
+    RHV_ME();
+    RHV_ADMIN();
+    RHV_RETAIN_VM(vm);
+    IOReturn rc = vm->getFpu((RHVFpuState *)args->structureOutput);
+    vm->release();
+    return rc;
+}
+
+IOReturn com_overlorddev_RyzenHVUserClient::sVmSetFpu(OSObject *target, void *,
+                                                      IOExternalMethodArguments *args)
+{
+    RHV_ME();
+    RHV_ADMIN();
+    RHV_RETAIN_VM(vm);
+    IOReturn rc = vm->setFpu((const RHVFpuState *)args->structureInput);
     vm->release();
     return rc;
 }

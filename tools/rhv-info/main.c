@@ -159,6 +159,7 @@ static int cmd_stats(io_connect_t conn)
     P(vmProtects);
     P(vmNptFaults);
     P(vmPagesMapped);
+    P(vmFpuMismatches);
 #undef P
     return 0;
 }

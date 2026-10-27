@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define RHV_ABI_VERSION 5
+#define RHV_ABI_VERSION 6
 #define RHV_SERVICE_NAME "com_overlorddev_RyzenHV"
 #define RHV_MAX_CPUS 64
 
@@ -59,6 +59,13 @@ extern "C" {
  *                (kIOReturnBadArgument for a field the framework does not have)
  *   VmcsWrite    in: scalar[0] = field, scalar[1] = value
  *                (kIOReturnNotWritable for the read-only exit fields)
+ *
+ * Extended state (x87/SSE/AVX) of the guest, kept by the kext and swapped in and out around VMRUN.
+ *   VmGetFpu     out: struct RHVFpuState
+ *   VmSetFpu     in: struct RHVFpuState. xcr0 must be a legal XCR0 (x87 set, AVX needs SSE, ...) and a subset of the
+ *                host's; area is the XSAVE standard format (the same layout hv_vcpu_read_fpstate returns), and
+ *                `size` must equal what VmGetFpu reported. kIOReturnBadArgument otherwise.
+ *                A client emulating the guest's XSETBV (VMX exit reason 55) sets xcr0 this way.
  */
 enum {
     kRHVMethodGetInfo = 0,
@@ -77,6 +84,8 @@ enum {
     kRHVMethodVmProtect,
     kRHVMethodVmcsRead,
     kRHVMethodVmcsWrite,
+    kRHVMethodVmGetFpu,
+    kRHVMethodVmSetFpu,
     kRHVMethodCount
 };
 
@@ -84,6 +93,15 @@ enum {
 enum { kRHVMemGuestRam = 0 };
 
 #define RHV_GUEST_RAM_SIZE (1u << 20)   /* built-in RAM: 1 MiB at guest physical 0 */
+
+/* Guest extended state. The area is the XSAVE standard format; `size` is the host's XSAVE size for its XCR0. */
+#define RHV_FPU_AREA_MAX 3072
+typedef struct RHVFpuState {
+    uint64_t xcr0;
+    uint32_t size;
+    uint32_t reserved;
+    uint8_t  area[RHV_FPU_AREA_MAX];
+} RHVFpuState;
 
 /* VmCreate flags. */
 enum {
@@ -168,6 +186,7 @@ typedef struct RHVStats {
     uint64_t vmProtects;
     uint64_t vmNptFaults;        /* RHV_EXIT_NPF handed to userland */
     uint64_t vmPagesMapped;      /* guest pages currently mapped, summed over VMs */
+    uint64_t vmFpuMismatches;    /* host x87/SSE state differed after a VMRUN round trip: must stay 0 */
 } RHVStats;
 
 /* Guest registers as seen by userland (VmGetRegs / VmSetRegs). */
@@ -233,8 +252,9 @@ typedef struct RHVLogChunk {
 
 /* Compile-time size checks that work in both C and C++. */
 typedef char rhv_assert_log_chunk_size[(sizeof(RHVLogChunk) == RHV_LOG_CHUNK_SIZE) ? 1 : -1];
-typedef char rhv_assert_stats_size[(sizeof(RHVStats) == 24 * sizeof(uint64_t)) ? 1 : -1];
+typedef char rhv_assert_stats_size[(sizeof(RHVStats) == 25 * sizeof(uint64_t)) ? 1 : -1];
 typedef char rhv_assert_regs_size[(sizeof(RHVRegs) == 18 * sizeof(uint64_t)) ? 1 : -1];
+typedef char rhv_assert_fpu_size[(sizeof(RHVFpuState) == 16 + RHV_FPU_AREA_MAX) ? 1 : -1];
 typedef char rhv_assert_exit_size[(sizeof(RHVExit) == 48) ? 1 : -1];
 
 /* IOIO exit decoding (EXITINFO1 of SVM exit 0x7B, AMD APM Vol.2, 15.10.2). */

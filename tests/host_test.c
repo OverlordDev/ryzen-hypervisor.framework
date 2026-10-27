@@ -114,14 +114,16 @@ int main(void)
 
     /* Struct layouts are part of the kext/userland ABI. */
     CHECK(sizeof(RHVInfo) == 14 * sizeof(uint32_t));
-    CHECK(sizeof(RHVStats) == 24 * sizeof(uint64_t));
+    CHECK(sizeof(RHVStats) == 25 * sizeof(uint64_t));
     CHECK(sizeof(RHVRegs) == 18 * sizeof(uint64_t));
     CHECK(sizeof(RHVExit) == 48);
     CHECK(sizeof(RHVLogChunk) == RHV_LOG_CHUNK_SIZE);
-    CHECK(kRHVMethodCount == 16);
+    CHECK(kRHVMethodCount == 18);
+    CHECK(kRHVMethodVmGetFpu == 16 && kRHVMethodVmSetFpu == 17);
     CHECK(kRHVMethodVmcsRead == 14 && kRHVMethodVmcsWrite == 15);
     CHECK(kRHVMethodVmMap == 11 && kRHVMethodVmUnmap == 12 && kRHVMethodVmProtect == 13);
-    CHECK(RHV_ABI_VERSION == 5);
+    CHECK(RHV_ABI_VERSION == 6);
+    CHECK(sizeof(RHVFpuState) == 16 + RHV_FPU_AREA_MAX);
 
     /* NPF decoding: write to a present (read-only) page; fetch from a not-present page; walk fault. */
     CHECK(rhv_npf_present(0x3) && rhv_npf_is_write(0x3) && !rhv_npf_is_fetch(0x3));

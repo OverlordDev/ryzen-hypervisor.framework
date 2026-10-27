@@ -80,10 +80,19 @@ SYM(rhv_svm_vmrun):
     movq    G_RDI(%rdi), %rdi   /* last: rdi was our pointer */
 
     movq    8(%rsp), %rax
+    /*
+     * V_INTR_MASKING makes the HOST's EFLAGS.IF decide whether a physical interrupt takes the CPU out of the
+     * guest. The caller runs with IF=0, so without this a guest would run with host interrupts blocked on this
+     * core: no timer, no TLB-shootdown IPIs, no 10 ms time slice, a guest loop would hang the machine.
+     * GIF is 0 (CLGI above) so nothing is delivered before VMRUN, and the one-instruction interrupt shadow of
+     * STI covers VMRUN itself. The exit puts us back at GIF=0, and the CLI below restores the caller's IF=0.
+     */
+    sti
     vmrun   %rax
+    cli
 
     /*
-     * Back from the guest. RSP is the host's again (restored by the #VMEXIT).
+     * Back from the guest. GIF is 0 and IF is 0 again (the CLI above). RSP is the host's again (restored by the #VMEXIT).
      * Do not trust RAX or anything but the stack slots for the addresses.
      */
     pushq   %rdi                /* park guest RDI, frees it as a pointer */

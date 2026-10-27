@@ -20,6 +20,7 @@
 #include <libkern/c++/OSObject.h>
 
 #include "../../include/RyzenHVShared.h"
+#include "FpuState.hpp"
 #include "Npt.hpp"
 #include "VmcsState.hpp"
 #include "PhysMem.hpp"
@@ -67,6 +68,10 @@ public:
     IOReturn vmcsRead(uint32_t field, uint64_t *value);
     IOReturn vmcsWrite(uint32_t field, uint64_t value);
 
+    /* Guest x87/SSE/AVX state and XCR0. */
+    IOReturn getFpu(RHVFpuState *out);
+    IOReturn setFpu(const RHVFpuState *in);
+
     /* A pinned buffer (user or kernel) and how many NPT pages still point into it. */
     struct Backing {
         IOMemoryDescriptor *md;
@@ -90,6 +95,10 @@ private:
     rhv::PhysMem              fMsrpm;    /*  8 KiB, all ones: intercept every MSR  */
     rhv::npt::Table           fNpt;
     rhv::vmx::VmcsState       fVmcs;
+    rhv::PhysMem              fHostFpu, fGuestFpu, fScratchFpu;   /* XSAVE areas, 4 KiB aligned */
+    uint64_t                  fGuestXcr0;
+    uint64_t                  fXcr0Supported;    /* CPUID.0xD.0 EDX:EAX */
+    uint32_t                  fFpuSize;
     bool                      fVmx;
     uint64_t                  fPagesMapped;
     rhv::GuestGprs            fGprs;

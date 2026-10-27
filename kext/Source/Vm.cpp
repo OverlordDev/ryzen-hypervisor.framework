@@ -1,6 +1,7 @@
 #include <IOKit/IOLib.h>
 
 #include "KernelDecls.hpp"
+#include "X86.hpp"
 #include "Log.hpp"
 #include "SVM.hpp"
 #include "Vm.hpp"
@@ -139,6 +140,12 @@ bool com_overlorddev_RyzenHVVm::init()
     fPagesMapped = 0;
     fVmx         = false;
     bzero(&fGprs, sizeof(fGprs));
+    bzero(&fHostFpu, sizeof(fHostFpu));
+    bzero(&fGuestFpu, sizeof(fGuestFpu));
+    bzero(&fScratchFpu, sizeof(fScratchFpu));
+    fGuestXcr0     = rhv::fpu::XCR0_X87;
+    fXcr0Supported = 0;
+    fFpuSize       = 0;
     fFirstRun    = true;
     fHaveNextRip = false;
 
@@ -150,6 +157,9 @@ void com_overlorddev_RyzenHVVm::free()
 {
     /* Unpins every buffer that is still mapped, then returns the tables. */
     fNpt.shutdown(&releaseOwner, this);
+    physFree(&fScratchFpu);
+    physFree(&fGuestFpu);
+    physFree(&fHostFpu);
     physFree(&fMsrpm);
     physFree(&fIopm);
     physFree(&fHostVmcb);
@@ -170,6 +180,22 @@ bool com_overlorddev_RyzenHVVm::setup(uint32_t flags)
     if (!physAlloc(&fVmcb, 4096) || !physAlloc(&fHostVmcb, 4096) || !physAlloc(&fIopm, 12288) ||
         !physAlloc(&fMsrpm, 8192) || !fNpt.init(kNptAllocator))
         return false;
+
+    /* Extended state areas. The size is what XSAVE needs for the XCR0 this thread has now. */
+    {
+        uint32_t r[4];
+        rhv_cpuid(0xD, 0, r);
+        fXcr0Supported = ((uint64_t)r[3] << 32) | r[0];
+        fFpuSize       = r[1];
+        if (fFpuSize < rhv::fpu::kHeaderEnd || fFpuSize > RHV_FPU_AREA_MAX) {
+            RHV_ERR("VM: XSAVE area of %u bytes is not supported (limit %u)", fFpuSize, RHV_FPU_AREA_MAX);
+            return false;
+        }
+        if (!physAlloc(&fHostFpu, 4096) || !physAlloc(&fGuestFpu, 4096) || !physAlloc(&fScratchFpu, 4096))
+            return false;
+        rhv::fpu::initArea((uint8_t *)fGuestFpu.va, 4096);
+        fGuestXcr0 = rhv::fpu::XCR0_X87;
+    }
 
     fVmx = (flags & RHV_VMCREATE_VMX) != 0;
     fVmcs.attach((rhv::vmcb::Vmcb *)fVmcb.va);
@@ -420,6 +446,10 @@ void com_overlorddev_RyzenHVVm::resetLocked(uint16_t cs, uint16_t ip)
 
     fHaveNextRip = false;
     fVmcs.reset();
+    if (fGuestFpu.va) {
+        rhv::fpu::initArea((uint8_t *)fGuestFpu.va, 4096);
+        fGuestXcr0 = rhv::fpu::XCR0_X87;
+    }
 }
 
 IOReturn com_overlorddev_RyzenHVVm::reset(uint16_t cs, uint16_t ip)
@@ -556,7 +586,43 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             break;
         }
 
+        /*
+         * VMRUN does not touch x87/SSE/AVX state or XCR0. Swap them by hand, still with interrupts off, so
+         * the calling process gets its registers back exactly as it left them.
+         */
+        /*
+         * XSAVE only manages the components XCR0 enables, and an OS that has not run XSETBV yet (XCR0 = 1) can
+         * still use SSE. So while the guest runs, the hardware XCR0 always includes x87 and SSE; the value the
+         * client sees (and a later XSETBV sets) is fGuestXcr0. The only visible difference is that XGETBV in
+         * such a guest reads 3 instead of 1.
+         */
+        const uint64_t guestX = fGuestXcr0 | rhv::fpu::XCR0_X87 | rhv::fpu::XCR0_SSE;
+        const bool wasTs = rhv::fpu::clearTs();
+        const uint64_t hostX = rhv::fpu::xgetbv0();
+        if (guestX & ~hostX) {
+            rhv::fpu::restoreTs(wasTs);
+            ml_set_interrupts_enabled(ints);
+            RHV_ERR("VmRun: guest XCR0 0x%llx needs state this thread has not enabled (0x%llx)",
+                    (unsigned long long)guestX, (unsigned long long)hostX);
+            rc = kIOReturnUnsupported;
+            break;
+        }
+        rhv::fpu::xsave(fHostFpu.va, hostX);
+        if (guestX != hostX)
+            rhv::fpu::xsetbv0(guestX);
+        rhv::fpu::xrstor(fGuestFpu.va, guestX);
+
         rhv_svm_vmrun(&fGprs, fVmcb.pa, fHostVmcb.pa);
+
+        rhv::fpu::xsave(fGuestFpu.va, guestX);
+        if (guestX != hostX)
+            rhv::fpu::xsetbv0(hostX);
+        rhv::fpu::xrstor(fHostFpu.va, hostX);
+        /* Self-check: the host state must be bit for bit what it was (this code uses no SSE of its own). */
+        rhv::fpu::xsave(fScratchFpu.va, hostX);
+        if (!rhv::fpu::legacyEqual((const uint8_t *)fHostFpu.va, (const uint8_t *)fScratchFpu.va))
+            RHV_STAT_INC(vmFpuMismatches);
+        rhv::fpu::restoreTs(wasTs);
 
         __asm__ volatile("movq %0, %%cr2" : : "r"(hostCr2));
         ml_set_interrupts_enabled(ints);   /* a pending host interrupt is taken right here */
@@ -617,6 +683,31 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 
     IOLockUnlock(fLock);
     return rc;
+}
+
+IOReturn com_overlorddev_RyzenHVVm::getFpu(RHVFpuState *out)
+{
+    bzero(out, sizeof(*out));
+    IOLockLock(fLock);
+    out->xcr0 = fGuestXcr0;
+    out->size = fFpuSize;
+    bcopy(fGuestFpu.va, out->area, fFpuSize);
+    IOLockUnlock(fLock);
+    return kIOReturnSuccess;
+}
+
+IOReturn com_overlorddev_RyzenHVVm::setFpu(const RHVFpuState *in)
+{
+    /* Everything XRSTOR or XSETBV would fault on is refused here: a fault in the kernel is a panic. */
+    const uint64_t hostX = rhv::fpu::xgetbv0();
+    if (in->size != fFpuSize || !rhv::fpu::validXcr0(in->xcr0, fXcr0Supported) || (in->xcr0 & ~hostX) ||
+        !rhv::fpu::validArea(in->area, fFpuSize, in->xcr0 | rhv::fpu::XCR0_X87 | rhv::fpu::XCR0_SSE))
+        return kIOReturnBadArgument;
+    IOLockLock(fLock);
+    fGuestXcr0 = in->xcr0;
+    bcopy(in->area, fGuestFpu.va, fFpuSize);
+    IOLockUnlock(fLock);
+    return kIOReturnSuccess;
 }
 
 IOReturn com_overlorddev_RyzenHVVm::vmcsRead(uint32_t field, uint64_t *value)
