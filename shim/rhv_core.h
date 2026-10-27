@@ -113,6 +113,12 @@ int32_t rhv_vcpu_enable_native_msr(uint32_t vcpu, uint32_t msr, int enable);
 int32_t rhv_vcpu_flush(uint32_t vcpu);
 int32_t rhv_vcpu_invalidate_tlb(uint32_t vcpu);
 int32_t rhv_vcpu_get_exec_time(uint32_t vcpu, uint64_t *time);
+uint64_t rhv_tsc_clock(void);
+int32_t rhv_vcpu_set_tsc_relative(uint32_t vcpu, int64_t offset);
+int32_t rhv_vcpu_set_msr_access(uint32_t vcpu, uint32_t msr, uint32_t flags);
+int32_t rhv_vmx_get_msr_info(uint32_t field, uint64_t *value);
+int32_t rhv_vmx_vcpu_set_apic_address(uint32_t vcpu, uint64_t gpa);
+int32_t rhv_vmx_vcpu_set_apic_address_space(uint32_t vcpu, uint32_t asid, uint64_t gpa);
 
 int32_t rhv_vmx_vcpu_read_vmcs(uint32_t vcpu, uint32_t field, uint64_t *value);
 int32_t rhv_vmx_vcpu_write_vmcs(uint32_t vcpu, uint32_t field, uint64_t value);

@@ -350,6 +350,33 @@ static void testFastPath(void)
     CHECK(rhv_vcpu_flush(v) == RHV_HV_SUCCESS);
 }
 
+/* The functions Parallels uses beyond the basics. */
+static void testParallelsApi(void)
+{
+    fresh();
+    uint32_t v = makeVcpu();
+    uint64_t x = 99;
+
+    K.hostTsc = 5000;
+    CHECK(rhv_tsc_clock() == 5000);
+    CHECK(rhv_vcpu_set_tsc_relative(v, -300) == RHV_HV_SUCCESS && K.vmcs[0x2010] == (uint64_t)-300);
+    CHECK(rhv_vcpu_set_tsc_relative(7, 0) == RHV_HV_BAD_ARGUMENT);
+
+    CHECK(rhv_vcpu_set_msr_access(v, 0xC0000081, 3) == RHV_HV_SUCCESS && K.nativeMsr == RHV_MSR_NATIVE_ENABLE && K.nativeMsrNum == 0xC0000081);
+    CHECK(rhv_vcpu_set_msr_access(v, 0xC0000081, 0) == RHV_HV_SUCCESS && K.nativeMsr == RHV_MSR_NATIVE_DISABLE);
+    CHECK(rhv_vcpu_set_msr_access(v, 0xC0000081, 4) == RHV_HV_BAD_ARGUMENT);
+
+    for (uint32_t f = 0; f <= 8; f++)
+        CHECK(rhv_vmx_get_msr_info(f, &x) == RHV_HV_SUCCESS && x == 0);
+    CHECK(rhv_vmx_get_msr_info(9, &x) == RHV_HV_BAD_ARGUMENT && rhv_vmx_get_msr_info(0, NULL) == RHV_HV_BAD_ARGUMENT);
+
+    CHECK(rhv_vmx_vcpu_set_apic_address(v, 0xFEE00000) == RHV_HV_SUCCESS);
+    CHECK(rhv_vmx_vcpu_set_apic_address(v, 0xFEE00010) == RHV_HV_BAD_ARGUMENT);              /* not page aligned */
+    CHECK(rhv_vmx_vcpu_set_apic_address(3, 0xFEE00000) == RHV_HV_BAD_ARGUMENT);              /* no such vCPU */
+    CHECK(rhv_vmx_vcpu_set_apic_address_space(v, 0, 0xFEE00000) == RHV_HV_SUCCESS);
+    CHECK(rhv_vmx_vcpu_set_apic_address_space(v, 1, 0xFEE00000) == RHV_HV_BAD_ARGUMENT);     /* only space 0 exists */
+}
+
 /* The state cache: how many calls reach the kernel, and that nothing stale is ever returned. */
 static void testCache(void)
 {
@@ -554,6 +581,7 @@ int main(void)
     testMemory();
     testRegisters();
     testCache();
+    testParallelsApi();
     testFastPath();
     testFpuMsrVmcs();
     testRunAndThreads();

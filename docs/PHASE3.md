@@ -75,7 +75,16 @@ APIC/IOAPIC (скорее всего да, раз API появился) и не�
    одним `VmcsReadMany`. Ядро ABI 7 шим больше не принимает (проверка в `hv_vm_create`, с понятным сообщением).
    Результат на Ryzen 7 5800H: 1.2-2 вызова ядра на выход вместо 12, ~17 мкс на выход под нагрузкой (57 тыс. выходов/с)
    вместо ~38 мкс; Linux без всяких параметров калибрует TSC сам (`Detected 3194.185 MHz processor`) и доходит до `~ #`.
-7. Встроенные APIC/IOAPIC/ATPIC и всё, что потребует Parallels.
+7. **Parallels (в работе).** Parallels Desktop 26.5 для Intel сам проверяет `sysctl kern.hv_support` (на AMD 0) и тогда
+   уходит на собственный движок с kext, которого у нас нет: `AppleHV does not support this Mac, defaulting to own
+   engine` в `~/Parallels/<ВМ>.pvm/parallels.log`. Его бэкенд на Hypervisor.framework лежит в `libMonitor.dylib`
+   (x86_64) и использует 35 функций (`nm -arch x86_64 -u libMonitor.dylib | grep _hv_`); реализовано 25. Сделано:
+   шим подменяет `kern.hv_support` на 1, добавлены `hv_tsc_clock`, `hv_vcpu_set_tsc_relative`, `hv_vcpu_set_msr_access`,
+   `hv_vmx_get_msr_info`, `hv_vmx_vcpu_set_apic_address[_space]`; kext с boot-arg `rhv_allow_users=1` пускает
+   локального пользователя (процесс ВМ Parallels работает не от root); `scripts/parallels-shim.sh install` ставит
+   обёртку на `prl_vm_app`, которая загружает шим. **Ещё нет:** адресные пространства (`hv_vm_space_*`,
+   `hv_vm_{map,unmap,protect}_space`, `hv_vcpu_set_space`), встроенные APIC/IOAPIC/ATPIC, если они понадобятся.
+8. Всё остальное, что потребуется Parallels.
 
 ## Риски
 

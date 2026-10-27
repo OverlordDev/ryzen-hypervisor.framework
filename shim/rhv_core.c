@@ -543,6 +543,64 @@ int32_t rhv_vcpu_get_exec_time(uint32_t vcpu, uint64_t *time)
     return RHV_HV_SUCCESS;
 }
 
+/*
+ * hv_tsc_clock is the host TSC here (the abstract clock "ticks at the same rate as the host TSC"), so the offset the
+ * client wants relative to it is the VMCB TSC offset itself.
+ */
+uint64_t rhv_tsc_clock(void)
+{
+    return B.tsc ? B.tsc(B.ctx) : 0;
+}
+
+int32_t rhv_vcpu_set_tsc_relative(uint32_t vcpu, int64_t offset)
+{
+    int32_t r = needVcpu(vcpu);
+    if (r)
+        return r;
+    NEED(vmcs_write);
+    return rhv_hv_from_ioreturn(vmcsSet(F_TSC_OFFSET, (uint64_t)offset));
+}
+
+/* hv_vcpu_set_msr_access: a managed MSR the guest may use without exits (any access) or not at all. */
+int32_t rhv_vcpu_set_msr_access(uint32_t vcpu, uint32_t msr, uint32_t flags)
+{
+    if (flags & ~3u)
+        return RHV_HV_BAD_ARGUMENT;
+    return rhv_vcpu_enable_native_msr(vcpu, msr, flags != 0);
+}
+
+/*
+ * Facts about MSRs the framework would otherwise get from the Intel CPU (ARCH_CAPABILITIES, which PERFEVTSEL bits are
+ * valid, ...). None apply to an AMD CPU: report "nothing", which a client takes as "do not touch these MSRs".
+ */
+int32_t rhv_vmx_get_msr_info(uint32_t field, uint64_t *value)
+{
+    if (!value || field > 8)
+        return RHV_HV_BAD_ARGUMENT;
+    *value = 0;
+    return RHV_HV_SUCCESS;
+}
+
+/*
+ * The APIC-access page belongs to Intel's "virtualize APIC accesses" control, which this shim does not offer; a
+ * client that sees it missing from the capabilities leaves it off, and the guest's APIC accesses then arrive as
+ * ordinary EPT violations at the APIC address. Accept and remember nothing.
+ */
+int32_t rhv_vmx_vcpu_set_apic_address(uint32_t vcpu, uint64_t gpa)
+{
+    int32_t r = needVcpu(vcpu);
+    if (r)
+        return r;
+    return (gpa & 0xFFF) ? RHV_HV_BAD_ARGUMENT : RHV_HV_SUCCESS;
+}
+
+int32_t rhv_vmx_vcpu_set_apic_address_space(uint32_t vcpu, uint32_t asid, uint64_t gpa)
+{
+    if (asid != 0)
+        return needVcpu(vcpu) ? needVcpu(vcpu) : RHV_HV_BAD_ARGUMENT;      /* only the default space exists */
+    return rhv_vmx_vcpu_set_apic_address(vcpu, gpa);
+}
+
 /* ---- registers ---- */
 
 /* The VMCS (or extension) field behind a register that is not a general-purpose one, 0 if there is none. */

@@ -16,6 +16,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -245,6 +247,57 @@ static hv_return_t rhv_hv_vcpu_interrupt(hv_vcpuid_t *vcpus, unsigned int count)
     RESULT("hv_vcpu_interrupt", rhv_vcpu_interrupt(vcpus, count));
 }
 DYLD_INTERPOSE(rhv_hv_vcpu_interrupt, hv_vcpu_interrupt);
+
+static uint64_t rhv_hv_tsc_clock(void)
+{
+    return rhv_tsc_clock();
+}
+DYLD_INTERPOSE(rhv_hv_tsc_clock, hv_tsc_clock);
+
+static hv_return_t rhv_hv_vcpu_set_tsc_relative(hv_vcpuid_t vcpu, int64_t offset)
+{
+    RESULT("hv_vcpu_set_tsc_relative", rhv_vcpu_set_tsc_relative(vcpu, offset));
+}
+DYLD_INTERPOSE(rhv_hv_vcpu_set_tsc_relative, hv_vcpu_set_tsc_relative);
+
+static hv_return_t rhv_hv_vcpu_set_msr_access(hv_vcpuid_t vcpu, uint32_t msr, hv_msr_flags_t flags)
+{
+    RESULT("hv_vcpu_set_msr_access", rhv_vcpu_set_msr_access(vcpu, msr, (uint32_t)flags));
+}
+DYLD_INTERPOSE(rhv_hv_vcpu_set_msr_access, hv_vcpu_set_msr_access);
+
+static hv_return_t rhv_hv_vmx_get_msr_info(hv_vmx_msr_info_t field, uint64_t *value)
+{
+    RESULT("hv_vmx_get_msr_info", rhv_vmx_get_msr_info((uint32_t)field, value));
+}
+DYLD_INTERPOSE(rhv_hv_vmx_get_msr_info, hv_vmx_get_msr_info);
+
+static hv_return_t rhv_hv_vmx_vcpu_set_apic_address(hv_vcpuid_t vcpu, hv_gpaddr_t gpa)
+{
+    RESULT("hv_vmx_vcpu_set_apic_address", rhv_vmx_vcpu_set_apic_address(vcpu, gpa));
+}
+DYLD_INTERPOSE(rhv_hv_vmx_vcpu_set_apic_address, hv_vmx_vcpu_set_apic_address);
+
+static hv_return_t rhv_hv_vmx_vcpu_set_apic_address_space(hv_vcpuid_t vcpu, hv_vm_space_t asid, hv_gpaddr_t gpa)
+{
+    RESULT("hv_vmx_vcpu_set_apic_address_space", rhv_vmx_vcpu_set_apic_address_space(vcpu, asid, gpa));
+}
+DYLD_INTERPOSE(rhv_hv_vmx_vcpu_set_apic_address_space, hv_vmx_vcpu_set_apic_address_space);
+
+/*
+ * Apps decide whether Apple's hypervisor can be used by asking the kernel (kern.hv_support), which is 0 on an AMD CPU.
+ * With the shim loaded the answer is yes: the shim is the hypervisor.
+ */
+static int rhv_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen)
+{
+    if (name && strcmp(name, "kern.hv_support") == 0 && oldp && oldlenp && *oldlenp >= sizeof(int) && !newp) {
+        *(int *)oldp = 1;
+        *oldlenp = sizeof(int);
+        return 0;
+    }
+    return sysctlbyname(name, oldp, oldlenp, newp, newlen);
+}
+DYLD_INTERPOSE(rhv_sysctlbyname, sysctlbyname);
 
 static hv_return_t rhv_hv_vcpu_read_register(hv_vcpuid_t vcpu, hv_x86_reg_t reg, uint64_t *value)
 {

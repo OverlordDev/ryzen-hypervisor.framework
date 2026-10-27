@@ -23,6 +23,15 @@ bool com_overlorddev_RyzenHVUserClient::initWithTask(task_t owningTask, void *se
     fIsAdmin = clientHasPrivilege(securityToken, kIOClientPrivilegeAdministrator) ==
                kIOReturnSuccess;
     /*
+     * Parallels (and any other VM app) runs its VM process as the logged-in user, not as root. Boot-arg
+     * rhv_allow_users=1 lets the local console user do what root can: create VMs, map memory, run guests.
+     */
+    if (!fIsAdmin) {
+        uint32_t allowUsers = 0;
+        if (PE_parse_boot_argn("rhv_allow_users", &allowUsers, sizeof(allowUsers)) && allowUsers)
+            fIsAdmin = clientHasPrivilege(securityToken, kIOClientPrivilegeLocalUser) == kIOReturnSuccess;
+    }
+    /*
      * Read-only methods (info, log, stats) are open to everyone. Methods that
      * change state or create VMs need root (fIsAdmin).
      * TODO(security): decide who may create VMs for real; Docker and friends
