@@ -15,6 +15,12 @@
 
 static io_connect_t gConn;
 
+/* Kernel round trips made so far; the shim's statistics report it (RYZENHV_STATS). */
+unsigned long long rhv_iokit_calls;
+#define IOConnectCallScalarMethod (rhv_iokit_calls++, IOConnectCallScalarMethod)
+#define IOConnectCallStructMethod (rhv_iokit_calls++, IOConnectCallStructMethod)
+#define IOConnectCallMethod       (rhv_iokit_calls++, IOConnectCallMethod)
+
 static int vm_create(void *ctx, uint32_t flags)
 {
     (void)ctx;

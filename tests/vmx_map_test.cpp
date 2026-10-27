@@ -197,6 +197,9 @@ void testExits()
     CHECK(translateExit(ex(EXIT_NPF, 0x15, 0), &v) && (v.qual & 7) == 4);       /* instruction fetch */
     CHECK(translateExit(ex(EXIT_NPF, 0x4, 0x100010), &v) && (v.qual & 7) == 1); /* data read */
     CHECK(v.instrLen == 0);
+    /* QEMU only emulates an EPT violation when bit 7 (linear address valid) and bit 8 (final translation) are set. */
+    CHECK(translateExit(ex(EXIT_NPF, (1ull << 32) | 0x6, 0x102010), &v) && (v.qual & (1 << 7)) && (v.qual & (1 << 8)));
+    CHECK(translateExit(ex(EXIT_NPF, (1ull << 33) | 0x6, 0x102010), &v) && (v.qual & (1 << 7)) && !(v.qual & (1 << 8)));   /* page walk */
 
     /* Exceptions: #PF has an error code and the faulting address; #BP is a software exception; #UD has no code. */
     CHECK(translateExit(ex(0x40 + 14, 0x2, 0xdead000), &v) && v.reason == VMX_EXC_NMI);

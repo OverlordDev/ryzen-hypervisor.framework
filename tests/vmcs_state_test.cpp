@@ -44,7 +44,10 @@ void testStateFields()
     CHECK(f.st.write(0x681c, 0xfff0) == R_OK && f.vmcb.save.rsp == 0xfff0);
     CHECK(f.st.write(0x6800, 0x80050033) == R_OK && f.vmcb.save.cr0 == 0x80050033);
     CHECK(f.st.write(0x6802, 0x1234000) == R_OK && f.vmcb.save.cr3 == 0x1234000);
-    CHECK(f.st.write(0x6804, 0x2620) == R_OK && f.vmcb.save.cr4 == 0x2620);
+    CHECK(f.st.write(0x6804, 0x2620) == R_OK && f.vmcb.save.cr4 == 0x620);   /* VMXE (bit 13) never reaches the VMCB ... */
+    { uint64_t c4 = 0; CHECK(f.st.read(0x6804, &c4) == R_OK && c4 == 0x2620); }   /* ... but reads back */
+    CHECK(f.st.write(0x6804, 0x620) == R_OK && f.vmcb.save.cr4 == 0x620);
+    { uint64_t c4 = 0; CHECK(f.st.read(0x6804, &c4) == R_OK && c4 == 0x620); }
     CHECK(f.st.write(0x6820, 0x2) == R_OK && f.vmcb.save.rflags == 0x2);
     CHECK(f.st.write(0x2804, 0x0007040600070406ull) == R_OK && f.vmcb.save.gPat == 0x0007040600070406ull);
 
@@ -289,6 +292,18 @@ void testExtensionsAndMsrs()
     CHECK(f.st.recordExit(0) && rd(f, 0x4402) == VMX_IO);
     f.st.recordSynthetic(VMX_EXT_INTR);
     CHECK(rd(f, 0x4402) == VMX_EXT_INTR && rd(f, 0x6400) == 0 && rd(f, 0x440c) == 0 && rd(f, 0x4404) == 0);
+
+    /* An exit with an interrupted delivery, then a synthetic one: the old vectoring info must not survive. */
+    f.vmcb.control.exitCode = EXIT_NPF;
+    f.vmcb.control.exitIntInfo = 0x80000030;
+    CHECK(f.st.recordExit(0) && rd(f, 0x4408) == 0x80000030);
+    f.st.recordSynthetic(VMX_EXT_INTR);
+    CHECK(rd(f, 0x4408) == 0 && rd(f, 0x440a) == 0);
+    /* An injection that never got in is handed back for the client to repeat. */
+    f.st.recordSynthetic(VMX_EXT_INTR, 0x800000ec, 0);
+    CHECK(rd(f, 0x4408) == 0x800000ec && rd(f, 0x4402) == VMX_EXT_INTR);
+    f.st.recordSynthetic(VMX_EXT_INTR, 0x80000b0e, 0x14);                 /* exception with an error code */
+    CHECK(rd(f, 0x4408) == 0x80000b0e && rd(f, 0x440a) == 0x14);
 }
 
 } // namespace

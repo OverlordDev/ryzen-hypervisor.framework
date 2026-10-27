@@ -7,6 +7,9 @@
 
 void (*rhv_core_trace)(const char *fmt, ...);
 
+/* Interrupts/exceptions the client asked to inject (VM-entry interruption info written with its valid bit). */
+unsigned long long rhv_core_injections;
+
 #define TRACE(...)                                  \
     do {                                            \
         if (rhv_core_trace)                         \
@@ -33,6 +36,149 @@ static int  gVcpu;
 static unsigned long gOwner;
 static uint64_t gExecTime;
 
+/*
+ * Every call into the kernel costs a few microseconds, and a guest I/O exit makes QEMU touch ~40 registers and VMCS
+ * fields (the real framework reads shared memory). Guest timing loops (Linux calibrating the TSC against the PIT)
+ * then fail, so the state is cached between exits:
+ *   - the general registers, RIP, RSP and RFLAGS are fetched with one call, written back in one call before the next
+ *     run (or before anything else that could see them); RIP/RSP/RFLAGS are served from here when asked as VMCS fields;
+ *   - other VMCS fields are cached on read and dropped when written.
+ * Everything is dropped when the guest runs (it changes state) and when an MSR is written (that can change a VMCS
+ * field behind the scenes, EFER for one).
+ */
+enum { kVcSlots = 64 };
+static struct { uint32_t enc; uint64_t val; uint8_t valid; } gVc[kVcSlots];
+static RHVRegs gRegs;
+static int     gRegsValid, gRegsDirty;
+
+static void cacheReset(void)
+{
+    memset(gVc, 0, sizeof(gVc));
+    gRegsValid = gRegsDirty = 0;
+}
+
+void rhv_core_cache_reset(void) { cacheReset(); }
+
+static unsigned vcSlot(uint32_t enc) { return ((enc >> 1) ^ (enc >> 7)) & (kVcSlots - 1); }
+
+static int vcGet(uint32_t enc, uint64_t *val)
+{
+    unsigned i = vcSlot(enc);
+    for (unsigned n = 0; n < kVcSlots; n++, i = (i + 1) & (kVcSlots - 1)) {
+        if (!gVc[i].valid)
+            return 0;
+        if (gVc[i].enc == enc) {
+            *val = gVc[i].val;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void vcPut(uint32_t enc, uint64_t val)
+{
+    unsigned i = vcSlot(enc);
+    for (unsigned n = 0; n < kVcSlots; n++, i = (i + 1) & (kVcSlots - 1)) {
+        if (!gVc[i].valid || gVc[i].enc == enc) {
+            gVc[i].enc = enc;
+            gVc[i].val = val;
+            gVc[i].valid = 1;
+            return;
+        }
+    }                                  /* full: just do not cache it */
+}
+
+static void vcDrop(uint32_t enc)
+{
+    /* Open addressing without tombstones: rebuild the table without the entry. */
+    typeof(gVc) old;
+    memcpy(old, gVc, sizeof(old));
+    memset(gVc, 0, sizeof(gVc));
+    for (unsigned i = 0; i < kVcSlots; i++)
+        if (old[i].valid && old[i].enc != enc)
+            vcPut(old[i].enc, old[i].val);
+}
+
+static int regsFetch(void)
+{
+    if (gRegsValid)
+        return 0;
+    if (!B.get_regs)
+        return (int)0xe00002c7;
+    int k = B.get_regs(B.ctx, &gRegs);
+    if (!k)
+        gRegsValid = 1;
+    return k;
+}
+
+static int regsFlush(void)
+{
+    if (!gRegsDirty)
+        return 0;
+    int k = B.set_regs ? B.set_regs(B.ctx, &gRegs) : (int)0xe00002c7;
+    if (!k)
+        gRegsDirty = 0;
+    return k;
+}
+
+enum { F_GUEST_RSP = 0x681c, F_GUEST_RIP = 0x681e, F_GUEST_RFLAGS = 0x6820 };
+
+static uint64_t *regsField(uint32_t enc)
+{
+    switch (enc) {
+    case F_GUEST_RSP: return &gRegs.rsp;
+    case F_GUEST_RIP: return &gRegs.rip;
+    case F_GUEST_RFLAGS: return &gRegs.rflags;
+    default: return NULL;
+    }
+}
+
+/* VMCS field access through the cache. */
+static int vmcsGet(uint32_t field, uint64_t *value)
+{
+    if (regsField(field)) {
+        int k = regsFetch();
+        if (k)
+            return k;
+        *value = *regsField(field);
+        return 0;
+    }
+    if (vcGet(field, value))
+        return 0;
+    if (!B.vmcs_read)
+        return (int)0xe00002c7;
+    int k = B.vmcs_read(B.ctx, field, value);
+    if (!k)
+        vcPut(field, *value);
+    return k;
+}
+
+static int vmcsSet(uint32_t field, uint64_t value)
+{
+    uint64_t *slot = regsField(field);
+    if (slot) {
+        int k = regsFetch();
+        if (k)
+            return k;
+        *slot = value;
+        gRegsDirty = 1;
+        return 0;
+    }
+    if (!B.vmcs_write)
+        return (int)0xe00002c7;
+    int k = B.vmcs_write(B.ctx, field, value);
+    vcDrop(field);
+    return k;
+}
+
+/*
+ * IA32_APIC_BASE. The real framework answers this one itself (the guest's local APIC is the VMM's business, but the
+ * MSR exists), and QEMU reads it without checking the result. Default: BSP, APIC enabled, base 0xFEE00000.
+ */
+#define MSR_IA32_APICBASE 0x1B
+#define APICBASE_DEFAULT  0xFEE00900ull
+static uint64_t gApicBase = APICBASE_DEFAULT;
+
 void rhv_core_init(const RhvBackend *backend)
 {
     B = *backend;
@@ -40,6 +186,7 @@ void rhv_core_init(const RhvBackend *backend)
     gVm = gVcpu = 0;
     gOwner = 0;
     gExecTime = 0;
+    cacheReset();
 }
 
 int32_t rhv_hv_from_ioreturn(int ior)
@@ -175,6 +322,8 @@ int32_t rhv_vcpu_create(uint32_t *vcpu, uint64_t flags)
     if (gVcpu)
         return RHV_HV_NO_RESOURCES;   /* one vCPU per VM for now */
     gVcpu = 1;
+    cacheReset();
+    gApicBase = APICBASE_DEFAULT;
     gOwner = B.thread_id ? B.thread_id(B.ctx) : 0;
     *vcpu = 0;
     return RHV_HV_SUCCESS;
@@ -186,6 +335,7 @@ int32_t rhv_vcpu_destroy(uint32_t vcpu)
     if (r)
         return r;
     gVcpu = 0;
+    cacheReset();
     return RHV_HV_SUCCESS;
 }
 
@@ -195,12 +345,16 @@ int32_t rhv_vcpu_run(uint32_t vcpu)
     if (r)
         return r;
     NEED(run);
+    int fk = regsFlush();
+    if (fk)
+        return rhv_hv_from_ioreturn(fk);
     RHVExit ex;
     memset(&ex, 0, sizeof(ex));
     uint64_t t0 = B.now ? B.now(B.ctx) : 0;
     int k = B.run(B.ctx, &ex);
     if (B.now)
         gExecTime += B.now(B.ctx) - t0;
+    cacheReset();                 /* the guest ran: all of it may have changed */
     if (k)
         return rhv_hv_from_ioreturn(k);
     /* What happened is in the VMCS read-only fields (exit reason, qualification, ...): the kernel put it there. */
@@ -225,7 +379,10 @@ int32_t rhv_vcpu_interrupt(const uint32_t *vcpus, unsigned int count)
 
 int32_t rhv_vcpu_flush(uint32_t vcpu)
 {
-    return needVcpu(vcpu);        /* state is written straight through, nothing to flush */
+    int32_t r = needVcpu(vcpu);
+    if (r)
+        return r;
+    return rhv_hv_from_ioreturn(regsFlush());
 }
 
 int32_t rhv_vcpu_invalidate_tlb(uint32_t vcpu)
@@ -324,22 +481,19 @@ int32_t rhv_vcpu_read_register(uint32_t vcpu, uint32_t reg, uint64_t *value)
         *value = f.xcr0;
         return RHV_HV_SUCCESS;
     }
-    RHVRegs regs;
-    uint64_t *slot = NULL;
     if (reg <= RHV_X86_R15) {
         NEED(get_regs);
-        int k = B.get_regs(B.ctx, &regs);
+        int k = regsFetch();
         if (k)
             return rhv_hv_from_ioreturn(k);
-        slot = gprSlot(&regs, reg);
-        *value = *slot;
+        *value = *gprSlot(&gRegs, reg);
         return RHV_HV_SUCCESS;
     }
     uint32_t field = rhv_core_register_field(reg);
     if (!field)
         return RHV_HV_BAD_ARGUMENT;         /* CR1 */
     NEED(vmcs_read);
-    return rhv_hv_from_ioreturn(B.vmcs_read(B.ctx, field, value));
+    return rhv_hv_from_ioreturn(vmcsGet(field, value));
 }
 
 int32_t rhv_vcpu_write_register(uint32_t vcpu, uint32_t reg, uint64_t value)
@@ -368,18 +522,18 @@ int32_t rhv_vcpu_write_register(uint32_t vcpu, uint32_t reg, uint64_t value)
     if (reg <= RHV_X86_R15) {
         NEED(get_regs);
         NEED(set_regs);
-        RHVRegs regs;
-        int k = B.get_regs(B.ctx, &regs);
+        int k = regsFetch();
         if (k)
             return rhv_hv_from_ioreturn(k);
-        *gprSlot(&regs, reg) = value;
-        return rhv_hv_from_ioreturn(B.set_regs(B.ctx, &regs));
+        *gprSlot(&gRegs, reg) = value;
+        gRegsDirty = 1;                       /* written back before the next run */
+        return RHV_HV_SUCCESS;
     }
     uint32_t field = rhv_core_register_field(reg);
     if (!field)
         return RHV_HV_BAD_ARGUMENT;
     NEED(vmcs_write);
-    return rhv_hv_from_ioreturn(B.vmcs_write(B.ctx, field, value));
+    return rhv_hv_from_ioreturn(vmcsSet(field, value));
 }
 
 /* ---- extended state, MSRs ---- */
@@ -426,9 +580,13 @@ int32_t rhv_vcpu_read_msr(uint32_t vcpu, uint32_t msr, uint64_t *value)
     int32_t r = needVcpu(vcpu);
     if (r)
         return r;
-    NEED(msr);
     if (!value)
         return RHV_HV_BAD_ARGUMENT;
+    if (msr == MSR_IA32_APICBASE) {
+        *value = gApicBase;
+        return RHV_HV_SUCCESS;
+    }
+    NEED(msr);
     return rhv_hv_from_ioreturn(B.msr(B.ctx, RHV_MSR_READ, msr, 0, value));
 }
 
@@ -437,9 +595,15 @@ int32_t rhv_vcpu_write_msr(uint32_t vcpu, uint32_t msr, uint64_t value)
     int32_t r = needVcpu(vcpu);
     if (r)
         return r;
+    if (msr == MSR_IA32_APICBASE) {
+        gApicBase = value;
+        return RHV_HV_SUCCESS;
+    }
     NEED(msr);
     uint64_t out;
-    return rhv_hv_from_ioreturn(B.msr(B.ctx, RHV_MSR_WRITE, msr, value, &out));
+    int k = B.msr(B.ctx, RHV_MSR_WRITE, msr, value, &out);
+    for (unsigned i = 0; i < kVcSlots; i++) gVc[i].valid = 0;       /* EFER and friends are VMCS fields too */
+    return rhv_hv_from_ioreturn(k);
 }
 
 int32_t rhv_vcpu_enable_native_msr(uint32_t vcpu, uint32_t msr, int enable)
@@ -462,7 +626,7 @@ int32_t rhv_vmx_vcpu_read_vmcs(uint32_t vcpu, uint32_t field, uint64_t *value)
     NEED(vmcs_read);
     if (!value)
         return RHV_HV_BAD_ARGUMENT;
-    return rhv_hv_from_ioreturn(B.vmcs_read(B.ctx, field, value));
+    return rhv_hv_from_ioreturn(vmcsGet(field, value));
 }
 
 int32_t rhv_vmx_vcpu_write_vmcs(uint32_t vcpu, uint32_t field, uint64_t value)
@@ -471,7 +635,11 @@ int32_t rhv_vmx_vcpu_write_vmcs(uint32_t vcpu, uint32_t field, uint64_t value)
     if (r)
         return r;
     NEED(vmcs_write);
-    return rhv_hv_from_ioreturn(B.vmcs_write(B.ctx, field, value));
+    if (field == 0x4016 && (value & (1u << 31)))
+        rhv_core_injections++;
+    if (rhv_core_trace && (field == 0x4016 || field == 0x4002))      /* VM-entry interruption info, CPU-based controls */
+        rhv_core_trace("write_vmcs(%#x) = %#llx", field, (unsigned long long)value);
+    return rhv_hv_from_ioreturn(vmcsSet(field, value));
 }
 
 /*
@@ -542,7 +710,7 @@ int32_t rhv_vmx_read_capability(uint32_t c, uint64_t *value)
     case RHV_VMX_CAP_CR0_FIXED0: *value = 0x20; break;             /* NE; PE and PG are free (unrestricted guest) */
     case RHV_VMX_CAP_CR0_FIXED1: *value = 0xFFFFFFFFull; break;
     case RHV_VMX_CAP_CR4_FIXED0: *value = 0; break;                /* no VMXE: the guest is not run inside VMX */
-    case RHV_VMX_CAP_CR4_FIXED1: *value = 0x00FFDFFFull; break;    /* every CR4 bit AMD has; bit 13 (VMXE) is reserved */
+    case RHV_VMX_CAP_CR4_FIXED1: *value = 0x00FFFFFFull; break;    /* bit 13 (VMXE) is accepted and kept out of the VMCB */
     default:
         return RHV_HV_BAD_ARGUMENT;
     }

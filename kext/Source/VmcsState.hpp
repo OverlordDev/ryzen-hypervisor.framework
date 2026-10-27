@@ -35,6 +35,7 @@ enum : uint32_t {
     F_CPU_BASED2         = 0x401e,
     F_CR0_MASK           = 0x6000,
     F_CR4_MASK           = 0x6002,
+    F_GUEST_CR4          = 0x6804,
     F_RO_INSTR_ERROR     = 0x4400,
     F_RO_EXIT_REASON     = 0x4402,
     F_RO_IRQ_INFO        = 0x4404,
@@ -84,6 +85,9 @@ enum : uint32_t {
 };
 enum : uint32_t { V4_XSETBV_BIT = 1u << 13 };
 
+/* CR4.VMXE: Intel clients (QEMU's HVF backend) always set it in the guest CR4 and hide it with the CR4 mask/shadow. It
+ * is reserved on AMD and makes VMRUN fail with VMEXIT_INVALID, so it never reaches the VMCB; the field remembers it. */
+static const uint64_t CR4_VMXE = 1ull << 13;
 static const uint64_t EFER_LME = 1ull << 8;
 static const uint64_t EFER_LMA = 1ull << 10;
 static const uint32_t INT_CTL_V_IRQ = 1u << 8;
@@ -138,6 +142,8 @@ public:
             return R_OK;
         case KIND_VMCB: {
             uint64_t v = loadBytes(m.vmcbOff, m.vmcbSize);
+            if (enc == F_GUEST_CR4)
+                v |= fShadow[idx] & CR4_VMXE;
             *out = v & mask(fieldBytes(enc));
             return R_OK;
         }
@@ -175,6 +181,10 @@ public:
             fDr[m.vmcbOff] = value;
             return R_OK;
         case KIND_VMCB:
+            if (enc == F_GUEST_CR4) {
+                fShadow[idx] = value & CR4_VMXE;
+                value &= ~CR4_VMXE;
+            }
             storeBytes(m.vmcbOff, m.vmcbSize, value);
             return R_OK;
         case KIND_SEG_AR:
@@ -342,13 +352,21 @@ public:
      * VmRun returned without a guest-caused exit (time slice over, or hv_vcpu_interrupt): to a Hypervisor.framework
      * client that looks like an external-interrupt exit, which is what the real framework reports.
      */
-    void recordSynthetic(uint32_t reason)
+    /*
+     * `idtInfo`/`idtError`: an event the client asked to inject (or one whose delivery was interrupted) that was not
+     * delivered before this exit. It is handed back in the IDT-vectoring information so the client injects it again;
+     * without it the interrupt is lost (QEMU's APIC then keeps it "in service" and blocks every lower vector). 0 when
+     * there is none: the field must not keep the previous exit's value either.
+     */
+    void recordSynthetic(uint32_t reason, uint32_t idtInfo = 0, uint32_t idtError = 0)
     {
         set(F_RO_EXIT_REASON, reason);
         set(F_RO_QUALIFICATION, 0);
         set(F_RO_INSTR_LEN, 0);
         set(F_RO_IRQ_INFO, 0);
         set(F_RO_IRQ_ERROR, 0);
+        set(F_RO_IDT_INFO, idtInfo);
+        set(F_RO_IDT_ERROR, idtError);
     }
 
 private:

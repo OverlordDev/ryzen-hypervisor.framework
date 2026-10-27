@@ -335,9 +335,17 @@ static inline bool translateExit(const SvmExit &in, VmxExit *out)
         bool write = (in.info1 & (1u << 1)) != 0;
         bool fetch = (in.info1 & (1u << 4)) != 0;
         out->reason = VMX_EPT_VIOLATION;
+        /*
+         * Bit 7 (guest linear address valid) is set for every access a guest instruction makes; bit 8 says the fault
+         * is on the final translation rather than on a page table the CPU was walking. SVM reports that in
+         * EXITINFO1 bit 32 (final address) and 33 (page table walk). QEMU's HVF backend only emulates an access
+         * when both bits are set and otherwise just re-enters the guest.
+         */
+        const bool walk = (in.info1 & (1ull << 33)) != 0;
         out->qual   = (fetch ? (1u << 2) : write ? (1u << 1) : (1u << 0)) |
                       ((in.nptPerm & 1u) ? (1u << 3) : 0) | ((in.nptPerm & 2u) ? (1u << 4) : 0) |
-                      ((in.nptPerm & 4u) ? (1u << 5) : 0);
+                      ((in.nptPerm & 4u) ? (1u << 5) : 0) |
+                      (1u << 7) | (walk ? 0 : (1u << 8));
         out->gpa = in.info2;
         out->instrLen = 0;
         return true;

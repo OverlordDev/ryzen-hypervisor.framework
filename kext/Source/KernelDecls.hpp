@@ -10,6 +10,8 @@
 
 extern "C" {
 void         mp_rendezvous_no_intrs(void (*action)(void *), void *arg);
+/* Runs `action` on the CPUs in the mask (bit n = CPU n) from an IPI. mode: 0 SYNC, 1 ASYNC, 2 NOSYNC. Returns the CPUs reached. */
+uint64_t     mp_cpus_call(uint64_t cpus, int mode, void (*action)(void *), void *arg);
 int          cpu_number(void);
 uint64_t     mach_absolute_time(void);
 void         nanoseconds_to_absolutetime(uint64_t nanoseconds, uint64_t *result);

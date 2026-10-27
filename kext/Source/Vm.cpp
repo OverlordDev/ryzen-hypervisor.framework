@@ -148,6 +148,7 @@ bool com_overlorddev_RyzenHVVm::init()
     fXcr0Supported = 0;
     fFpuSize       = 0;
     fKick          = 0;
+    fRunCpu        = -1;
     fFirstRun    = true;
     fHaveNextRip = false;
 
@@ -537,6 +538,28 @@ static uint32_t classify(uint64_t code)
     }
 }
 
+/*
+ * At most one kick IPI per CPU is in flight: mp_cpus_call draws from a small pool in the kernel, and the handler may run
+ * after the VM that asked for it is gone, so it only touches this array, never the VM.
+ */
+static volatile uint8_t gKickInFlight[64];
+
+static void kickAction(void *)
+{
+    int cpu = cpu_number();
+    if (cpu >= 0 && cpu < 64)
+        gKickInFlight[cpu] = 0;
+}
+
+void com_overlorddev_RyzenHVVm::kick()
+{
+    fKick = 1;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    int cpu = fRunCpu;
+    if (cpu >= 0 && cpu < 64 && __sync_bool_compare_and_swap(&gKickInFlight[cpu], 0, 1))
+        mp_cpus_call(1ull << cpu, 2 /* NOSYNC */, kickAction, nullptr);
+}
+
 IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 {
     IOReturn rc = kIOReturnSuccess;
@@ -570,11 +593,26 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
     uint64_t deadline = mach_absolute_time() + sliceAbs;
     uint64_t code = 0;
     bool timeslice = false;
+    /*
+     * An event waiting to go in (the client's injection, or one whose delivery a host interrupt cut short) when we
+     * leave without having run the guest long enough to deliver it. It goes back to the client as IDT-vectoring
+     * information; dropping it loses the interrupt (the client believes it was delivered).
+     */
+    uint32_t carryInfo = 0, carryErr = 0;
+    auto takePendingEvent = [&]() {
+        if (v->control.eventInj & (1u << 31)) {
+            carryInfo = v->control.eventInj;
+            carryErr  = v->control.eventInjErr;
+            v->control.eventInj    = 0;
+            v->control.eventInjErr = 0;
+        }
+    };
 
     for (;;) {
         if (fKick) {                  /* hv_vcpu_interrupt from another thread */
             fKick = 0;
             timeslice = true;
+            takePendingEvent();
             break;
         }
         v->control.exitCode = 0;
@@ -586,7 +624,15 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 
         /* Interrupts off from here until the exit has been looked at. See activeOnAllUsable(). */
         int ints = ml_set_interrupts_enabled(0);
+        fRunCpu = cpu_number();               /* interrupts are off: the thread cannot move before VMRUN */
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (fKick) {                          /* a kick that arrived before fRunCpu was visible */
+            fRunCpu = -1;
+            ml_set_interrupts_enabled(ints);
+            continue;
+        }
         if (!svm::activeOnAllUsable()) {
+            fRunCpu = -1;
             ml_set_interrupts_enabled(ints);
             RHV_ERR("VmRun: SVM was turned off under us (sleep?), not entering the guest");
             rc = kIOReturnNotReady;
@@ -607,6 +653,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         const bool wasTs = rhv::fpu::clearTs();
         const uint64_t hostX = rhv::fpu::xgetbv0();
         if (guestX & ~hostX) {
+            fRunCpu = -1;
             rhv::fpu::restoreTs(wasTs);
             ml_set_interrupts_enabled(ints);
             RHV_ERR("VmRun: guest XCR0 0x%llx needs state this thread has not enabled (0x%llx)",
@@ -634,6 +681,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         }
 
         rhv_svm_vmrun(&fGprs, fVmcb.pa, fHostVmcb.pa);
+        fRunCpu = -1;
 
         if (fVmx) {
             for (unsigned i = 0; i < 4; i++)
@@ -658,6 +706,9 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 
         code = v->control.exitCode;
         RHV_STAT_INC(vmExits);
+        /* The injection was either delivered or is reported in exitIntInfo; do not let it fire a second time. */
+        v->control.eventInj    = 0;
+        v->control.eventInjErr = 0;
 
         /*
          * The guest executed an SVM instruction (VMRUN, VMLOAD, VMSAVE, STGI, CLGI, SKINIT). A Hypervisor.framework
@@ -678,6 +729,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             /* The host needed the CPU. It has it now; run on unless the slice is over. */
             if (mach_absolute_time() >= deadline) {
                 timeslice = true;
+                takePendingEvent();
                 break;
             }
             continue;
@@ -690,7 +742,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         if (timeslice) {
             out->reason = RHV_EXIT_TIMESLICE;
             if (fVmx)
-                fVmcs.recordSynthetic(rhv::vmx::VMX_EXT_INTR);
+                fVmcs.recordSynthetic(rhv::vmx::VMX_EXT_INTR, carryInfo, carryErr);
         } else {
             out->reason   = classify(code);
             if (out->reason == RHV_EXIT_NPF)

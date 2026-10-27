@@ -60,7 +60,7 @@ static void rhv_trace(const char *fmt, ...)
 __attribute__((constructor)) static void rhv_shim_init(void)
 {
     const char *v = getenv("RYZENHV_TRACE");
-    g_trace = v && *v && *v != '0';
+    g_trace = v && *v && *v != '0' ? atoi(v) : 0;      /* 1: every call, 2: only what is not routine I/O, CPUID, MMIO */
     const char *path = getenv("RYZENHV_TRACE_FILE");
     g_stream = path && *path ? fopen(path, "a") : NULL;
     if (!g_stream)
@@ -145,15 +145,86 @@ static hv_return_t rhv_hv_vcpu_destroy(hv_vcpuid_t vcpu)
 }
 DYLD_INTERPOSE(rhv_hv_vcpu_destroy, hv_vcpu_destroy);
 
+/*
+ * RYZENHV_STATS=1: once a second, one line in /tmp/rhv-stats.txt (RYZENHV_STATS_FILE): VM exits per second, the share of
+ * time spent in the guest, kernel round trips per exit and microseconds per exit. Cheap enough to leave on while timing.
+ */
+extern unsigned long long rhv_iokit_calls;
+extern unsigned long long rhv_core_injections;
+static unsigned long long g_kicks;          /* hv_vcpu_interrupt calls */
+static int g_stats = -1;
+static FILE *g_stats_stream;
+static struct {
+    double last, inKernel, tRunStart;
+    unsigned long long runs, calls0, inj0, kicks0, byReason[64];
+} g_st;
+
+static void stats_after_run(uint64_t reasonBasic)
+{
+    g_st.runs++;
+    g_st.byReason[reasonBasic & 63]++;
+    double now = seconds();
+    if (now - g_st.last < 1.0)
+        return;
+    double dt = now - g_st.last;
+    unsigned long long calls = rhv_iokit_calls - g_st.calls0;
+    fprintf(g_stats_stream, "[%8.3f] %6.0f exits/s  guest %4.1f%%  %5.1f kernel calls/exit  %6.1f us/exit  inj %llu  kicks %llu  reasons:",
+            now - g_t0, g_st.runs / dt, 100.0 * g_st.inKernel / dt, g_st.runs ? (double)calls / g_st.runs : 0.0,
+            g_st.runs ? 1e6 * dt / g_st.runs : 0.0, rhv_core_injections - g_st.inj0, g_kicks - g_st.kicks0);
+    for (int i = 0; i < 64; i++)
+        if (g_st.byReason[i])
+            fprintf(g_stats_stream, " %d:%llu", i, g_st.byReason[i]);
+    fputc('\n', g_stats_stream);
+    fflush(g_stats_stream);
+    memset(g_st.byReason, 0, sizeof(g_st.byReason));
+    g_st.runs = 0;
+    g_st.inKernel = 0;
+    g_st.calls0 = rhv_iokit_calls;
+    g_st.inj0 = rhv_core_injections;
+    g_st.kicks0 = g_kicks;
+    g_st.last = now;
+}
+
 static hv_return_t rhv_hv_vcpu_run(hv_vcpuid_t vcpu)
 {
+    if (g_stats < 0) {
+        const char *e = getenv("RYZENHV_STATS");
+        g_stats = e && *e && *e != '0';
+        if (g_stats) {
+            const char *path = getenv("RYZENHV_STATS_FILE");
+            g_stats_stream = fopen(path && *path ? path : "/tmp/rhv-stats.txt", "a");
+            if (!g_stats_stream)
+                g_stats = 0;
+            g_st.last = seconds();
+        }
+    }
+    double t0 = g_stats > 0 ? seconds() : 0;
     hv_return_t r = (hv_return_t)rhv_vcpu_run(vcpu);
+    if (g_stats > 0) {
+        g_st.inKernel += seconds() - t0;
+        uint64_t reason = 0;
+        rhv_vmx_vcpu_read_vmcs(vcpu, 0x4402, &reason);       /* cached: QEMU reads it right after anyway */
+        stats_after_run(reason & 0xFFFF);
+    }
     if (g_trace) {
         uint64_t reason = 0, rip = 0;
+        if (g_trace >= 2) {                                   /* only the unusual exits */
+            rhv_vmx_vcpu_read_vmcs(vcpu, 0x4402, &reason);
+            unsigned basic = (unsigned)(reason & 0xFFFF);
+            if (basic == 30 || basic == 48 || basic == 10 || basic == 28 || basic == 31 || basic == 32)
+                return r;
+        }
         rhv_vmx_vcpu_read_vmcs(vcpu, 0x4402, &reason);
         rhv_vmx_vcpu_read_vmcs(vcpu, 0x681e, &rip);
-        rhv_trace("hv_vcpu_run(%u) -> %#x exit reason %llu rip %#llx", vcpu, (unsigned)r, (unsigned long long)(reason & 0xFFFF),
-                  (unsigned long long)rip);
+        uint64_t rfl = 0, intr = 0, idt = 0, ctl = 0, qual = 0;
+        rhv_vmx_vcpu_read_vmcs(vcpu, 0x6820, &rfl);
+        rhv_vmx_vcpu_read_vmcs(vcpu, 0x4824, &intr);     /* guest interruptibility */
+        rhv_vmx_vcpu_read_vmcs(vcpu, 0x4408, &idt);      /* IDT-vectoring info */
+        rhv_vmx_vcpu_read_vmcs(vcpu, 0x4002, &ctl);      /* primary processor-based controls */
+        rhv_vmx_vcpu_read_vmcs(vcpu, 0x6400, &qual);
+        rhv_trace("hv_vcpu_run(%u) -> %#x exit reason %llu rip %#llx rfl %#llx intr %#llx idt %#llx ctl %#llx qual %#llx", vcpu,
+                  (unsigned)r, (unsigned long long)(reason & 0xFFFF), (unsigned long long)rip, (unsigned long long)rfl,
+                  (unsigned long long)intr, (unsigned long long)idt, (unsigned long long)ctl, (unsigned long long)qual);
     }
     return r;
 }
@@ -168,6 +239,9 @@ DYLD_INTERPOSE(rhv_hv_vcpu_run_until, hv_vcpu_run_until);
 
 static hv_return_t rhv_hv_vcpu_interrupt(hv_vcpuid_t *vcpus, unsigned int count)
 {
+    g_kicks++;
+    if (g_trace)
+        rhv_trace("hv_vcpu_interrupt(%u)", count);
     RESULT("hv_vcpu_interrupt", rhv_vcpu_interrupt(vcpus, count));
 }
 DYLD_INTERPOSE(rhv_hv_vcpu_interrupt, hv_vcpu_interrupt);

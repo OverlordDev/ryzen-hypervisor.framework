@@ -70,7 +70,12 @@ public:
 
     /* Guest x87/SSE/AVX state and XCR0. */
     IOReturn msrOp(uint32_t op, uint32_t msr, uint64_t value, uint64_t *out);
-    void     kick() { fKick = 1; }     /* no lock: called while another thread sits in run() */
+    /*
+     * hv_vcpu_interrupt: no lock, called while another thread sits in run(). Besides raising the flag it sends an IPI to
+     * the CPU the guest runs on: the physical interrupt makes VMRUN exit at once, instead of when the host happens to
+     * take its next interrupt (up to 10 ms later, too slow for a guest that expects a 250-1000 Hz timer).
+     */
+    void     kick();
 
     IOReturn getFpu(RHVFpuState *out);
     IOReturn setFpu(const RHVFpuState *in);
@@ -103,6 +108,7 @@ private:
     uint64_t                  fXcr0Supported;    /* CPUID.0xD.0 EDX:EAX */
     uint32_t                  fFpuSize;
     volatile uint32_t         fKick;
+    volatile int              fRunCpu;           /* CPU inside VMRUN, -1 when none; for kick() */
     bool                      fVmx;
     uint64_t                  fPagesMapped;
     rhv::GuestGprs            fGprs;

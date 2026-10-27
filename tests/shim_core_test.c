@@ -44,6 +44,7 @@ SAME(RHV_HV_MEMORY_MASK, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
 
 static struct {
     int vmCreated, vmDestroyed, kicks, runs;
+    int getRegs, setRegs, vmcsReads, vmcsWrites;     /* calls that reached the "kernel" */
     uint32_t createFlags;
     struct { uint64_t uva, gpa, size; uint32_t flags; } map;
     struct { uint64_t gpa, size; } unmap;
@@ -66,16 +67,16 @@ static int f_vm_map(void *c, uint64_t u, uint64_t g, uint64_t s, uint32_t f)
 { (void)c; K.map.uva = u; K.map.gpa = g; K.map.size = s; K.map.flags = f; return s == 0 ? IOR_BAD : (g == 0x7000 ? IOR_BUSY : 0); }
 static int f_vm_unmap(void *c, uint64_t g, uint64_t s) { (void)c; K.unmap.gpa = g; K.unmap.size = s; return 0; }
 static int f_vm_protect(void *c, uint64_t g, uint64_t s, uint32_t f) { (void)c; K.prot.gpa = g; K.prot.size = s; K.prot.flags = f; return 0xe00002f0; }
-static int f_vmcs_read(void *c, uint32_t f, uint64_t *v) { (void)c; if (f >= 0x10000) return IOR_BAD; *v = K.vmcs[f]; return 0; }
-static int f_vmcs_write(void *c, uint32_t f, uint64_t v) { (void)c; if (f >= 0x10000) return IOR_BAD; K.vmcs[f] = v; return 0; }
-static int f_get_regs(void *c, RHVRegs *r) { (void)c; *r = K.regs; return 0; }
-static int f_set_regs(void *c, const RHVRegs *r) { (void)c; K.regs = *r; return 0; }
+static int f_vmcs_read(void *c, uint32_t f, uint64_t *v) { (void)c; K.vmcsReads++; if (f >= 0x10000) return IOR_BAD; *v = K.vmcs[f]; return 0; }
+static int f_vmcs_write(void *c, uint32_t f, uint64_t v) { (void)c; K.vmcsWrites++; if (f >= 0x10000) return IOR_BAD; K.vmcs[f] = v; return 0; }
+static int f_get_regs(void *c, RHVRegs *r) { (void)c; K.getRegs++; *r = K.regs; return 0; }
+static int f_set_regs(void *c, const RHVRegs *r) { (void)c; K.setRegs++; K.regs = *r; return 0; }
 static int f_get_fpu(void *c, RHVFpuState *f) { (void)c; *f = K.fpu; return 0; }
 static int f_set_fpu(void *c, const RHVFpuState *f) { (void)c; if (f->xcr0 == 0) return IOR_BAD; K.fpu = *f; return 0; }
 static int f_msr(void *c, uint32_t op, uint32_t msr, uint64_t value, uint64_t *out)
 {
     (void)c;
-    if (msr == 0x1B) return IOR_BAD;
+    if (msr == 0x80) return IOR_BAD;
     if (op == RHV_MSR_NATIVE_ENABLE || op == RHV_MSR_NATIVE_DISABLE) { K.nativeMsr = (int)op; K.nativeMsrNum = msr; return 0; }
     for (int i = 0; i < K.msrCount; i++)
         if (K.msrs[i][0] == msr) {
@@ -86,7 +87,7 @@ static int f_msr(void *c, uint32_t op, uint32_t msr, uint64_t value, uint64_t *o
     *out = 0;
     return 0;
 }
-static int f_run(void *c, RHVExit *e) { (void)c; K.runs++; K.now += 1000; e->reason = RHV_EXIT_HLT; return K.failNext ? (int)0xe00002d8 : 0; }
+static int f_run(void *c, RHVExit *e) { (void)c; K.runs++; K.now += 1000; K.regs.rip += 2; K.vmcs[0x4402] = 12 + (uint64_t)K.runs; e->reason = RHV_EXIT_HLT; return K.failNext ? (int)0xe00002d8 : 0; }
 static int f_kick(void *c) { (void)c; K.kicks++; return 0; }
 static uint64_t f_now(void *c) { (void)c; return K.now; }
 static uint64_t f_tsc(void *c) { (void)c; return K.hostTsc; }
@@ -163,6 +164,7 @@ static void testRegisters(void)
     /* General purpose registers go through RHVRegs, each to its own slot. */
     for (uint32_t r = RHV_X86_RIP; r <= RHV_X86_R15; r++)
         CHECK(rhv_vcpu_write_register(v, r, 0x1000 + r) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_flush(v) == RHV_HV_SUCCESS);                  /* register writes are buffered until flush or run */
     CHECK(K.regs.rip == 0x1000 && K.regs.rflags == 0x1001 && K.regs.rax == 0x1002 && K.regs.rcx == 0x1003 &&
           K.regs.rdx == 0x1004 && K.regs.rbx == 0x1005 && K.regs.rsi == 0x1006 && K.regs.rdi == 0x1007 &&
           K.regs.rsp == 0x1008 && K.regs.rbp == 0x1009 && K.regs.r8 == 0x100a && K.regs.r15 == 0x1011);
@@ -170,7 +172,8 @@ static void testRegisters(void)
         CHECK(rhv_vcpu_read_register(v, r, &x) == RHV_HV_SUCCESS && x == 0x1000 + r);
 
     /* Writing one register must not disturb the others. */
-    CHECK(rhv_vcpu_write_register(v, RHV_X86_RAX, 0xAA) == RHV_HV_SUCCESS && K.regs.rbx == 0x1005 && K.regs.rax == 0xAA);
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_RAX, 0xAA) == RHV_HV_SUCCESS && rhv_vcpu_flush(v) == RHV_HV_SUCCESS);
+    CHECK(K.regs.rbx == 0x1005 && K.regs.rax == 0xAA);
 
     /* Everything else is a VMCS (or extension) field, each to its own encoding. */
     struct { uint32_t reg, field; } map[] = {
@@ -211,6 +214,82 @@ static void testRegisters(void)
     CHECK(rhv_vcpu_write_register(v, RHV_X86_XCR0, 0) == RHV_HV_BAD_ARGUMENT);   /* kernel refuses */
 }
 
+/* The state cache: how many calls reach the kernel, and that nothing stale is ever returned. */
+static void testCache(void)
+{
+    fresh();
+    uint32_t v = makeVcpu();
+    uint64_t x;
+    K.regs.rax = 0x11; K.regs.rip = 0x2000; K.regs.rsp = 0x3000; K.regs.rflags = 0x202;
+    K.vmcs[0x4402] = 30; K.vmcs[0x6400] = 0x80;
+
+    /* Sixteen registers, RIP and the VMCS twins of RIP/RSP/RFLAGS: one call. */
+    for (uint32_t r = RHV_X86_RIP; r <= RHV_X86_R15; r++)
+        CHECK(rhv_vcpu_read_register(v, r, &x) == RHV_HV_SUCCESS);
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x681e, &x) == RHV_HV_SUCCESS && x == 0x2000);
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x681c, &x) == RHV_HV_SUCCESS && x == 0x3000);
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x6820, &x) == RHV_HV_SUCCESS && x == 0x202);
+    CHECK(K.getRegs == 1 && K.vmcsReads == 0);
+
+    /* Other fields are read once. */
+    for (int i = 0; i < 5; i++)
+        CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x4402, &x) == RHV_HV_SUCCESS && x == 30);
+    CHECK(K.vmcsReads == 1);
+
+    /* Register writes are buffered and visible to reads, including as VMCS fields; one write-back. */
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_RAX, 0x99) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_RIP, 0x2004) == RHV_HV_SUCCESS);
+    CHECK(rhv_vmx_vcpu_write_vmcs(v, 0x6820, 0x246) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_RAX, &x) == RHV_HV_SUCCESS && x == 0x99);
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x681e, &x) == RHV_HV_SUCCESS && x == 0x2004);
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_RFLAGS, &x) == RHV_HV_SUCCESS && x == 0x246);
+    CHECK(K.setRegs == 0 && K.regs.rax == 0x11 && K.getRegs == 1);
+    CHECK(rhv_vcpu_run(v) == RHV_HV_SUCCESS);
+    CHECK(K.setRegs == 1 && K.runs == 1);                          /* flushed by the run, before it */
+
+    /* The guest ran: the cache is gone, reads see what the run changed (our fake run moves RIP by 2 and the reason). */
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_RIP, &x) == RHV_HV_SUCCESS && x == 0x2006);
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_RAX, &x) == RHV_HV_SUCCESS && x == 0x99);
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x4402, &x) == RHV_HV_SUCCESS && x == 13);
+    CHECK(K.getRegs == 2);
+
+    /* A VMCS write is passed through at once, and the old value is not served afterwards. */
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x4002, &x) == RHV_HV_SUCCESS && x == 0);
+    int w = K.vmcsWrites;
+    CHECK(rhv_vmx_vcpu_write_vmcs(v, 0x4002, 0x84000004) == RHV_HV_SUCCESS && K.vmcsWrites == w + 1 && K.vmcs[0x4002] == 0x84000004);
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x4002, &x) == RHV_HV_SUCCESS && x == 0x84000004);
+    /* An unknown field is an error every time, not a cached zero. */
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0xFFFFF, &x) == RHV_HV_BAD_ARGUMENT);
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0xFFFFF, &x) == RHV_HV_BAD_ARGUMENT);
+
+    /* Writing an MSR can change VMCS fields (EFER): the VMCS cache is dropped. */
+    K.vmcs[0x2806] = 0x500;
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x2806, &x) == RHV_HV_SUCCESS && x == 0x500);
+    K.vmcs[0x2806] = 0xd01;
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x2806, &x) == RHV_HV_SUCCESS && x == 0x500);       /* still cached */
+    CHECK(rhv_vcpu_write_msr(v, 0xC0000080, 0xd01) == RHV_HV_SUCCESS);
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x2806, &x) == RHV_HV_SUCCESS && x == 0xd01);
+
+    /* Many different fields at once must all stay correct (the cache is a small hash table). */
+    for (uint32_t f = 0; f < 100; f++)
+        K.vmcs[0x800 + 2 * f] = 1000 + f;
+    rhv_core_cache_reset();
+    for (int pass = 0; pass < 2; pass++)
+        for (uint32_t f = 0; f < 100; f++)
+            CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x800 + 2 * f, &x) == RHV_HV_SUCCESS && x == 1000 + f);
+    CHECK(rhv_vmx_vcpu_write_vmcs(v, 0x800 + 2 * 7, 5) == RHV_HV_SUCCESS);
+    for (uint32_t f = 0; f < 100; f++)
+        CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x800 + 2 * f, &x) == RHV_HV_SUCCESS && x == (f == 7 ? 5u : 1000 + f));
+
+    /* A dead vCPU leaves nothing behind. */
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_RBX, 0x77) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_destroy(v) == RHV_HV_SUCCESS);
+    uint32_t v2 = 9;
+    CHECK(rhv_vcpu_create(&v2, 0) == RHV_HV_SUCCESS);
+    K.regs.rbx = 0x55;
+    CHECK(rhv_vcpu_read_register(v2, RHV_X86_RBX, &x) == RHV_HV_SUCCESS && x == 0x55);
+}
+
 static void testFpuMsrVmcs(void)
 {
     fresh();
@@ -230,7 +309,10 @@ static void testFpuMsrVmcs(void)
     uint64_t x = 0;
     CHECK(rhv_vcpu_write_msr(v, 0xC0000082, 0xdead) == RHV_HV_SUCCESS);
     CHECK(rhv_vcpu_read_msr(v, 0xC0000082, &x) == RHV_HV_SUCCESS && x == 0xdead);
-    CHECK(rhv_vcpu_read_msr(v, 0x1B, &x) == RHV_HV_BAD_ARGUMENT);                   /* kernel refuses unknown MSRs */
+    CHECK(rhv_vcpu_read_msr(v, 0x1B, &x) == RHV_HV_SUCCESS && x == 0xFEE00900ull);  /* APIC base: answered by the shim */
+    CHECK(rhv_vcpu_write_msr(v, 0x1B, 0xFEE00800ull) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_read_msr(v, 0x1B, &x) == RHV_HV_SUCCESS && x == 0xFEE00800ull && K.msrCount == 1);   /* never reached the kernel */
+    CHECK(rhv_vcpu_read_msr(v, 0x80, &x) == RHV_HV_BAD_ARGUMENT);                   /* other unknown MSRs: the kernel refuses */
     CHECK(rhv_vcpu_enable_native_msr(v, 0xC0000081, 1) == RHV_HV_SUCCESS && K.nativeMsr == RHV_MSR_NATIVE_ENABLE && K.nativeMsrNum == 0xC0000081);
     CHECK(rhv_vcpu_enable_native_msr(v, 0xC0000081, 0) == RHV_HV_SUCCESS && K.nativeMsr == RHV_MSR_NATIVE_DISABLE);
 
@@ -326,7 +408,7 @@ static void testCapabilities(void)
     CHECK(((uint32_t)(v >> 32)) & (1u << 7));                                             /* unrestricted guest */
     CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_PINBASED, &v) == RHV_HV_SUCCESS);
     CHECK(!(((uint32_t)(v >> 32)) & (1u << 6)));                                          /* no preemption timer */
-    CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_CR4_FIXED1, &v) == RHV_HV_SUCCESS && !(v & (1u << 13)));   /* VMXE is reserved on AMD */
+    CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_CR4_FIXED1, &v) == RHV_HV_SUCCESS && (v & (1u << 13)));    /* VMXE is accepted (QEMU always sets it) */
     CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_CR4_FIXED0, &v) == RHV_HV_SUCCESS && v == 0);
 }
 
@@ -335,6 +417,7 @@ int main(void)
     testLifecycle();
     testMemory();
     testRegisters();
+    testCache();
     testFpuMsrVmcs();
     testRunAndThreads();
     testErrorMapping();
