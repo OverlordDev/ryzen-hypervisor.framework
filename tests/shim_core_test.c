@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "../shim/rhv_core.h"
+#include "../shim/rhv_fields.h"
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
@@ -45,6 +46,7 @@ SAME(RHV_HV_MEMORY_MASK, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
 static struct {
     int vmCreated, vmDestroyed, kicks, runs;
     int getRegs, setRegs, vmcsReads, vmcsWrites;     /* calls that reached the "kernel" */
+    int runEx, runExNoRun, readMany;                 /* fast path calls */
     uint32_t createFlags;
     struct { uint64_t uva, gpa, size; uint32_t flags; } map;
     struct { uint64_t gpa, size; } unmap;
@@ -93,6 +95,58 @@ static uint64_t f_now(void *c) { (void)c; return K.now; }
 static uint64_t f_tsc(void *c) { (void)c; return K.hostTsc; }
 static unsigned long f_thread(void *c) { (void)c; return K.thread; }
 
+/* The fast path: the same fake kernel behind VmRunEx / VmcsReadMany. */
+static const uint32_t kFastFields[RHV_RUN_NFIELDS] = {
+#define X(e) e,
+    RHV_RUN_FIELDS_LIST(X)
+#undef X
+};
+
+static int f_run_ex(void *c, const RHVRunIn *in, RHVRunOut *out)
+{
+    (void)c;
+    memset(out, 0, sizeof(*out));
+    K.runEx++;
+    if (in->nWrites > RHV_RUN_MAX_WRITES) return IOR_BAD;
+    if (in->flags & RHV_RUN_REGS) K.regs = in->regs;
+    for (uint32_t i = 0; i < in->nWrites; i++) {
+        if (in->writes[i].field >= 0x10000) { out->failedWrite = i; return IOR_BAD; }
+        K.vmcsWrites++;
+        K.vmcs[in->writes[i].field] = in->writes[i].value;
+    }
+    if (in->flags & RHV_RUN_NO_RUN) K.runExNoRun++;
+    else {
+        RHVExit e;
+        int rc = f_run(c, &e);
+        if (rc) return rc;
+    }
+    out->regs = K.regs;
+    for (unsigned i = 0; i < RHV_RUN_NFIELDS; i++) out->fields[i] = K.vmcs[kFastFields[i]];
+    return 0;
+}
+
+static int f_read_many(void *c, const RHVReadMany *in, RHVReadManyOut *out)
+{
+    (void)c;
+    K.readMany++;
+    memset(out, 0, sizeof(*out));
+    if (in->count > RHV_READMANY_MAX) return IOR_BAD;
+    for (uint32_t i = 0; i < in->count; i++) out->values[i] = K.vmcs[in->fields[i]];
+    return 0;
+}
+
+static void freshFast(void)
+{
+    memset(&K, 0, sizeof(K));
+    K.fpu.xcr0 = 1;
+    K.fpu.size = 832;
+    K.thread = 1;
+    RhvBackend b = { NULL, f_vm_create, f_vm_destroy, f_vm_map, f_vm_unmap, f_vm_protect, f_vmcs_read, f_vmcs_write,
+                     f_get_regs, f_set_regs, f_get_fpu, f_set_fpu, f_msr, f_run, f_kick, f_now, f_tsc, f_thread,
+                     f_run_ex, f_read_many };
+    rhv_core_init(&b);
+}
+
 static void fresh(void)
 {
     memset(&K, 0, sizeof(K));
@@ -100,7 +154,8 @@ static void fresh(void)
     K.fpu.size = 832;
     K.thread = 1;
     RhvBackend b = { NULL, f_vm_create, f_vm_destroy, f_vm_map, f_vm_unmap, f_vm_protect, f_vmcs_read, f_vmcs_write,
-                     f_get_regs, f_set_regs, f_get_fpu, f_set_fpu, f_msr, f_run, f_kick, f_now, f_tsc, f_thread };
+                     f_get_regs, f_set_regs, f_get_fpu, f_set_fpu, f_msr, f_run, f_kick, f_now, f_tsc, f_thread,
+                     NULL, NULL };               /* the one-call-per-field path */
     rhv_core_init(&b);
 }
 
@@ -212,6 +267,87 @@ static void testRegisters(void)
     memcpy(&bv, K.fpu.area + 512, 8);
     CHECK(bv == 3);                                        /* AVX no longer marked in use */
     CHECK(rhv_vcpu_write_register(v, RHV_X86_XCR0, 0) == RHV_HV_BAD_ARGUMENT);   /* kernel refuses */
+}
+
+/* The fast path: one kernel call per guest exit, writes buffered, the usual reads served from the reply. */
+static void testFastPath(void)
+{
+    freshFast();
+    uint32_t v = makeVcpu();
+    uint64_t x;
+    K.regs.rax = 0x11; K.regs.rip = 0x2000; K.regs.rflags = 0x202;
+    K.vmcs[0x4402] = 30; K.vmcs[0x6400] = 0x80;
+
+    /* Writes wait for the run, in one call, together with the dirty registers. */
+    CHECK(rhv_vmx_vcpu_write_vmcs(v, 0x4002, 0x840065fe) == RHV_HV_SUCCESS);
+    CHECK(rhv_vmx_vcpu_write_vmcs(v, 0x4016, 0x80000030) == RHV_HV_SUCCESS);
+    CHECK(rhv_vmx_vcpu_write_vmcs(v, 0x4002, 0x840065fa) == RHV_HV_SUCCESS);          /* same field again: last wins */
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_RAX, 0x99) == RHV_HV_SUCCESS);
+    CHECK(K.vmcsWrites == 0 && K.runEx == 0 && K.getRegs == 1);                       /* only the register fetch */
+    CHECK(rhv_vcpu_run(v) == RHV_HV_SUCCESS);
+    CHECK(K.runEx == 1 && K.vmcsWrites == 2 && K.vmcs[0x4002] == 0x840065fa && K.vmcs[0x4016] == 0x80000030);
+    CHECK(K.regs.rax == 0x99 && K.runs == 1 && K.setRegs == 0);
+
+    /* After the exit nothing more is asked of the kernel for the usual reads. */
+    int calls = K.getRegs + K.vmcsReads + K.readMany + K.runEx;
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x4402, &x) == RHV_HV_SUCCESS && x == 13);
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x6400, &x) == RHV_HV_SUCCESS && x == 0x80);
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_RIP, &x) == RHV_HV_SUCCESS && x == 0x2002);
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_RAX, &x) == RHV_HV_SUCCESS && x == 0x99);
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_CR4, &x) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_TPR, &x) == RHV_HV_SUCCESS);
+    CHECK(K.getRegs + K.vmcsReads + K.readMany + K.runEx == calls);
+
+    /* A field the kernel refuses is refused at once, and nothing is buffered for it. */
+    CHECK(rhv_vmx_vcpu_write_vmcs(v, 0x4402, 1) == RHV_HV_BAD_ARGUMENT);              /* read-only exit field */
+    CHECK(rhv_vmx_vcpu_write_vmcs(v, 0xFFFFF, 1) == RHV_HV_BAD_ARGUMENT);             /* no such field */
+    CHECK(rhv_vmx_vcpu_write_vmcs(v, 0xF010, 0x0000800000000000ull) == RHV_HV_BAD_ARGUMENT);   /* non-canonical DR0 */
+    CHECK(rhv_vcpu_flush(v) == RHV_HV_SUCCESS && K.runEx == 1);
+
+    /* Reading a field with a write pending sends the write first. */
+    CHECK(rhv_vmx_vcpu_write_vmcs(v, 0x6804, 0x26b0) == RHV_HV_SUCCESS && K.vmcs[0x6804] == 0);
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x6804, &x) == RHV_HV_SUCCESS && x == 0x26b0);
+    CHECK(K.runEx == 2 && K.runExNoRun == 1 && K.vmcs[0x6804] == 0x26b0 && K.runs == 1);
+
+    /* An MSR access sees the buffered VMCS writes (EFER is both). */
+    CHECK(rhv_vmx_vcpu_write_vmcs(v, 0x2806, 0xd01) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_read_msr(v, 0xC0000082, &x) == RHV_HV_SUCCESS);
+    CHECK(K.vmcs[0x2806] == 0xd01);
+    CHECK(rhv_vcpu_write_msr(v, 0xC0000082, 5) == RHV_HV_SUCCESS);
+
+    /* Segment state comes in one call. */
+    for (uint32_t i = 0; i < 8; i++) { K.vmcs[0x800 + 2 * i] = 0x10 + i; K.vmcs[0x6806 + 2 * i] = 0x1000 * i; K.vmcs[0x4814 + 2 * i] = 0x93 + i; }
+    CHECK(rhv_vcpu_run(v) == RHV_HV_SUCCESS);                                         /* drops the cache */
+    int rm = K.readMany, rd = K.vmcsReads;
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_CS, &x) == RHV_HV_SUCCESS && x == 0x11);
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x6808, &x) == RHV_HV_SUCCESS && x == 0x1000);    /* CS base */
+    CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x4816, &x) == RHV_HV_SUCCESS && x == 0x94);      /* CS access rights */
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_TR, &x) == RHV_HV_SUCCESS && x == 0x17);
+    CHECK(K.readMany == rm + 1 && K.vmcsReads == rd);
+    /* ... and not twice for the same exit, but again after the next run. */
+    CHECK(rhv_vcpu_run(v) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_DS, &x) == RHV_HV_SUCCESS && K.readMany == rm + 2);
+
+    /* More writes than fit in one call: flushed on the way, none lost, order kept. */
+    uint32_t many[100];
+    unsigned nMany = 0;
+    for (unsigned i = 0; i < sizeof(kRhvVmcsEncodings) / sizeof(kRhvVmcsEncodings[0]) && nMany < 100; i++)
+        if (rhv_vmcs_write_status(kRhvVmcsEncodings[i], 0) == RHV_FIELD_OK && kRhvVmcsEncodings[i] != 0x4002 &&
+            kRhvVmcsEncodings[i] != 0x6804)
+            many[nMany++] = kRhvVmcsEncodings[i];
+    CHECK(nMany == 100);
+    for (uint32_t i = 0; i < 150; i++)
+        CHECK(rhv_vmx_vcpu_write_vmcs(v, many[i % 100], 1000 + i) == RHV_HV_SUCCESS);       /* the first 50 twice */
+    CHECK(rhv_vcpu_run(v) == RHV_HV_SUCCESS);
+    for (uint32_t f = 0; f < 100; f++)
+        CHECK(K.vmcs[many[f]] == (f < 50 ? 1100 + f : 1000 + f));
+
+    /* A failed run call is an error, and the buffered state does not linger. */
+    CHECK(rhv_vmx_vcpu_write_vmcs(v, 0x4002, 7) == RHV_HV_SUCCESS);
+    K.failNext = 1;
+    CHECK(rhv_vcpu_run(v) != RHV_HV_SUCCESS);
+    K.failNext = 0;
+    CHECK(rhv_vcpu_flush(v) == RHV_HV_SUCCESS);
 }
 
 /* The state cache: how many calls reach the kernel, and that nothing stale is ever returned. */
@@ -418,6 +554,7 @@ int main(void)
     testMemory();
     testRegisters();
     testCache();
+    testFastPath();
     testFpuMsrVmcs();
     testRunAndThreads();
     testErrorMapping();

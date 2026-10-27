@@ -62,6 +62,8 @@ public:
     IOReturn getRegs(RHVRegs *out);
     IOReturn setRegs(const RHVRegs *in);
     IOReturn run(bool skipInstruction, RHVExit *out);
+    IOReturn runEx(const RHVRunIn *in, RHVRunOut *out);            /* VmRunEx: apply, run, report in one call */
+    IOReturn vmcsReadMany(const RHVReadMany *in, RHVReadManyOut *out);
 
     /* VMX mode (RHV_VMCREATE_VMX): the Hypervisor.framework view of the guest. */
     bool     isVmx() const { return fVmx; }

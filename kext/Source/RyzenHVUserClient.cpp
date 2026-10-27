@@ -127,6 +127,10 @@ IOReturn com_overlorddev_RyzenHVUserClient::externalMethod(uint32_t selector,
         { (IOExternalMethodAction)&C::sVmMsr, 3, 0, 1, 0 },
         /* kRHVMethodVmKick */
         { (IOExternalMethodAction)&C::sVmKick, 0, 0, 0, 0 },
+        /* kRHVMethodVmRunEx: struct in, struct out */
+        { (IOExternalMethodAction)&C::sVmRunEx, 0, sizeof(RHVRunIn), 0, sizeof(RHVRunOut) },
+        /* kRHVMethodVmcsReadMany: struct in, struct out */
+        { (IOExternalMethodAction)&C::sVmcsReadMany, 0, sizeof(RHVReadMany), 0, sizeof(RHVReadManyOut) },
     };
 
     static_assert(sizeof(kMethods) / sizeof(kMethods[0]) == kRHVMethodCount,
@@ -456,4 +460,30 @@ IOReturn com_overlorddev_RyzenHVUserClient::sVmKick(OSObject *target, void *,
     vm->kick();
     vm->release();
     return kIOReturnSuccess;
+}
+
+IOReturn com_overlorddev_RyzenHVUserClient::sVmRunEx(OSObject *target, void *,
+                                                     IOExternalMethodArguments *args)
+{
+    RHV_ME();
+    RHV_ADMIN();
+    if (!args->structureInput || !args->structureOutput)
+        return kIOReturnBadArgument;
+    RHV_RETAIN_VM(vm);
+    IOReturn rc = vm->runEx((const RHVRunIn *)args->structureInput, (RHVRunOut *)args->structureOutput);
+    vm->release();
+    return rc;
+}
+
+IOReturn com_overlorddev_RyzenHVUserClient::sVmcsReadMany(OSObject *target, void *,
+                                                          IOExternalMethodArguments *args)
+{
+    RHV_ME();
+    RHV_ADMIN();
+    if (!args->structureInput || !args->structureOutput)
+        return kIOReturnBadArgument;
+    RHV_RETAIN_VM(vm);
+    IOReturn rc = vm->vmcsReadMany((const RHVReadMany *)args->structureInput, (RHVReadManyOut *)args->structureOutput);
+    vm->release();
+    return rc;
 }

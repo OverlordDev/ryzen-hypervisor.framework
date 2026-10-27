@@ -861,6 +861,52 @@ IOReturn com_overlorddev_RyzenHVVm::vmcsRead(uint32_t field, uint64_t *value)
     return r == rhv::vmx::R_OK ? kIOReturnSuccess : kIOReturnBadArgument;
 }
 
+IOReturn com_overlorddev_RyzenHVVm::vmcsReadMany(const RHVReadMany *in, RHVReadManyOut *out)
+{
+    bzero(out, sizeof(*out));
+    if (in->count > RHV_READMANY_MAX)
+        return kIOReturnBadArgument;
+    for (uint32_t i = 0; i < in->count; i++) {
+        IOReturn rc = vmcsRead(in->fields[i], &out->values[i]);
+        if (rc != kIOReturnSuccess)
+            return rc;
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn com_overlorddev_RyzenHVVm::runEx(const RHVRunIn *in, RHVRunOut *out)
+{
+    bzero(out, sizeof(*out));
+    if (in->nWrites > RHV_RUN_MAX_WRITES)
+        return kIOReturnBadArgument;
+
+    IOReturn rc;
+    if (in->flags & RHV_RUN_REGS) {
+        rc = setRegs(&in->regs);
+        if (rc != kIOReturnSuccess)
+            return rc;
+    }
+    for (uint32_t i = 0; i < in->nWrites; i++) {
+        rc = vmcsWrite(in->writes[i].field, in->writes[i].value);
+        if (rc != kIOReturnSuccess) {
+            out->failedWrite = i;
+            return rc;
+        }
+    }
+    if (!(in->flags & RHV_RUN_NO_RUN)) {
+        rc = run((in->flags & RHV_RUN_SKIP) != 0, &out->exit);
+        if (rc != kIOReturnSuccess)
+            return rc;
+    }
+
+    getRegs(&out->regs);
+    unsigned n = 0;
+#define RHV_X(enc) do { uint64_t v_ = 0; if (fVmx) (void)vmcsRead(enc, &v_); out->fields[n++] = v_; } while (0);
+    RHV_RUN_FIELDS_LIST(RHV_X)
+#undef RHV_X
+    return kIOReturnSuccess;
+}
+
 IOReturn com_overlorddev_RyzenHVVm::vmcsWrite(uint32_t field, uint64_t value)
 {
     if (!fVmx)

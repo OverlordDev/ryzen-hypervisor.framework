@@ -46,6 +46,8 @@ private:
     static IOReturn sVmSetFpu(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sVmMsr(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sVmKick(OSObject *target, void *reference, IOExternalMethodArguments *args);
+    static IOReturn sVmRunEx(OSObject *target, void *reference, IOExternalMethodArguments *args);
+    static IOReturn sVmcsReadMany(OSObject *target, void *reference, IOExternalMethodArguments *args);
 
     void destroyVm();
 

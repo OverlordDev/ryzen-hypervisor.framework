@@ -9,6 +9,7 @@
 #include <IOKit/IOKitLib.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <stdio.h>
 
 #define IOR_NO_DEVICE 0xe00002c0
 #define IOR_BAD_ARG   0xe00002c2
@@ -32,6 +33,21 @@ static int vm_create(void *ctx, uint32_t flags)
     kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &gConn);
     IOObjectRelease(svc);
     if (kr != KERN_SUCCESS) {
+        gConn = 0;
+        return kr;
+    }
+    /* The shim and the kext share struct layouts and selectors; a stale kext (not rebooted after an update) would
+     * misread them. */
+    RHVInfo info;
+    size_t infoSize = sizeof(info);
+    kr = IOConnectCallStructMethod(gConn, kRHVMethodGetInfo, NULL, 0, &info, &infoSize);
+    if (kr == KERN_SUCCESS && info.abiVersion != RHV_ABI_VERSION) {
+        fprintf(stderr, "ryzenhv: the loaded kext speaks ABI %u, this shim ABI %u: install the matching RyzenHV.kext "
+                        "and reboot\n", info.abiVersion, (unsigned)RHV_ABI_VERSION);
+        kr = (kern_return_t)0xe00002c7;
+    }
+    if (kr != KERN_SUCCESS) {
+        IOServiceClose(gConn);
         gConn = 0;
         return kr;
     }
@@ -138,6 +154,20 @@ static int run(void *ctx, RHVExit *ex)
     return IOConnectCallMethod(gConn, kRHVMethodVmRun, &skip, 1, NULL, 0, NULL, NULL, ex, &sz);
 }
 
+static int run_ex(void *ctx, const RHVRunIn *in, RHVRunOut *out)
+{
+    (void)ctx;
+    size_t sz = sizeof(*out);
+    return IOConnectCallStructMethod(gConn, kRHVMethodVmRunEx, in, sizeof(*in), out, &sz);
+}
+
+static int vmcs_read_many(void *ctx, const RHVReadMany *in, RHVReadManyOut *out)
+{
+    (void)ctx;
+    size_t sz = sizeof(*out);
+    return IOConnectCallStructMethod(gConn, kRHVMethodVmcsReadMany, in, sizeof(*in), out, &sz);
+}
+
 static int kick(void *ctx)
 {
     (void)ctx;
@@ -182,4 +212,6 @@ void rhv_iokit_backend(RhvBackend *b)
     b->now = now;
     b->tsc = tsc;
     b->thread_id = thread_id;
+    b->run_ex = run_ex;
+    b->vmcs_read_many = vmcs_read_many;
 }

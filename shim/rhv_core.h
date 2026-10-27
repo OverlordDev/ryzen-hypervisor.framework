@@ -80,6 +80,9 @@ typedef struct RhvBackend {
     uint64_t (*now)(void *ctx);                                  /* mach_absolute_time units, for exec time */
     uint64_t (*tsc)(void *ctx);                                  /* host TSC */
     unsigned long (*thread_id)(void *ctx);                       /* identifies the calling thread */
+    /* Fast path (ABI 8); without them the core falls back to one call per register / field. */
+    int (*run_ex)(void *ctx, const RHVRunIn *in, RHVRunOut *out);
+    int (*vmcs_read_many)(void *ctx, const RHVReadMany *in, RHVReadManyOut *out);
 } RhvBackend;
 
 /* Installs the backend. The core copies it. Must be called before the first API call. */

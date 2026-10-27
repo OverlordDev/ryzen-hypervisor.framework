@@ -2,6 +2,7 @@
  * rhv_core.c - see rhv_core.h.
  */
 #include "rhv_core.h"
+#include "rhv_fields.h"
 
 #include <string.h>
 
@@ -51,10 +52,34 @@ static struct { uint32_t enc; uint64_t val; uint8_t valid; } gVc[kVcSlots];
 static RHVRegs gRegs;
 static int     gRegsValid, gRegsDirty;
 
+/*
+ * With the fast path (a backend with run_ex) VMCS writes are not sent at once: they wait here and travel with the
+ * next run (or the next read that could depend on them). The run call also returns the registers and the fields in
+ * RHV_RUN_FIELDS_LIST, so the usual "what happened?" reads after an exit are served from the cache.
+ */
+static RHVVmcsWrite gPend[RHV_RUN_MAX_WRITES];
+static unsigned     gNPend;
+
+static const uint32_t kRunFields[RHV_RUN_NFIELDS] = {
+#define X(e) e,
+    RHV_RUN_FIELDS_LIST(X)
+#undef X
+};
+
+/* Segment state: when one of these is read, all of it is fetched in a single call (instruction emulation reads many). */
+static const uint32_t kSegGroup[] = {
+    0x0800, 0x0802, 0x0804, 0x0806, 0x0808, 0x080a, 0x080c, 0x080e,                 /* selectors */
+    0x4800, 0x4802, 0x4804, 0x4806, 0x4808, 0x480a, 0x480c, 0x480e, 0x4810, 0x4812, /* limits, GDTR, IDTR */
+    0x4814, 0x4816, 0x4818, 0x481a, 0x481c, 0x481e, 0x4820, 0x4822,                 /* access rights */
+    0x6806, 0x6808, 0x680a, 0x680c, 0x680e, 0x6810, 0x6812, 0x6814, 0x6816, 0x6818  /* bases, GDTR, IDTR */
+};
+#define SEG_GROUP_N ((unsigned)(sizeof(kSegGroup) / sizeof(kSegGroup[0])))
+
 static void cacheReset(void)
 {
     memset(gVc, 0, sizeof(gVc));
     gRegsValid = gRegsDirty = 0;
+    gNPend = 0;
 }
 
 void rhv_core_cache_reset(void) { cacheReset(); }
@@ -133,6 +158,54 @@ static uint64_t *regsField(uint32_t enc)
     }
 }
 
+static void adoptReply(const RHVRunOut *o)
+{
+    gRegs = o->regs;
+    gRegsValid = 1;
+    gRegsDirty = 0;
+    for (unsigned i = 0; i < RHV_RUN_NFIELDS; i++)
+        vcPut(kRunFields[i], o->fields[i]);
+}
+
+static int pendingFor(uint32_t field)
+{
+    for (unsigned i = 0; i < gNPend; i++)
+        if (gPend[i].field == field)
+            return 1;
+    return 0;
+}
+
+/* Sends buffered registers and VMCS writes to the kernel without running the guest. */
+static int flushPending(void)
+{
+    if (!B.run_ex)
+        return regsFlush();
+    if (!gNPend && !gRegsDirty)
+        return 0;
+    static RHVRunIn  in;
+    static RHVRunOut out;
+    in.flags = RHV_RUN_NO_RUN | (gRegsDirty ? RHV_RUN_REGS : 0);
+    in.regs = gRegs;
+    in.nWrites = gNPend;
+    memcpy(in.writes, gPend, gNPend * sizeof(gPend[0]));
+    int k = B.run_ex(B.ctx, &in, &out);
+    gNPend = 0;
+    if (k) {
+        cacheReset();
+        return k;
+    }
+    adoptReply(&out);
+    return 0;
+}
+
+static int segGroupHas(uint32_t field)
+{
+    for (unsigned i = 0; i < SEG_GROUP_N; i++)
+        if (kSegGroup[i] == field)
+            return 1;
+    return 0;
+}
+
 /* VMCS field access through the cache. */
 static int vmcsGet(uint32_t field, uint64_t *value)
 {
@@ -143,8 +216,31 @@ static int vmcsGet(uint32_t field, uint64_t *value)
         *value = *regsField(field);
         return 0;
     }
+    if (B.run_ex && gNPend) {                  /* a pending write to this field (or to one fetched along) first */
+        int dep = pendingFor(field);
+        for (unsigned i = 0; !dep && i < SEG_GROUP_N && segGroupHas(field); i++)
+            dep = pendingFor(kSegGroup[i]);
+        if (dep) {
+            int k = flushPending();
+            if (k)
+                return k;
+        }
+    }
     if (vcGet(field, value))
         return 0;
+    if (B.vmcs_read_many && segGroupHas(field)) {
+        RHVReadMany in;
+        RHVReadManyOut out;
+        in.count = SEG_GROUP_N;
+        for (unsigned i = 0; i < SEG_GROUP_N; i++)
+            in.fields[i] = kSegGroup[i];
+        if (B.vmcs_read_many(B.ctx, &in, &out) == 0) {
+            for (unsigned i = 0; i < SEG_GROUP_N; i++)
+                vcPut(kSegGroup[i], out.values[i]);
+            if (vcGet(field, value))
+                return 0;
+        }
+    }
     if (!B.vmcs_read)
         return (int)0xe00002c7;
     int k = B.vmcs_read(B.ctx, field, value);
@@ -162,6 +258,30 @@ static int vmcsSet(uint32_t field, uint64_t value)
             return k;
         *slot = value;
         gRegsDirty = 1;
+        return 0;
+    }
+    if (B.run_ex) {                            /* buffered; the kernel's verdict on the field is known in advance */
+        switch (rhv_vmcs_write_status(field, value)) {
+        case RHV_FIELD_OK: break;
+        case RHV_FIELD_READ_ONLY: return (int)0xe00002cf;       /* kIOReturnNotWritable */
+        default: return (int)0xe00002c2;                        /* kIOReturnBadArgument */
+        }
+        vcDrop(field);
+        for (unsigned i = 0; i < gNPend; i++) {
+            if (gPend[i].field == field) {
+                gPend[i].value = value;
+                return 0;
+            }
+        }
+        if (gNPend == RHV_RUN_MAX_WRITES) {
+            int k = flushPending();
+            if (k)
+                return k;
+        }
+        gPend[gNPend].field = field;
+        gPend[gNPend].reserved = 0;
+        gPend[gNPend].value = value;
+        gNPend++;
         return 0;
     }
     if (!B.vmcs_write)
@@ -307,6 +427,8 @@ int32_t rhv_vm_sync_tsc(uint64_t tsc)
         return r;
     NEED(vmcs_write);
     NEED(tsc);
+    if (gVcpu && flushPending() == 0) {}           /* keep the order with buffered writes */
+    vcDrop(F_TSC_OFFSET);
     return rhv_hv_from_ioreturn(B.vmcs_write(B.ctx, F_TSC_OFFSET, tsc - B.tsc(B.ctx)));
 }
 
@@ -345,6 +467,26 @@ int32_t rhv_vcpu_run(uint32_t vcpu)
     if (r)
         return r;
     NEED(run);
+
+    if (B.run_ex) {
+        /* One call: send what is buffered, run, get the registers and the exit information back. */
+        static RHVRunIn  in;
+        static RHVRunOut out;
+        in.flags = gRegsDirty ? RHV_RUN_REGS : 0;
+        in.regs = gRegs;
+        in.nWrites = gNPend;
+        memcpy(in.writes, gPend, gNPend * sizeof(gPend[0]));
+        uint64_t t0 = B.now ? B.now(B.ctx) : 0;
+        int k = B.run_ex(B.ctx, &in, &out);
+        if (B.now)
+            gExecTime += B.now(B.ctx) - t0;
+        cacheReset();                 /* the guest ran: all of it may have changed */
+        if (k)
+            return rhv_hv_from_ioreturn(k);
+        adoptReply(&out);
+        return RHV_HV_SUCCESS;
+    }
+
     int fk = regsFlush();
     if (fk)
         return rhv_hv_from_ioreturn(fk);
@@ -354,7 +496,7 @@ int32_t rhv_vcpu_run(uint32_t vcpu)
     int k = B.run(B.ctx, &ex);
     if (B.now)
         gExecTime += B.now(B.ctx) - t0;
-    cacheReset();                 /* the guest ran: all of it may have changed */
+    cacheReset();                     /* the guest ran: all of it may have changed */
     if (k)
         return rhv_hv_from_ioreturn(k);
     /* What happened is in the VMCS read-only fields (exit reason, qualification, ...): the kernel put it there. */
@@ -382,7 +524,7 @@ int32_t rhv_vcpu_flush(uint32_t vcpu)
     int32_t r = needVcpu(vcpu);
     if (r)
         return r;
-    return rhv_hv_from_ioreturn(regsFlush());
+    return rhv_hv_from_ioreturn(flushPending());
 }
 
 int32_t rhv_vcpu_invalidate_tlb(uint32_t vcpu)
@@ -587,6 +729,9 @@ int32_t rhv_vcpu_read_msr(uint32_t vcpu, uint32_t msr, uint64_t *value)
         return RHV_HV_SUCCESS;
     }
     NEED(msr);
+    int fk = flushPending();                  /* an MSR and a VMCS field can be the same state (EFER) */
+    if (fk)
+        return rhv_hv_from_ioreturn(fk);
     return rhv_hv_from_ioreturn(B.msr(B.ctx, RHV_MSR_READ, msr, 0, value));
 }
 
@@ -601,6 +746,9 @@ int32_t rhv_vcpu_write_msr(uint32_t vcpu, uint32_t msr, uint64_t value)
     }
     NEED(msr);
     uint64_t out;
+    int fk = flushPending();
+    if (fk)
+        return rhv_hv_from_ioreturn(fk);
     int k = B.msr(B.ctx, RHV_MSR_WRITE, msr, value, &out);
     for (unsigned i = 0; i < kVcSlots; i++) gVc[i].valid = 0;       /* EFER and friends are VMCS fields too */
     return rhv_hv_from_ioreturn(k);
@@ -613,6 +761,9 @@ int32_t rhv_vcpu_enable_native_msr(uint32_t vcpu, uint32_t msr, int enable)
         return r;
     NEED(msr);
     uint64_t out;
+    int fk = flushPending();
+    if (fk)
+        return rhv_hv_from_ioreturn(fk);
     return rhv_hv_from_ioreturn(B.msr(B.ctx, enable ? RHV_MSR_NATIVE_ENABLE : RHV_MSR_NATIVE_DISABLE, msr, 0, &out));
 }
 

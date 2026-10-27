@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define RHV_ABI_VERSION 7
+#define RHV_ABI_VERSION 8
 #define RHV_SERVICE_NAME "com_overlorddev_RyzenHV"
 #define RHV_MAX_CPUS 64
 
@@ -74,6 +74,15 @@ extern "C" {
  *                kIOReturnBadArgument for an MSR the vCPU does not keep (and for NATIVE on EFER)
  *   VmKick       no arguments. Makes a running VmRun (on another thread) return soon with RHV_EXIT_TIMESLICE, which a
  *                VMX-mode client sees as an external-interrupt exit, like hv_vcpu_interrupt does. Does not wait.
+ *
+ * Fast path (ABI 8). A guest exit costs the client dozens of register/VMCS accesses, and every kernel call is
+ * microseconds, so the shim batches them: one call applies buffered state, runs, and returns what the client reads
+ * after every exit.
+ *   VmRunEx      in: struct RHVRunIn   out: struct RHVRunOut
+ *                Applies `regs` (when RHV_RUN_REGS) and `writes[]` in order (VmcsWrite semantics; the first failure
+ *                stops everything and its index is returned in out->failedWrite), runs the guest unless
+ *                RHV_RUN_NO_RUN, then returns the exit, the registers and the VMCS fields listed in kRhvRunFields[].
+ *   VmcsReadMany in: struct RHVReadMany   out: struct RHVReadManyOut. VmcsRead for up to RHV_READMANY_MAX fields.
  */
 enum {
     kRHVMethodGetInfo = 0,
@@ -96,6 +105,8 @@ enum {
     kRHVMethodVmSetFpu,
     kRHVMethodVmMsr,
     kRHVMethodVmKick,
+    kRHVMethodVmRunEx,
+    kRHVMethodVmcsReadMany,
     kRHVMethodCount
 };
 
@@ -251,6 +262,59 @@ typedef struct RHVExit {
     uint64_t rip;                /* guest RIP at the exit */
 } RHVExit;
 
+/* ---- VmRunEx / VmcsReadMany (ABI 8) ---- */
+
+/* RHVRunIn.flags */
+enum {
+    RHV_RUN_REGS    = 1u << 0,   /* apply `regs` before anything else */
+    RHV_RUN_NO_RUN  = 1u << 1,   /* only apply the state and return it, do not run the guest */
+    RHV_RUN_SKIP    = 1u << 2    /* resume at the next instruction (same as VmRun's argument) */
+};
+
+#define RHV_RUN_MAX_WRITES 96
+
+typedef struct RHVVmcsWrite {
+    uint32_t field;
+    uint32_t reserved;
+    uint64_t value;
+} RHVVmcsWrite;
+
+typedef struct RHVRunIn {
+    uint32_t     flags;
+    uint32_t     nWrites;                         /* <= RHV_RUN_MAX_WRITES */
+    RHVRegs      regs;
+    RHVVmcsWrite writes[RHV_RUN_MAX_WRITES];
+} RHVRunIn;
+
+/* The VMCS fields every VmRunEx returns, in this order: what a VMX client reads after each exit. */
+#define RHV_RUN_FIELDS_LIST(X)                                                                                   \
+    X(0x4402) /* exit reason */          X(0x6400) /* exit qualification */  X(0x440c) /* instruction length */    \
+    X(0x4404) /* interruption info */    X(0x4406) /* interruption error */  X(0x4408) /* IDT-vectoring info */    \
+    X(0x440a) /* IDT-vectoring error */  X(0x2400) /* guest physical addr */ X(0x640a) /* guest linear addr */    \
+    X(0x4824) /* interruptibility */     X(0x4826) /* activity state */      X(0xF004) /* TPR (extension) */      \
+    X(0x6800) /* CR0 */                  X(0x6802) /* CR3 */                 X(0x6804) /* CR4 */                  \
+    X(0x2806) /* EFER */                 X(0x681a) /* DR7 */                 X(0xF000) /* CR2 (extension) */
+#define RHV_RUN_NFIELDS 18
+
+typedef struct RHVRunOut {
+    uint32_t failedWrite;                         /* index of the write that failed, when the call failed */
+    uint32_t reserved;
+    RHVExit  exit;
+    RHVRegs  regs;
+    uint64_t fields[RHV_RUN_NFIELDS];             /* RHV_RUN_FIELDS_LIST order */
+} RHVRunOut;
+
+#define RHV_READMANY_MAX 48
+
+typedef struct RHVReadMany {
+    uint32_t count;                               /* <= RHV_READMANY_MAX */
+    uint32_t fields[RHV_READMANY_MAX];
+} RHVReadMany;
+
+typedef struct RHVReadManyOut {
+    uint64_t values[RHV_READMANY_MAX];
+} RHVReadManyOut;
+
 /*
  * One read of the kernel log ring. Fixed size (4096 bytes) so the IOKit
  * dispatch table can check it. `cursor` is an absolute byte offset into the
@@ -274,6 +338,9 @@ typedef char rhv_assert_stats_size[(sizeof(RHVStats) == 25 * sizeof(uint64_t)) ?
 typedef char rhv_assert_regs_size[(sizeof(RHVRegs) == 18 * sizeof(uint64_t)) ? 1 : -1];
 typedef char rhv_assert_fpu_size[(sizeof(RHVFpuState) == 16 + RHV_FPU_AREA_MAX) ? 1 : -1];
 typedef char rhv_assert_exit_size[(sizeof(RHVExit) == 48) ? 1 : -1];
+typedef char rhv_assert_runin_size[(sizeof(RHVRunIn) == 8 + sizeof(RHVRegs) + RHV_RUN_MAX_WRITES * 16) ? 1 : -1];
+typedef char rhv_assert_runout_size[(sizeof(RHVRunOut) == 8 + 48 + sizeof(RHVRegs) + RHV_RUN_NFIELDS * 8) ? 1 : -1];
+typedef char rhv_assert_runin_fits[(sizeof(RHVRunIn) <= 4096 && sizeof(RHVRunOut) <= 4096) ? 1 : -1];   /* inband IOKit */
 
 /* IOIO exit decoding (EXITINFO1 of SVM exit 0x7B, AMD APM Vol.2, 15.10.2). */
 static inline uint32_t rhv_ioio_port(uint64_t info1)    { return (uint32_t)(info1 >> 16) & 0xFFFF; }

@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "../kext/Source/VmcsState.hpp"
+#include "../shim/rhv_fields.h"
 
 using namespace rhv::vmx;
 using namespace rhv::vmcb;
@@ -306,10 +307,34 @@ void testExtensionsAndMsrs()
     CHECK(rd(f, 0x4408) == 0x80000b0e && rd(f, 0x440a) == 0x14);
 }
 
+/* The shim decides up front which VMCS writes the kernel will refuse (it buffers them); it must agree with VmcsState
+ * on every possible encoding. */
+void testShimFieldTable()
+{
+    Fixture f;
+    for (uint32_t enc = 0; enc < 0x10000; enc++) {
+        uint64_t v = 0;
+        Result rr = f.st.read(enc, &v);
+        Result wr = f.st.write(enc, 0);
+        int shimRead  = rhv_vmcs_read_status(enc);
+        int shimWrite = rhv_vmcs_write_status(enc, 0);
+        CHECK((rr == R_OK) == (shimRead == RHV_FIELD_OK));
+        int want = wr == R_OK ? RHV_FIELD_OK : wr == R_READ_ONLY ? RHV_FIELD_READ_ONLY : RHV_FIELD_INVALID;
+        if (want != shimWrite) {
+            printf("field %#x: kernel %d, shim %d\n", enc, want, shimWrite);
+            fails++;
+        }
+    }
+    CHECK(rhv_vmcs_write_status(0xF010, 0x0000800000000000ull) == RHV_FIELD_BAD_VALUE);     /* non-canonical DR0 */
+    CHECK(rhv_vmcs_write_status(0xF010, 0xFFFF800000000000ull) == RHV_FIELD_OK);
+    CHECK(rhv_vmcs_write_status(0xF002, 0x0000800000000000ull) == RHV_FIELD_OK);            /* DR6 is not loaded */
+}
+
 } // namespace
 
 int main()
 {
+    testShimFieldTable();
     testStateFields();
     testShadowAndErrors();
     testInterruptibility();
