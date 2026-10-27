@@ -86,7 +86,7 @@ void setSeg(Seg &s, uint16_t selector, uint64_t base, uint32_t limit, uint16_t a
 com_overlorddev_RyzenHVVm *com_overlorddev_RyzenHVVm::create(const RHVInfo &info, uint32_t flags,
                                                              IOReturn *err)
 {
-    if (flags & ~(uint32_t)RHV_VMCREATE_NO_RAM) {
+    if (flags & ~(uint32_t)(RHV_VMCREATE_NO_RAM | RHV_VMCREATE_VMX)) {
         *err = kIOReturnBadArgument;
         return nullptr;
     }
@@ -137,6 +137,7 @@ bool com_overlorddev_RyzenHVVm::init()
     bzero(&fIopm, sizeof(fIopm));
     bzero(&fMsrpm, sizeof(fMsrpm));
     fPagesMapped = 0;
+    fVmx         = false;
     bzero(&fGprs, sizeof(fGprs));
     fFirstRun    = true;
     fHaveNextRip = false;
@@ -169,6 +170,9 @@ bool com_overlorddev_RyzenHVVm::setup(uint32_t flags)
     if (!physAlloc(&fVmcb, 4096) || !physAlloc(&fHostVmcb, 4096) || !physAlloc(&fIopm, 12288) ||
         !physAlloc(&fMsrpm, 8192) || !fNpt.init(kNptAllocator))
         return false;
+
+    fVmx = (flags & RHV_VMCREATE_VMX) != 0;
+    fVmcs.attach((rhv::vmcb::Vmcb *)fVmcb.va);
 
     /* Intercept every I/O port and every MSR: userland decides what the guest may touch. */
     memset(fIopm.va, 0xFF, fIopm.size);
@@ -415,6 +419,7 @@ void com_overlorddev_RyzenHVVm::resetLocked(uint16_t cs, uint16_t ip)
     s.gPat   = kGuestPat;
 
     fHaveNextRip = false;
+    fVmcs.reset();
 }
 
 IOReturn com_overlorddev_RyzenHVVm::reset(uint16_t cs, uint16_t ip)
@@ -525,6 +530,9 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
                  (unsigned long long)v->control.nestedCr3);
     }
 
+    if (fVmx)
+        fVmcs.applyControls();      /* controls and event injection the client set through the VMCS */
+
     uint64_t sliceAbs = 0;
     nanoseconds_to_absolutetime(kTimesliceNs, &sliceAbs);
     uint64_t deadline = mach_absolute_time() + sliceAbs;
@@ -557,6 +565,11 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         RHV_STAT_INC(vmExits);
 
         if (code == EXIT_INTR || code == EXIT_NMI) {
+            /* An event that was being delivered when the host interrupt came in must be injected again. */
+            if (v->control.exitIntInfo & (1u << 31)) {
+                v->control.eventInj    = v->control.exitIntInfo;
+                v->control.eventInjErr = v->control.exitIntInfoErr;
+            }
             /* The host needed the CPU. It has it now; run on unless the slice is over. */
             if (mach_absolute_time() >= deadline) {
                 timeslice = true;
@@ -580,6 +593,13 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             out->info2    = v->control.exitInfo2;
             out->nextRip  = v->control.nextRip;
             fHaveNextRip  = v->control.nextRip != 0;
+            if (fVmx) {
+                uint32_t perm = 0;
+                if (code == EXIT_NPF)
+                    fNpt.lookup(v->control.exitInfo2 & ~(uint64_t)0xFFF, nullptr, &perm);
+                if (!fVmcs.recordExit(perm))
+                    out->reason = RHV_EXIT_UNHANDLED;      /* e.g. the guest executed an SVM instruction */
+            }
             RHV_TRACE("VM exit: code=0x%llx info1=0x%llx info2=0x%llx rip=0x%llx",
                       (unsigned long long)code, (unsigned long long)out->info1,
                       (unsigned long long)out->info2, (unsigned long long)v->save.rip);
@@ -597,6 +617,32 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 
     IOLockUnlock(fLock);
     return rc;
+}
+
+IOReturn com_overlorddev_RyzenHVVm::vmcsRead(uint32_t field, uint64_t *value)
+{
+    if (!fVmx)
+        return kIOReturnUnsupported;
+    IOLockLock(fLock);
+    rhv::vmx::Result r = fVmcs.read(field, value);
+    IOLockUnlock(fLock);
+    return r == rhv::vmx::R_OK ? kIOReturnSuccess : kIOReturnBadArgument;
+}
+
+IOReturn com_overlorddev_RyzenHVVm::vmcsWrite(uint32_t field, uint64_t value)
+{
+    if (!fVmx)
+        return kIOReturnUnsupported;
+    IOLockLock(fLock);
+    rhv::vmx::Result r = fVmcs.write(field, value);
+    if (r == rhv::vmx::R_OK && field == rhv::vmx::F_GUEST_RIP)
+        fHaveNextRip = false;           /* the client moved RIP itself */
+    IOLockUnlock(fLock);
+    switch (r) {
+    case rhv::vmx::R_OK:         return kIOReturnSuccess;
+    case rhv::vmx::R_READ_ONLY:  return kIOReturnNotWritable;
+    default:                     return kIOReturnBadArgument;
+    }
 }
 
 void com_overlorddev_RyzenHVVm::dumpVmcb(const char *why)

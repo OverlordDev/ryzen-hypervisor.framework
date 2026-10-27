@@ -21,6 +21,7 @@
 
 #include "../../include/RyzenHVShared.h"
 #include "Npt.hpp"
+#include "VmcsState.hpp"
 #include "PhysMem.hpp"
 #include "VMCB.hpp"
 
@@ -61,6 +62,11 @@ public:
     IOReturn setRegs(const RHVRegs *in);
     IOReturn run(bool skipInstruction, RHVExit *out);
 
+    /* VMX mode (RHV_VMCREATE_VMX): the Hypervisor.framework view of the guest. */
+    bool     isVmx() const { return fVmx; }
+    IOReturn vmcsRead(uint32_t field, uint64_t *value);
+    IOReturn vmcsWrite(uint32_t field, uint64_t value);
+
     /* A pinned buffer (user or kernel) and how many NPT pages still point into it. */
     struct Backing {
         IOMemoryDescriptor *md;
@@ -83,6 +89,8 @@ private:
     rhv::PhysMem              fIopm;     /* 12 KiB, all ones: intercept every port */
     rhv::PhysMem              fMsrpm;    /*  8 KiB, all ones: intercept every MSR  */
     rhv::npt::Table           fNpt;
+    rhv::vmx::VmcsState       fVmcs;
+    bool                      fVmx;
     uint64_t                  fPagesMapped;
     rhv::GuestGprs            fGprs;
     bool                      fFirstRun;

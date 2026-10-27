@@ -118,9 +118,10 @@ int main(void)
     CHECK(sizeof(RHVRegs) == 18 * sizeof(uint64_t));
     CHECK(sizeof(RHVExit) == 48);
     CHECK(sizeof(RHVLogChunk) == RHV_LOG_CHUNK_SIZE);
-    CHECK(kRHVMethodCount == 14);
+    CHECK(kRHVMethodCount == 16);
+    CHECK(kRHVMethodVmcsRead == 14 && kRHVMethodVmcsWrite == 15);
     CHECK(kRHVMethodVmMap == 11 && kRHVMethodVmUnmap == 12 && kRHVMethodVmProtect == 13);
-    CHECK(RHV_ABI_VERSION == 4);
+    CHECK(RHV_ABI_VERSION == 5);
 
     /* NPF decoding: write to a present (read-only) page; fetch from a not-present page; walk fault. */
     CHECK(rhv_npf_present(0x3) && rhv_npf_is_write(0x3) && !rhv_npf_is_fetch(0x3));

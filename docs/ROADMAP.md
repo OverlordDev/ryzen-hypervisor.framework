@@ -48,10 +48,10 @@
 
 **Готово, когда:** `rhv-map-test` проходит на железе, а гость с paging (long mode) исполняет код из замапленной памяти.
 
-## Фаза 3: VMX-совместимость
+## Фаза 3: VMX-совместимость (в работе: этапы 1–2 пройдены на железе, см. `docs/PHASE3.md`)
 
-- [ ] Таблица соответствия полей VMCS → VMCB, чтение/запись через `hv_vmx_vcpu_*`
-- [ ] Синтез VMX exit reason и qualification
+- [x] Таблица соответствия полей VMCS → VMCB, чтение/запись через `hv_vmx_vcpu_*` (в ядре: `VmcsRead`/`VmcsWrite`; `rhv-vmx-test` PASS)
+- [x] Синтез VMX exit reason и qualification (I/O, MSR, CPUID, HLT, EPT-нарушение, исключения, CR/DR)
 - [ ] Эмуляция `hv_vmx_read_capability`
 - [ ] Инъекция прерываний, таймер, `hv_vcpu_interrupt`
 - [ ] Шим форвардит все вызовы в кекст

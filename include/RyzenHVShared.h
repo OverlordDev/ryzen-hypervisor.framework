@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define RHV_ABI_VERSION 4
+#define RHV_ABI_VERSION 5
 #define RHV_SERVICE_NAME "com_overlorddev_RyzenHV"
 #define RHV_MAX_CPUS 64
 
@@ -51,6 +51,14 @@ extern "C" {
  *                Holes in the range are fine, any sub-range of a mapping works.
  *   VmProtect    in: scalar[0] = guest physical address, scalar[1] = size,
  *                scalar[2] = RHV_MEM_* flags. Every page must be mapped.
+ *
+ * Phase 3: VMCS access for VMs created with RHV_VMCREATE_VMX (hv_vmx_vcpu_read_vmcs / write_vmcs).
+ * The field numbers are Intel's VMCS encodings. Execution controls written this way become VMCB intercepts
+ * at every VmRun, and after VmRun the VMX exit reason, qualification, etc. are readable as VMCS_RO_* fields.
+ *   VmcsRead     in: scalar[0] = field                       out: scalar[0] = value
+ *                (kIOReturnBadArgument for a field the framework does not have)
+ *   VmcsWrite    in: scalar[0] = field, scalar[1] = value
+ *                (kIOReturnNotWritable for the read-only exit fields)
  */
 enum {
     kRHVMethodGetInfo = 0,
@@ -67,6 +75,8 @@ enum {
     kRHVMethodVmMap,
     kRHVMethodVmUnmap,
     kRHVMethodVmProtect,
+    kRHVMethodVmcsRead,
+    kRHVMethodVmcsWrite,
     kRHVMethodCount
 };
 
@@ -76,7 +86,10 @@ enum { kRHVMemGuestRam = 0 };
 #define RHV_GUEST_RAM_SIZE (1u << 20)   /* built-in RAM: 1 MiB at guest physical 0 */
 
 /* VmCreate flags. */
-enum { RHV_VMCREATE_NO_RAM = 1u << 0 };   /* do not map the built-in 1 MiB, the guest starts empty */
+enum {
+    RHV_VMCREATE_NO_RAM = 1u << 0,   /* do not map the built-in 1 MiB, the guest starts empty */
+    RHV_VMCREATE_VMX    = 1u << 1    /* the client drives the guest through VMCS fields (Hypervisor.framework style) */
+};
 
 /* VmMap / VmProtect flags, same values as hv_memory_flags_t. Write or execute imply read. */
 enum { RHV_MEM_READ = 1u << 0, RHV_MEM_WRITE = 1u << 1, RHV_MEM_EXEC = 1u << 2 };

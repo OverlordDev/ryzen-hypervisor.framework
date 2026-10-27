@@ -40,6 +40,8 @@ private:
     static IOReturn sVmMap(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sVmUnmap(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sVmProtect(OSObject *target, void *reference, IOExternalMethodArguments *args);
+    static IOReturn sVmcsRead(OSObject *target, void *reference, IOExternalMethodArguments *args);
+    static IOReturn sVmcsWrite(OSObject *target, void *reference, IOExternalMethodArguments *args);
 
     void destroyVm();
 

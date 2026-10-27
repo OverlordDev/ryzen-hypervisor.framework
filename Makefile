@@ -1,7 +1,7 @@
 # Top-level build. Run on the Ryzentosh (needs Xcode command line tools).
 #
 #   make test     host-side unit tests, works on any OS with a C compiler
-#   make tools    build/rhv-info, build/rhv-guest-test, build/rhv-map-test
+#   make tools    build/rhv-info, build/rhv-guest-test, build/rhv-map-test, build/rhv-vmx-test
 #   make shim     build/libryzenhv.dylib
 #   make kext     build/RyzenHV.kext   (see kext/Makefile, best effort)
 #   make all      tools + shim + kext
@@ -27,6 +27,8 @@ test: | $(BUILD)
 	$(BUILD)/npt_test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -g -o $(BUILD)/vmx_map_test tests/vmx_map_test.cpp
 	$(BUILD)/vmx_map_test
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -g -o $(BUILD)/vmcs_state_test tests/vmcs_state_test.cpp
+	$(BUILD)/vmcs_state_test
 
 tools: | $(BUILD)
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-info tools/rhv-info/main.c \
@@ -34,6 +36,8 @@ tools: | $(BUILD)
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-guest-test tools/rhv-guest-test/main.c \
 		-framework IOKit -framework CoreFoundation
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-map-test tools/rhv-map-test/main.c \
+		-framework IOKit -framework CoreFoundation
+	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-vmx-test tools/rhv-vmx-test/main.c \
 		-framework IOKit -framework CoreFoundation
 
 shim: | $(BUILD)

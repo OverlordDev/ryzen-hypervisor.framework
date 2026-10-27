@@ -10,7 +10,7 @@ Android, современные VMware/Parallels), не запускается. 
 > **Статус: фазы 0, 1 и 2 пройдены на железе (Ryzen 7 5800H, Sequoia 15.8.1, OpenCore).** SVM включается на всех
 > 16 ядрах (`selftest 16 of 16`), `rhv-guest-test` и `rhv-map-test` печатают `PASS`: гость исполняет код, отвечает
 > на `CPUID`, работает с памятью процесса через `VmMap`/`VmUnmap`/`VmProtect`, NPT-fault'ы приходят с точным адресом.
-> Не проверено: час стабильности под нагрузкой, сон/пробуждение, `kextunload`. Дальше фаза 3 (совместимость с VMX API).
+> Не проверено: час стабильности под нагрузкой, сон/пробуждение, `kextunload`. Фаза 3 (совместимость с VMX API) в работе: этапы 1–2 пройдены (`rhv-vmx-test` PASS), дальше FPU/прерывания/long mode, шим и QEMU (`docs/PHASE3.md`).
 > Если что-то падает при загрузке, начни с `docs/DEBUGGING.md` (`rhv_stage`, лог OpenCore, `check-kext-symbols.sh`).
 
 Целевое железо: Ryzen 7 5800H (Zen 3, Cezanne, family 19h model 50h), macOS Sequoia (15), OpenCore.
@@ -25,6 +25,7 @@ shim/hv_shim.c            userland-фронтенд: перехват hv_* че�
 tools/rhv-info/           утилита: инфо, лог, счётчики, самопроверка
 tools/rhv-guest-test/     приёмочный тест фазы 1: гость печатает строку, делает CPUID, останавливается
 tools/rhv-map-test/       приёмочный тест фазы 2: память гостя = память процесса, protect/unmap, NPF
+tools/rhv-vmx-test/       фаза 3: гость ведётся через поля VMCS, как это делает клиент Hypervisor.framework
 scripts/                  collect-debug.sh (отчёт для разбора), install-to-efi.sh
 tests/host_test.c         unit-тесты чистых функций, запускаются где угодно
 docs/                     архитектура, roadmap, Ryzentosh, отладка, реверс
