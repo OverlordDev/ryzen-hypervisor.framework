@@ -138,6 +138,9 @@ int32_t rhv_vmx_read_capability(uint32_t cap, uint64_t *value);
 /* Drops the register/VMCS cache (the tests change the fake kernel's state behind the core's back). */
 void rhv_core_cache_reset(void);
 
+/* Number of vCPUs that exist. */
+unsigned rhv_core_vcpu_count(void);
+
 /* Maps a kernel return code (IOReturn) to an hv_return_t. */
 int32_t rhv_hv_from_ioreturn(int ior);
 

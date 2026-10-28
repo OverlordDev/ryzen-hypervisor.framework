@@ -421,6 +421,9 @@ static int32_t needVcpu(uint32_t vcpu)
     return RHV_HV_SUCCESS;
 }
 
+/* How many vCPUs exist now (the shim uses it for the CPUID topology it reports). */
+unsigned rhv_core_vcpu_count(void);
+
 static unsigned vcpuCount(void)
 {
     unsigned n = 0;
@@ -428,6 +431,8 @@ static unsigned vcpuCount(void)
         n += gV[i].used;
     return n;
 }
+
+unsigned rhv_core_vcpu_count(void) { return vcpuCount(); }
 
 #define NEED(fn) do { if (!B.fn) return RHV_HV_UNSUPPORTED; } while (0)
 

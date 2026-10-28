@@ -662,6 +662,84 @@ __attribute__((unused)) static void cpuid_hide_hypervisor(hv_vcpuid_t vcpu)
     if (!g_cpuid.pending || disabled)
         return;
     g_cpuid.pending = 0;
+    if (g_trace) {                                         /* what the monitor answered, once per leaf/subleaf */
+        static struct { uint32_t leaf, sub; } seen[160];
+        static int nseen;
+        int known = 0;
+        for (int i = 0; i < nseen; i++)
+            if (seen[i].leaf == g_cpuid.leaf && seen[i].sub == g_cpuid.subleaf)
+                known = 1;
+        if (!known && nseen < 160) {
+            seen[nseen].leaf = g_cpuid.leaf;
+            seen[nseen++].sub = g_cpuid.subleaf;
+            uint64_t a = 0, b = 0, c = 0, d = 0;
+            rhv_vcpu_read_register(vcpu, 2, &a);
+            rhv_vcpu_read_register(vcpu, 5, &b);
+            rhv_vcpu_read_register(vcpu, 3, &c);
+            rhv_vcpu_read_register(vcpu, 4, &d);
+            rhv_trace("cpuid %#x.%u -> eax %#x ebx %#x ecx %#x edx %#x (vcpu %u)", g_cpuid.leaf, g_cpuid.subleaf,
+                      (unsigned)a, (unsigned)b, (unsigned)c, (unsigned)d, vcpu);
+        }
+    }
+    if (g_cpuid.leaf == 4) {
+        /*
+         * Intel's cache and core topology leaf. The monitor passes the AMD host's leaf 4, which is empty: Windows then sees
+         * every vCPU as a package of its own (4 sockets, which Windows Home does not run: it starts one CPU) and no L1
+         * cache. Report what a Zen 3 core has: 32 KiB L1D and L1I (8-way), 512 KiB L2 (8-way), 16 MiB L3 (16-way, shared
+         * by all), and all vCPUs in one package.
+         */
+        unsigned n = rhv_core_vcpu_count();
+        if (n < 1)
+            n = 1;
+        uint32_t cores = (n - 1) << 26;
+        uint32_t a = 0, b = 0, c = 0;
+        switch (g_cpuid.subleaf) {
+        case 0: a = cores | (1u << 8) | (1u << 5) | 1; b = 63 | (7u << 22); c = 63; break;           /* L1 data    */
+        case 1: a = cores | (1u << 8) | (1u << 5) | 2; b = 63 | (7u << 22); c = 63; break;           /* L1 inst    */
+        case 2: a = cores | (1u << 8) | (2u << 5) | 3; b = 63 | (7u << 22); c = 1023; break;         /* L2 unified */
+        case 3: a = cores | ((n - 1) << 14) | (1u << 8) | (3u << 5) | 3; b = 63 | (15u << 22); c = 16383; break;   /* L3 */
+        default: break;                                                                                /* none       */
+        }
+        rhv_vcpu_write_register(vcpu, 2, a);
+        rhv_vcpu_write_register(vcpu, 5, b);
+        rhv_vcpu_write_register(vcpu, 3, c);
+        rhv_vcpu_write_register(vcpu, 4, 0);
+        return;
+    }
+    if (g_cpuid.leaf == 0x80000008u) {
+        /* AMD: ECX[7:0] = cores per package - 1, ECX[15:12] = bits of the APIC id that name the core. */
+        unsigned n = rhv_core_vcpu_count();
+        if (n > 1) {
+            uint64_t rcx = 0;
+            rhv_vcpu_read_register(vcpu, 3, &rcx);
+            unsigned bits = 0;
+            while ((1u << bits) < n)
+                bits++;
+            rcx = (rcx & ~0xF0FFull) | ((uint64_t)bits << 12) | (n - 1);
+            rhv_vcpu_write_register(vcpu, 3, rcx);
+        }
+        return;
+    }
+    if (g_cpuid.leaf == 0x80000005u) {                      /* AMD L1: 32 KiB data and instruction, 8-way, 64-byte lines */
+        rhv_vcpu_write_register(vcpu, 2, 0xFF40FF40u);
+        rhv_vcpu_write_register(vcpu, 5, 0xFF40FF40u);
+        rhv_vcpu_write_register(vcpu, 3, (32u << 24) | (8u << 16) | (1u << 8) | 64);
+        rhv_vcpu_write_register(vcpu, 4, (32u << 24) | (8u << 16) | (1u << 8) | 64);
+        return;
+    }
+    if (g_cpuid.leaf == 0x80000006u) {                      /* AMD L3: 4 MiB per core (Windows adds the cores up: 16 MiB in all), 16-way, units of 512 KiB */
+        rhv_vcpu_write_register(vcpu, 4, (8u << 18) | (8u << 12) | (1u << 8) | 64);
+        return;
+    }
+    if (g_cpuid.leaf == 0x80000001u) {
+        unsigned n = rhv_core_vcpu_count();
+        if (n > 1) {                                       /* CmpLegacy: the logical-processor count in leaf 1 is valid */
+            uint64_t rcx = 0;
+            rhv_vcpu_read_register(vcpu, 3, &rcx);
+            rhv_vcpu_write_register(vcpu, 3, rcx | 2);
+        }
+        return;
+    }
     if (g_cpuid.leaf == 1) {
         uint64_t rcx = 0;
         rhv_vcpu_read_register(vcpu, 3, &rcx);
@@ -910,10 +988,21 @@ static hv_return_t rhv_hv_vcpu_run(hv_vcpuid_t vcpu)
                     rhv_trace("mmio %#llx qual %#llx", (unsigned long long)gpa, (unsigned long long)q);
                 }
                 if ((gpa == 0xfee00300ull || gpa == 0xfee00310ull) && (q & 2)) {            /* ICR writes: IPIs, INIT, SIPI */
-                    static unsigned icr_logged;
-                    if (icr_logged++ < 200)
-                        rhv_trace("ICR %s <- %#llx (vcpu %u)", gpa == 0xfee00300ull ? "low" : "high",
-                                  (unsigned long long)mmio_store_value(vcpu), vcpu);
+                    static struct { uint64_t reg, val; unsigned n; } icr_seen[64];
+                    static int icr_n;
+                    int64_t v = mmio_store_value(vcpu);
+                    int slot = -1;
+                    for (int i = 0; i < icr_n; i++)
+                        if (icr_seen[i].reg == gpa && icr_seen[i].val == (uint64_t)v)
+                            slot = i;
+                    if (slot < 0 && icr_n < 64) {
+                        slot = icr_n++;
+                        icr_seen[slot].reg = gpa;
+                        icr_seen[slot].val = (uint64_t)v;
+                    }
+                    if (slot >= 0 && (icr_seen[slot].n++ < 3 || (icr_seen[slot].n % 2000) == 0))
+                        rhv_trace("ICR %s <- %#llx (vcpu %u, %u so far)", gpa == 0xfee00300ull ? "low" : "high",
+                                  (unsigned long long)v, vcpu, icr_seen[slot].n);
                 }
                 if (0) {
                 }
