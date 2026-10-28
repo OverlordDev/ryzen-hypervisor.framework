@@ -106,8 +106,8 @@ IOReturn com_overlorddev_RyzenHVUserClient::externalMethod(uint32_t selector,
         { (IOExternalMethodAction)&C::sGetStats, 0, 0, 0, sizeof(RHVStats) },
         /* kRHVMethodSelfTest: 2 scalars out (ok, total) */
         { (IOExternalMethodAction)&C::sSelfTest, 0, 0, 2, 0 },
-        /* kRHVMethodVmCreate: 1 scalar in (flags), 1 scalar out (built-in RAM size) */
-        { (IOExternalMethodAction)&C::sVmCreate, 1, 0, 1, 0 },
+        /* kRHVMethodVmCreate: 1 scalar in (flags), 2 scalars out (built-in RAM size, VM id) */
+        { (IOExternalMethodAction)&C::sVmCreate, 1, 0, 2, 0 },
         /* kRHVMethodVmDestroy */
         { (IOExternalMethodAction)&C::sVmDestroy, 0, 0, 0, 0 },
         /* kRHVMethodVmReset: 2 scalars in (cs, ip) */
@@ -140,6 +140,8 @@ IOReturn com_overlorddev_RyzenHVUserClient::externalMethod(uint32_t selector,
         { (IOExternalMethodAction)&C::sVmRunEx, 0, sizeof(RHVRunIn), 0, sizeof(RHVRunOut) },
         /* kRHVMethodVmcsReadMany: struct in, struct out */
         { (IOExternalMethodAction)&C::sVmcsReadMany, 0, sizeof(RHVReadMany), 0, sizeof(RHVReadManyOut) },
+        /* kRHVMethodVmJoin: 2 scalars in (flags, VM id), 1 scalar out (vCPU index) */
+        { (IOExternalMethodAction)&C::sVmJoin, 2, 0, 1, 0 },
     };
 
     static_assert(sizeof(kMethods) / sizeof(kMethods[0]) == kRHVMethodCount,
@@ -273,7 +275,7 @@ IOReturn com_overlorddev_RyzenHVUserClient::sVmCreate(OSObject *target, void *,
     if (args->scalarInput[0] > 0xFFFFFFFFull)
         return kIOReturnBadArgument;
     com_overlorddev_RyzenHVVm *vm =
-        com_overlorddev_RyzenHVVm::create(info, (uint32_t)args->scalarInput[0], &err);
+        com_overlorddev_RyzenHVVm::create(info, (uint32_t)args->scalarInput[0], me->fTask, nullptr, &err);
     if (!vm)
         return err;
 
@@ -289,6 +291,42 @@ IOReturn com_overlorddev_RyzenHVUserClient::sVmCreate(OSObject *target, void *,
     }
 
     args->scalarOutput[0] = vm->ramSize();
+    args->scalarOutput[1] = vm->shared()->id();
+    return kIOReturnSuccess;
+}
+
+IOReturn com_overlorddev_RyzenHVUserClient::sVmJoin(OSObject *target, void *, IOExternalMethodArguments *args)
+{
+    RHV_ME();
+    RHV_ADMIN();
+
+    RHVInfo info;
+    me->fOwner->getInfo(&info);
+    if (args->scalarInput[0] > 0xFFFFFFFFull)
+        return kIOReturnBadArgument;
+
+    com_overlorddev_RyzenHVVmShared *sh = com_overlorddev_RyzenHVVmShared::find(args->scalarInput[1], me->fTask);
+    if (!sh)
+        return kIOReturnNotFound;
+
+    IOReturn err = kIOReturnSuccess;
+    com_overlorddev_RyzenHVVm *vm =
+        com_overlorddev_RyzenHVVm::create(info, (uint32_t)args->scalarInput[0], me->fTask, sh, &err);
+    sh->release();
+    if (!vm)
+        return err;
+
+    IOLockLock(me->fVmLock);
+    bool taken = me->fVm != nullptr;
+    if (!taken)
+        me->fVm = vm;
+    IOLockUnlock(me->fVmLock);
+
+    if (taken) {
+        vm->release();
+        return kIOReturnExclusiveAccess;   /* one vCPU per client */
+    }
+    args->scalarOutput[0] = vm->index();
     return kIOReturnSuccess;
 }
 

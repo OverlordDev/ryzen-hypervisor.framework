@@ -32,6 +32,7 @@ enum : uint32_t {
     F_VMENTRY_IRQ_INFO   = 0x4016,
     F_VMENTRY_EXC_ERROR  = 0x4018,
     F_VMENTRY_INSTR_LEN  = 0x401a,
+    F_TPR_THRESHOLD      = 0x401c,
     F_CPU_BASED2         = 0x401e,
     F_CR0_MASK           = 0x6000,
     F_CR4_MASK           = 0x6002,
@@ -64,6 +65,7 @@ enum : uint32_t {
     CPU_CR3_STORE_EXIT = 1u << 16,
     CPU_CR8_LOAD_EXIT = 1u << 19,
     CPU_CR8_STORE_EXIT = 1u << 20,
+    CPU_TPR_SHADOW    = 1u << 21,
     CPU_MOV_DR_EXIT   = 1u << 23,
     CPU_IO_EXIT       = 1u << 24,
     CPU_IO_BITMAPS    = 1u << 25,
@@ -83,7 +85,7 @@ enum : uint32_t {
     V3_PAUSE   = 1u << 23,
     V3_INVLPG  = 1u << 25
 };
-enum : uint32_t { V4_XSETBV_BIT = 1u << 13 };
+enum : uint32_t { V4_RDTSCP_BIT = 1u << 7, V4_XSETBV_BIT = 1u << 13 };
 
 /* CR4.VMXE: Intel clients (QEMU's HVF backend) always set it in the guest CR4 and hide it with the CR4 mask/shadow. It
  * is reserved on AMD and makes VMRUN fail with VMEXIT_INVALID, so it never reaches the VMCB; the field remembers it. */
@@ -124,7 +126,11 @@ public:
     explicit VmcsState(rhv::vmcb::Vmcb *vmcb) : fVmcb(vmcb) { memset(fShadow, 0, sizeof(fShadow)); memset(fDr, 0, sizeof(fDr)); }
 
     void attach(rhv::vmcb::Vmcb *vmcb) { fVmcb = vmcb; }
-    void reset() { memset(fShadow, 0, sizeof(fShadow)); memset(fDr, 0, sizeof(fDr)); }
+    void reset() { memset(fShadow, 0, sizeof(fShadow)); memset(fDr, 0, sizeof(fDr)); fTscAux = 0; }
+
+    /* IA32_TSC_AUX of the guest (RDTSCP): the kext puts it in the real MSR while the guest runs. 32 bits. */
+    uint64_t tscAux() const { return fTscAux; }
+    void     setTscAux(uint64_t v) { fTscAux = v & 0xFFFFFFFFull; }
 
     /* DR0-DR3 of the guest. The kext loads them into the CPU around VMRUN, VMRUN itself does not. */
     uint64_t dr(unsigned i) const { return fDr[i & 3]; }
@@ -208,6 +214,15 @@ public:
         }
     }
 
+    /* The client uses the TPR shadow and has left CR8 accesses to the hardware (CR8-load exiting off). */
+    bool tprShadowActive() const
+    {
+        const uint32_t cpu = (uint32_t)get(F_CPU_BASED);
+        return (cpu & CPU_TPR_SHADOW) && !(cpu & CPU_CR8_LOAD_EXIT);
+    }
+    /* TPR threshold, bits 3:0 (the class of the interrupt that waits for a lower TPR); 0 means "never exit". */
+    uint32_t tprThreshold() const { return (uint32_t)get(F_TPR_THRESHOLD) & 0xF; }
+
     /* Convenience for the kext's own use. */
     uint64_t get(uint32_t enc) const { uint64_t v = 0; read(enc, &v); return v; }
 
@@ -229,7 +244,12 @@ public:
         if (cpu & CPU_HLT_EXIT)     v3 |= V3_HLT;
         if (cpu & CPU_INVLPG_EXIT)  v3 |= V3_INVLPG;
         if (cpu & CPU_RDPMC_EXIT)   v3 |= V3_RDPMC;
-        if (cpu & CPU_RDTSC_EXIT)   v3 |= V3_RDTSC;
+        if (cpu & CPU_RDTSC_EXIT) {
+            /* Intel: with RDTSC exiting, RDTSCP exits too. Leaving it out lets RDTSCP read the raw host TSC while the
+             * client hands out its own virtual TSC for RDTSC: two clocks hours apart, and Windows' QPC goes negative. */
+            v3 |= V3_RDTSC;
+            v4 |= V4_RDTSCP_BIT;
+        }
         if (cpu & CPU_PAUSE_EXIT)   v3 |= V3_PAUSE;
         v3 |= V3_IOIO;      /* Hypervisor.framework always hands port I/O to the client, whatever CPU_BASED says */
         v3 |= V3_MSR;                                              /* all MSRs exit; see Vm::fMsrpm for native ones */
@@ -243,6 +263,13 @@ public:
         if (cpu & CPU_CR3_LOAD_EXIT)  cr |= 1u << (16 + 3);
         if (cpu & CPU_CR8_STORE_EXIT) cr |= 1u << 8;
         if (cpu & CPU_CR8_LOAD_EXIT)  cr |= 1u << (16 + 8);
+        /*
+         * TPR shadow: the guest's CR8 is V_TPR (VMRUN virtualizes it when V_INTR_MASKING is on) and a MOV to CR8 does not
+         * exit, except while the client has a TPR threshold set: then the write is intercepted so Vm::run can compare
+         * the new TPR with the threshold (Intel exits with "TPR below threshold" at that point).
+         */
+        if (tprShadowActive() && tprThreshold())
+            cr |= 1u << (16 + 8);
         if (get(F_CR0_MASK)) cr |= 1u << (16 + 0);
         if (get(F_CR4_MASK)) cr |= 1u << (16 + 4);
 
@@ -326,6 +353,9 @@ public:
         case msr::K_TSC:
             *out = hostTsc + fVmcb->control.tscOffset;
             return R_OK;
+        case msr::K_TSC_AUX:
+            *out = fTscAux;
+            return R_OK;
         default:
             return R_INVALID_FIELD;
         }
@@ -342,6 +372,9 @@ public:
             return write(F_GUEST_EFER, value);
         case msr::K_TSC:
             fVmcb->control.tscOffset = value - hostTsc;
+            return R_OK;
+        case msr::K_TSC_AUX:
+            setTscAux(value);
             return R_OK;
         default:
             return R_INVALID_FIELD;
@@ -395,6 +428,7 @@ private:
     rhv::vmcb::Vmcb *fVmcb;
     uint64_t         fShadow[kNumFields];
     uint64_t         fDr[4];
+    uint64_t         fTscAux = 0;
 };
 
 } // namespace vmx

@@ -10,17 +10,29 @@
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 #define IOR_NO_DEVICE 0xe00002c0
 #define IOR_BAD_ARG   0xe00002c2
 
-static io_connect_t gConn;
+/* One connection (one kext user client) per vCPU: the first is the one that created the VM, the others join it. */
+typedef struct Conn {
+    io_connect_t c;
+} Conn;
+
+static Conn     gPrimary;
+static uint64_t gVmId;
+static uint32_t gVmFlags;
+#define gConn (gPrimary.c)
 
 /* Kernel round trips made so far; the shim's statistics report it (RYZENHV_STATS). */
 unsigned long long rhv_iokit_calls;
-#define IOConnectCallScalarMethod (rhv_iokit_calls++, IOConnectCallScalarMethod)
-#define IOConnectCallStructMethod (rhv_iokit_calls++, IOConnectCallStructMethod)
-#define IOConnectCallMethod       (rhv_iokit_calls++, IOConnectCallMethod)
+unsigned long long rhv_iokit_by_selector[32];
+struct { uint32_t field; unsigned long long n; } rhv_iokit_reads[24];     /* which VMCS fields miss the cache */                /* per selector, for the statistics */
+#define IOConnectCallScalarMethod(c, sel, ...) (rhv_iokit_calls++, rhv_iokit_by_selector[(sel) & 31]++, IOConnectCallScalarMethod(c, sel, __VA_ARGS__))
+#define IOConnectCallStructMethod(c, sel, ...) (rhv_iokit_calls++, rhv_iokit_by_selector[(sel) & 31]++, IOConnectCallStructMethod(c, sel, __VA_ARGS__))
+#define IOConnectCallMethod(c, sel, ...)       (rhv_iokit_calls++, rhv_iokit_by_selector[(sel) & 31]++, IOConnectCallMethod(c, sel, __VA_ARGS__))
 
 static int vm_create(void *ctx, uint32_t flags)
 {
@@ -51,14 +63,64 @@ static int vm_create(void *ctx, uint32_t flags)
         gConn = 0;
         return kr;
     }
-    uint64_t in = flags, out = 0;
-    uint32_t outCnt = 1;
-    kr = IOConnectCallScalarMethod(gConn, kRHVMethodVmCreate, &in, 1, &out, &outCnt);
+    gVmFlags = flags;
+    uint64_t in = flags, out[2] = { 0, 0 };
+    uint32_t outCnt = 2;
+    kr = IOConnectCallScalarMethod(gConn, kRHVMethodVmCreate, &in, 1, out, &outCnt);
     if (kr != KERN_SUCCESS) {
         IOServiceClose(gConn);
         gConn = 0;
+    } else {
+        gVmId = out[1];
     }
     return kr;
+}
+
+
+/* vCPU `index`: 0 is the one vm_create made; another one is a new connection that joins the VM. */
+static int vcpu_open(void *ctx, uint32_t index, void **vctx)
+{
+    (void)ctx;
+    if (index == 0) {
+        *vctx = &gPrimary;
+        return 0;
+    }
+    Conn *c = calloc(1, sizeof(*c));
+    if (!c)
+        return (int)0xe00002bd;                          /* kIOReturnNoMemory */
+    io_service_t svc = IOServiceGetMatchingService(0, IOServiceMatching(RHV_SERVICE_NAME));
+    if (!svc) {
+        free(c);
+        return (int)IOR_NO_DEVICE;
+    }
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &c->c);
+    IOObjectRelease(svc);
+    if (kr != KERN_SUCCESS) {
+        free(c);
+        return kr;
+    }
+    uint64_t in[2] = { gVmFlags, gVmId }, out = 0;
+    uint32_t outCnt = 1;
+    kr = IOConnectCallScalarMethod(c->c, kRHVMethodVmJoin, in, 2, &out, &outCnt);
+    if (kr != KERN_SUCCESS) {
+        IOServiceClose(c->c);
+        free(c);
+        return kr;
+    }
+    *vctx = c;
+    return 0;
+}
+
+static int vcpu_close(void *ctx, uint32_t index, void *vctx)
+{
+    (void)ctx;
+    if (index == 0 || !vctx)
+        return 0;                                        /* the first one goes with the VM, see vm_destroy */
+    Conn *c = vctx;
+    IOConnectCallScalarMethod(c->c, kRHVMethodVmDestroy, NULL, 0, NULL, NULL);
+    IOServiceClose(c->c);
+    free(c);
+    return 0;
 }
 
 static int vm_destroy(void *ctx)
@@ -95,83 +157,79 @@ static int vm_protect(void *ctx, uint64_t gpa, uint64_t size, uint32_t flags)
 
 static int vmcs_read(void *ctx, uint32_t field, uint64_t *value)
 {
-    (void)ctx;
+    for (int i = 0; i < 24; i++) {
+        if (rhv_iokit_reads[i].n && rhv_iokit_reads[i].field != field)
+            continue;
+        rhv_iokit_reads[i].field = field;
+        rhv_iokit_reads[i].n++;
+        break;
+    }
     uint64_t in = field, out = 0;
     uint32_t cnt = 1;
-    kern_return_t kr = IOConnectCallScalarMethod(gConn, kRHVMethodVmcsRead, &in, 1, &out, &cnt);
+    kern_return_t kr = IOConnectCallScalarMethod(((Conn *)ctx)->c, kRHVMethodVmcsRead, &in, 1, &out, &cnt);
     *value = out;
     return kr;
 }
 
 static int vmcs_write(void *ctx, uint32_t field, uint64_t value)
 {
-    (void)ctx;
     uint64_t in[2] = { field, value };
-    return IOConnectCallScalarMethod(gConn, kRHVMethodVmcsWrite, in, 2, NULL, NULL);
+    return IOConnectCallScalarMethod(((Conn *)ctx)->c, kRHVMethodVmcsWrite, in, 2, NULL, NULL);
 }
 
 static int get_regs(void *ctx, RHVRegs *regs)
 {
-    (void)ctx;
     size_t sz = sizeof(*regs);
-    return IOConnectCallStructMethod(gConn, kRHVMethodVmGetRegs, NULL, 0, regs, &sz);
+    return IOConnectCallStructMethod(((Conn *)ctx)->c, kRHVMethodVmGetRegs, NULL, 0, regs, &sz);
 }
 
 static int set_regs(void *ctx, const RHVRegs *regs)
 {
-    (void)ctx;
-    return IOConnectCallStructMethod(gConn, kRHVMethodVmSetRegs, regs, sizeof(*regs), NULL, NULL);
+    return IOConnectCallStructMethod(((Conn *)ctx)->c, kRHVMethodVmSetRegs, regs, sizeof(*regs), NULL, NULL);
 }
 
 static int get_fpu(void *ctx, RHVFpuState *fpu)
 {
-    (void)ctx;
     size_t sz = sizeof(*fpu);
-    return IOConnectCallStructMethod(gConn, kRHVMethodVmGetFpu, NULL, 0, fpu, &sz);
+    return IOConnectCallStructMethod(((Conn *)ctx)->c, kRHVMethodVmGetFpu, NULL, 0, fpu, &sz);
 }
 
 static int set_fpu(void *ctx, const RHVFpuState *fpu)
 {
-    (void)ctx;
-    return IOConnectCallStructMethod(gConn, kRHVMethodVmSetFpu, fpu, sizeof(*fpu), NULL, NULL);
+    return IOConnectCallStructMethod(((Conn *)ctx)->c, kRHVMethodVmSetFpu, fpu, sizeof(*fpu), NULL, NULL);
 }
 
 static int msr_op(void *ctx, uint32_t op, uint32_t msr, uint64_t value, uint64_t *out)
 {
-    (void)ctx;
     uint64_t in[3] = { op, msr, value }, o = 0;
     uint32_t cnt = 1;
-    kern_return_t kr = IOConnectCallScalarMethod(gConn, kRHVMethodVmMsr, in, 3, &o, &cnt);
+    kern_return_t kr = IOConnectCallScalarMethod(((Conn *)ctx)->c, kRHVMethodVmMsr, in, 3, &o, &cnt);
     *out = o;
     return kr;
 }
 
 static int run(void *ctx, RHVExit *ex)
 {
-    (void)ctx;
     uint64_t skip = 0;                  /* a VMX client advances RIP itself */
     size_t sz = sizeof(*ex);
-    return IOConnectCallMethod(gConn, kRHVMethodVmRun, &skip, 1, NULL, 0, NULL, NULL, ex, &sz);
+    return IOConnectCallMethod(((Conn *)ctx)->c, kRHVMethodVmRun, &skip, 1, NULL, 0, NULL, NULL, ex, &sz);
 }
 
 static int run_ex(void *ctx, const RHVRunIn *in, RHVRunOut *out)
 {
-    (void)ctx;
     size_t sz = sizeof(*out);
-    return IOConnectCallStructMethod(gConn, kRHVMethodVmRunEx, in, sizeof(*in), out, &sz);
+    return IOConnectCallStructMethod(((Conn *)ctx)->c, kRHVMethodVmRunEx, in, sizeof(*in), out, &sz);
 }
 
 static int vmcs_read_many(void *ctx, const RHVReadMany *in, RHVReadManyOut *out)
 {
-    (void)ctx;
     size_t sz = sizeof(*out);
-    return IOConnectCallStructMethod(gConn, kRHVMethodVmcsReadMany, in, sizeof(*in), out, &sz);
+    return IOConnectCallStructMethod(((Conn *)ctx)->c, kRHVMethodVmcsReadMany, in, sizeof(*in), out, &sz);
 }
 
 static int kick(void *ctx)
 {
-    (void)ctx;
-    return IOConnectCallScalarMethod(gConn, kRHVMethodVmKick, NULL, 0, NULL, NULL);
+    return IOConnectCallScalarMethod(((Conn *)ctx)->c, kRHVMethodVmKick, NULL, 0, NULL, NULL);
 }
 
 static uint64_t now(void *ctx)
@@ -214,4 +272,6 @@ void rhv_iokit_backend(RhvBackend *b)
     b->thread_id = thread_id;
     b->run_ex = run_ex;
     b->vmcs_read_many = vmcs_read_many;
+    b->vcpu_open = vcpu_open;
+    b->vcpu_close = vcpu_close;
 }

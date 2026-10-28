@@ -56,6 +56,19 @@ shim: | $(BUILD)
 	$(CC) -arch x86_64 -Wall -Wextra -Wno-deprecated-declarations -Wno-nullability-completeness -O2 -dynamiclib \
 		-o $(BUILD)/libryzenhv.dylib $(SHIM_SRC) -framework Hypervisor -framework IOKit -framework CoreFoundation
 
+# The shim as a stand-in for one of Parallels' own libraries (see shim/hijack.c and scripts/parallels-shim.sh).
+# HIJACK_NAME is the library's file name, HIJACK_ORIG a copy of the real one with its install name changed to where the
+# real one will be found at run time (only the linker reads it).
+HIJACK_NAME ?= libPrlXmlModel.1.dylib
+HIJACK_ORIG ?= $(BUILD)/hijack-link/$(HIJACK_NAME)
+HIJACK_ORIG_RUNTIME ?= @loader_path/libPrlXmlModel.1.orig.dylib
+
+hijack: | $(BUILD)
+	@test -f "$(HIJACK_ORIG)" || { echo "run scripts/parallels-shim.sh prepare first (it makes $(HIJACK_ORIG))"; exit 1; }
+	$(CC) -arch x86_64 -Wall -Wextra -Wno-deprecated-declarations -Wno-nullability-completeness -O2 -dynamiclib -DRHV_HIJACK \
+		-install_name @rpath/$(HIJACK_NAME) -Wl,-reexport_library,$(HIJACK_ORIG) \
+		-o $(BUILD)/$(HIJACK_NAME) $(SHIM_SRC) shim/hijack.c -framework Hypervisor -framework IOKit -framework CoreFoundation
+
 kext:
 	$(MAKE) -C kext
 

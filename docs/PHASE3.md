@@ -75,15 +75,28 @@ APIC/IOAPIC (скорее всего да, раз API появился) и не�
    одним `VmcsReadMany`. Ядро ABI 7 шим больше не принимает (проверка в `hv_vm_create`, с понятным сообщением).
    Результат на Ryzen 7 5800H: 1.2-2 вызова ядра на выход вместо 12, ~17 мкс на выход под нагрузкой (57 тыс. выходов/с)
    вместо ~38 мкс; Linux без всяких параметров калибрует TSC сам (`Detected 3194.185 MHz processor`) и доходит до `~ #`.
-7. **Parallels (в работе).** Parallels Desktop 26.5 для Intel сам проверяет `sysctl kern.hv_support` (на AMD 0) и тогда
-   уходит на собственный движок с kext, которого у нас нет: `AppleHV does not support this Mac, defaulting to own
-   engine` в `~/Parallels/<ВМ>.pvm/parallels.log`. Его бэкенд на Hypervisor.framework лежит в `libMonitor.dylib`
-   (x86_64) и использует 35 функций (`nm -arch x86_64 -u libMonitor.dylib | grep _hv_`); реализовано 25. Сделано:
-   шим подменяет `kern.hv_support` на 1, добавлены `hv_tsc_clock`, `hv_vcpu_set_tsc_relative`, `hv_vcpu_set_msr_access`,
-   `hv_vmx_get_msr_info`, `hv_vmx_vcpu_set_apic_address[_space]`; kext с boot-arg `rhv_allow_users=1` пускает
-   локального пользователя (процесс ВМ Parallels работает не от root); `scripts/parallels-shim.sh install` ставит
-   обёртку на `prl_vm_app`, которая загружает шим. **Ещё нет:** адресные пространства (`hv_vm_space_*`,
-   `hv_vm_{map,unmap,protect}_space`, `hv_vcpu_set_space`), встроенные APIC/IOAPIC/ATPIC, если они понадобятся.
+7. **Parallels (в работе).** Parallels Desktop 26.5 для Intel сам проверяет `sysctl kern.hv_support` (на AMD 0) и уходит
+   на собственный движок с kext, которого у нас нет (`AppleHV does not support this Mac, defaulting to own engine` в
+   `~/Parallels/<ВМ>.pvm/parallels.log`). Его бэкенд на Hypervisor.framework лежит в `libMonitor.dylib` (x86_64) и
+   использует 35 функций (`nm -arch x86_64 -u libMonitor.dylib | grep _hv_`). Пройдено на реальном запуске:
+   - **Как попасть в процесс.** `prl_vm_app` это hardened-бинарник: dyld игнорирует `DYLD_INSERT_LIBRARIES`, а диспетчер
+     Parallels проверяет подпись процесса (`anchor apple generic and certificate leaf[subject.OU] = "4C6364ACXT"`), поэтому
+     ни переменная окружения, ни переподпись не годятся. `scripts/parallels-shim.sh prepare` делает в `~/.ryzenhv/prl`
+     зеркало приложения (подпись Parallels цела), где библиотека `libPrlXmlModel.1.dylib`, грузящаяся при запуске, это шим,
+     реэкспортирующий настоящую (`shim/hijack.c`); `install` (sudo) заменяет только `prl_vm_app` в `/Applications` на
+     обёртку-перенаправитель, `uninstall` возвращает оригинал. Подмену функций делает сам шим (перезапись указателей импорта
+     по имени, как fishhook): `dyld_dynamic_interpose` на этой системе уже загруженные образы не трогает.
+   - **kern.hv_support** шим отдаёт 1, и Parallels выбирает бэкенд Apple HV.
+   - **Проверка вендора CPUID** (`GenuineIntel`, это инструкция, перехватить нельзя) обходится правкой одного условного
+     перехода: в памяти `prl_vm_app` (файл править нельзя, подпись) и в копии `libMonitor.dylib` в зеркале.
+   - Реализованы `hv_vm_allocate/deallocate`, `hv_tsc_clock`, `hv_vcpu_set_tsc_relative`, `hv_vcpu_set_msr_access`,
+     `hv_vmx_get_msr_info`, `hv_vmx_vcpu_set_apic_address[_space]`, ёмкости VMX `VMCS_ENUM`/`EPT_VPID_CAP`, XSAVE-образ с
+     `XSTATE_BV`, шире текущего `XCR0` (Parallels пишет его до включения AVX), `IA32_TSC_AUX` как «родной» MSR.
+   - Ядро: boot-arg `rhv_allow_users=1` пускает локального пользователя; ВМ Parallels работает от пользователя.
+   С 1 vCPU (`prlctl set <ВМ> --cpus 1`) ВМ уже создаётся: vCPU, 8 ГБ памяти и устройства отображаются в гостя.
+   **Ещё нет:** несколько vCPU (Parallels создаёт по vCPU на поток, у нас один на ВМ), адресные пространства
+   (`hv_vm_space_*`, `hv_vm_{map,unmap,protect}_space`, `hv_vcpu_set_space`), встроенные APIC/IOAPIC/ATPIC, если понадобятся;
+   дальше выяснится по первому запуску гостя.
 8. Всё остальное, что потребуется Parallels.
 
 ## Риски

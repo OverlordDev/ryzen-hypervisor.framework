@@ -1,16 +1,19 @@
 /*
- * Vm.hpp - one virtual machine with one vCPU (phase 1).
+ * Vm.hpp - a virtual machine: one shared part and one object per vCPU.
  *
- * Owns the VMCB, the host VMCB, the I/O and MSR permission bitmaps, the nested
- * page tables (guest physical -> pinned memory, built by rhv::npt::Table) and
- * the guest's general purpose registers.
+ * com_overlorddev_RyzenHVVmShared is what all vCPUs of a VM have in common: the nested page tables (guest physical ->
+ * pinned memory, built by rhv::npt::Table), the optional built-in RAM and the list of the vCPUs. com_overlorddev_RyzenHVVm
+ * is one vCPU: it owns the VMCB, the host VMCB, the I/O and MSR permission bitmaps and the guest's general purpose
+ * registers, and has its own lock, so vCPUs run in parallel on different host threads.
  *
  * Guest memory comes from two places: the optional built-in 1 MiB at guest
  * physical 0 (kernel memory userland can map), and VmMap, which pins pages of the
  * calling process. Both end up as 4 KiB NPT entries pointing into a Backing.
  *
- * Everything is serialised by one lock: VmRun holds it while the guest runs,
- * which is bounded by the time slice (see Vm.cpp).
+ * A vCPU's own state is serialised by its lock: VmRun holds it while the guest runs, which is bounded by the time slice
+ * (see Vm.cpp). The page tables have a reader/writer lock: a vCPU holds it for reading while it is inside the guest, and
+ * VmMap/VmUnmap/VmProtect take it for writing after kicking every vCPU out, so when they return no vCPU still runs with
+ * the old mappings or permissions (every VMRUN flushes the TLB).
  */
 #ifndef RYZENHV_VM_HPP
 #define RYZENHV_VM_HPP
@@ -36,22 +39,80 @@ struct GuestGprs {
 
 } // namespace rhv
 
+
+class com_overlorddev_RyzenHVVm;
+
+class com_overlorddev_RyzenHVVmShared : public OSObject {
+    OSDeclareDefaultStructors(com_overlorddev_RyzenHVVmShared)
+
+public:
+    /* flags: RHV_VMCREATE_*. `owner` is the task that created it (a vCPU may only join from the same task). */
+    static com_overlorddev_RyzenHVVmShared *create(uint32_t flags, task_t owner, IOReturn *err);
+    /* Looks a VM up by id; takes a reference, nullptr when there is none or it belongs to another task. */
+    static com_overlorddev_RyzenHVVmShared *find(uint64_t id, task_t owner);
+
+    bool init() override;
+    void free() override;
+
+    uint64_t            id() const { return fId; }
+    rhv::npt::Table    &npt() { return fNpt; }
+    IORWLock           *rw() const { return fRw; }
+    IOMemoryDescriptor *ramDescriptor() const { return fRam; }
+    uint32_t            ramSize() const { return fRam ? RHV_GUEST_RAM_SIZE : 0; }
+
+    /* hv_vm_map / unmap / protect. See RyzenHVShared.h for the exact rules. */
+    IOReturn map(task_t task, uint64_t uva, uint64_t gpa, uint64_t size, uint32_t flags);
+    IOReturn unmap(uint64_t gpa, uint64_t size);
+    IOReturn protect(uint64_t gpa, uint64_t size, uint32_t flags);
+
+    /* The vCPUs, for kicking them out of the guest. attach() fails with kIOReturnNoResources when the VM is full. */
+    IOReturn attach(com_overlorddev_RyzenHVVm *vcpu, uint32_t *index);
+    void     detach(com_overlorddev_RyzenHVVm *vcpu);
+    void     kickAll();
+
+    /* A pinned buffer (user or kernel) and how many NPT pages still point into it. */
+    struct Backing {
+        IOMemoryDescriptor *md;
+        uint64_t            live;
+    };
+
+private:
+    bool     setup(uint32_t flags, task_t owner);
+    IOReturn mapDescriptorLocked(IOMemoryDescriptor *md, uint64_t gpa, uint64_t size, uint32_t perm);
+    static void dropPage(Backing *b);
+    static void releaseOwner(void *ctx, void *owner);
+
+    uint64_t                  fId;
+    task_t                    fOwner;
+    IORWLock                 *fRw;
+    IOLock                   *fRegLock;
+    com_overlorddev_RyzenHVVm *fVcpus[RHV_MAX_VCPUS_PER_VM];
+    IOBufferMemoryDescriptor *fRam;
+    rhv::npt::Table           fNpt;
+    uint64_t                  fPagesMapped;
+};
+
 class com_overlorddev_RyzenHVVm : public OSObject {
     OSDeclareDefaultStructors(com_overlorddev_RyzenHVVm)
 
 public:
     /*
      * Fails with kIOReturnNotReady if SVM is not active on all CPUs and with
-     * kIOReturnUnsupported if the CPU lacks NPT or NRIPS.
+     * kIOReturnUnsupported if the CPU lacks NPT or NRIPS. With `shared` null a new VM is made (this is its first vCPU),
+     * otherwise the vCPU joins that VM (kIOReturnNoResources when it is full).
      */
-    static com_overlorddev_RyzenHVVm *create(const RHVInfo &info, uint32_t flags, IOReturn *err);
+    static com_overlorddev_RyzenHVVm *create(const RHVInfo &info, uint32_t flags, task_t owner,
+                                             com_overlorddev_RyzenHVVmShared *shared, IOReturn *err);
+
+    com_overlorddev_RyzenHVVmShared *shared() const { return fShared; }
+    uint32_t                         index() const { return fIndex; }
 
     bool init() override;
     void free() override;
 
-    /* nullptr when created with RHV_VMCREATE_NO_RAM. */
-    IOMemoryDescriptor *ramDescriptor() const { return fRam; }
-    uint32_t            ramSize() const { return fRam ? RHV_GUEST_RAM_SIZE : 0; }
+    /* nullptr when created with RHV_VMCREATE_NO_RAM (and for a vCPU that joined). */
+    IOMemoryDescriptor *ramDescriptor() const { return fShared->ramDescriptor(); }
+    uint32_t            ramSize() const { return fShared->ramSize(); }
 
     /* hv_vm_map / unmap / protect. See RyzenHVShared.h for the exact rules. */
     IOReturn map(task_t task, uint64_t uva, uint64_t gpa, uint64_t size, uint32_t flags);
@@ -82,37 +143,27 @@ public:
     IOReturn getFpu(RHVFpuState *out);
     IOReturn setFpu(const RHVFpuState *in);
 
-    /* A pinned buffer (user or kernel) and how many NPT pages still point into it. */
-    struct Backing {
-        IOMemoryDescriptor *md;
-        uint64_t            live;
-    };
-
 private:
     bool     setup(uint32_t flags);
-    IOReturn mapDescriptorLocked(IOMemoryDescriptor *md, uint64_t gpa, uint64_t size,
-                                 uint32_t perm);
-    static void dropPage(Backing *b);
-    static void releaseOwner(void *ctx, void *owner);
     void     resetLocked(uint16_t cs, uint16_t ip);
     void     dumpVmcb(const char *why);
 
     IOLock                   *fLock;
-    IOBufferMemoryDescriptor *fRam;
+    com_overlorddev_RyzenHVVmShared *fShared;
+    uint32_t                  fIndex;
     rhv::PhysMem              fVmcb;
     rhv::PhysMem              fHostVmcb;
     rhv::PhysMem              fIopm;     /* 12 KiB, all ones: intercept every port */
     rhv::PhysMem              fMsrpm;    /*  8 KiB, all ones: intercept every MSR  */
-    rhv::npt::Table           fNpt;
     rhv::vmx::VmcsState       fVmcs;
     rhv::PhysMem              fHostFpu, fGuestFpu, fScratchFpu;   /* XSAVE areas, 4 KiB aligned */
     uint64_t                  fGuestXcr0;
     uint64_t                  fXcr0Supported;    /* CPUID.0xD.0 EDX:EAX */
+    bool                      fHasTscAux;        /* the CPU has RDTSCP, so IA32_TSC_AUX */
     uint32_t                  fFpuSize;
     volatile uint32_t         fKick;
     volatile int              fRunCpu;           /* CPU inside VMRUN, -1 when none; for kick() */
     bool                      fVmx;
-    uint64_t                  fPagesMapped;
     rhv::GuestGprs            fGprs;
     bool                      fFirstRun;
     bool                      fHaveNextRip;

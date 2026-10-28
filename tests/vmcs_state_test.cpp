@@ -151,7 +151,7 @@ void testControls()
     f.st.write(0x4002, 0);
     f.st.write(0x401e, 0);
     f.st.applyControls();
-    CHECK(!(c.interceptVec3 & (V3_HLT | V3_PAUSE)) && (c.interceptVec3 & V3_IOIO) && !(c.interceptVec4 & (V4_MWAIT | V4_WBINVD)) && c.interceptDr == 0);
+    CHECK(!(c.interceptVec3 & (V3_HLT | V3_PAUSE)) && (c.interceptVec3 & V3_IOIO) && !(c.interceptVec4 & (V4_MWAIT | V4_WBINVD | V4_RDTSCP_BIT)) && c.interceptDr == 0);
 
     /* The client can never switch the host's own intercepts off. */
     f.st.write(0x4000, 0);                                      /* "no external-interrupt exiting" */
@@ -164,11 +164,32 @@ void testControls()
     f.st.write(0x6002, 0);
     f.st.applyControls();
     CHECK((c.interceptVec3 & (V3_RDTSC | V3_RDPMC)) == (V3_RDTSC | V3_RDPMC));
+    CHECK(c.interceptVec4 & V4_RDTSCP_BIT);                     /* RDTSC exiting takes RDTSCP along */
     CHECK(c.interceptCr == ((1u << 3) | (1u << 19) | (1u << 24) | (1u << 16)));   /* CR3 store, CR3 load, CR8 load, CR0 write (mask set) */
     f.st.write(0x6000, 0);
     f.st.write(0x6002, 0x20);                                   /* CR4 mask: PAE */
     f.st.applyControls();
     CHECK((c.interceptCr & (1u << 20)) && !(c.interceptCr & (1u << 16)));
+
+    /* TPR shadow: CR8 is virtualized (V_TPR), a write exits only while a TPR threshold is set. */
+    f.st.write(0x6000, 0);
+    f.st.write(0x6002, 0);
+    f.st.write(0x4002, CPU_TPR_SHADOW);
+    f.st.write(0x401c, 0);
+    f.st.applyControls();
+    CHECK(c.interceptCr == 0 && f.st.tprShadowActive() && f.st.tprThreshold() == 0);
+    f.st.write(0x401c, 0xd);
+    f.st.applyControls();
+    CHECK(c.interceptCr == (1u << (16 + 8)) && f.st.tprThreshold() == 0xd);          /* only the CR8 write, not the read */
+    f.st.write(0x401c, 0x1000d);                                                      /* bits above 3:0 are ignored */
+    CHECK(f.st.tprThreshold() == 0xd);
+    f.st.write(0x4002, CPU_TPR_SHADOW | CPU_CR8_LOAD_EXIT);                           /* CR8-load exiting wins: no shadow */
+    f.st.applyControls();
+    CHECK(!f.st.tprShadowActive() && (c.interceptCr & (1u << (16 + 8))));
+    f.st.write(0x4002, CPU_CR8_LOAD_EXIT | CPU_CR8_STORE_EXIT);                       /* no shadow: exits as the client asked */
+    f.st.write(0x401c, 0);
+    f.st.applyControls();
+    CHECK(c.interceptCr == ((1u << 8) | (1u << (16 + 8))));
 
     /* Interrupt window exiting asks for a virtual interrupt and the VINTR exit. */
     f.st.write(0x4002, CPU_INTR_WINDOW);
@@ -281,7 +302,13 @@ void testExtensionsAndMsrs()
     CHECK(f.st.writeMsr(msr::MSR_SYSENTER_CS, 0, 0x1FFFFFF08ull) == R_OK && f.vmcb.save.sysenterCs == 0xFFFFFF08);   /* 32-bit MSR */
     CHECK(f.st.writeMsr(msr::MSR_EFER, 0, 0xD01) == R_OK && (f.vmcb.save.efer & EFER_SVME));
     CHECK(f.st.readMsr(msr::MSR_EFER, 0, &out) == R_OK && out == 0xD01);
-    CHECK(f.st.writeMsr(0x1B, 0, 1) == R_INVALID_FIELD && f.st.readMsr(0xC0000103, 0, &out) == R_INVALID_FIELD);
+    CHECK(f.st.writeMsr(0x1B, 0, 1) == R_INVALID_FIELD && f.st.readMsr(0xC0000104, 0, &out) == R_INVALID_FIELD);
+    /* TSC_AUX is not in the VMCB; the state keeps it (32 bits) for the kext to load around VMRUN. */
+    CHECK(f.st.writeMsr(msr::MSR_TSC_AUX, 0, 0x1234ABCDull) == R_OK && f.st.tscAux() == 0x1234ABCDull);
+    CHECK(f.st.readMsr(msr::MSR_TSC_AUX, 0, &out) == R_OK && out == 0x1234ABCDull);
+    CHECK(f.st.writeMsr(msr::MSR_TSC_AUX, 0, 0xFFFFFFFF00000007ull) == R_OK && f.st.tscAux() == 7);   /* high half is reserved */
+    f.st.reset();
+    CHECK(f.st.tscAux() == 0);
     /* The guest TSC is the host TSC plus the offset; writing it sets the offset. */
     CHECK(f.st.writeMsr(msr::MSR_TSC, 1000, 5000) == R_OK && f.vmcb.control.tscOffset == 4000);
     CHECK(f.st.readMsr(msr::MSR_TSC, 1500, &out) == R_OK && out == 5500);

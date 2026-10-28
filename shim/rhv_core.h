@@ -7,7 +7,7 @@
  * <Hypervisor/Hypervisor.h>, so it builds and is tested on any machine. hv_shim.c adapts it to the real prototypes.
  *
  * Limits of this first version, all reported as errors rather than faked:
- *   - one VM per process, one vCPU per VM
+ *   - one VM per process (several vCPUs per VM; each runs on the thread that created it)
  *   - no in-kernel APIC / IOAPIC / ATPIC (hv_vcpu_apic_*, hv_vm_ioapic_*, ...): HV_UNSUPPORTED; QEMU emulates those
  *   - no VM address spaces (hv_vm_space_*)
  */
@@ -51,7 +51,7 @@ enum {
     RHV_VMX_CAP_PINBASED = 0, RHV_VMX_CAP_PROCBASED, RHV_VMX_CAP_PROCBASED2, RHV_VMX_CAP_ENTRY, RHV_VMX_CAP_EXIT,
     RHV_VMX_CAP_BASIC, RHV_VMX_CAP_TRUE_PINBASED, RHV_VMX_CAP_TRUE_PROCBASED, RHV_VMX_CAP_TRUE_ENTRY,
     RHV_VMX_CAP_TRUE_EXIT, RHV_VMX_CAP_MISC, RHV_VMX_CAP_CR0_FIXED0, RHV_VMX_CAP_CR0_FIXED1,
-    RHV_VMX_CAP_CR4_FIXED0, RHV_VMX_CAP_CR4_FIXED1
+    RHV_VMX_CAP_CR4_FIXED0, RHV_VMX_CAP_CR4_FIXED1, RHV_VMX_CAP_VMCS_ENUM, RHV_VMX_CAP_EPT_VPID_CAP
 };
 
 /* What the real thing accepts for hv_vm_map and friends. */
@@ -83,10 +83,20 @@ typedef struct RhvBackend {
     /* Fast path (ABI 8); without them the core falls back to one call per register / field. */
     int (*run_ex)(void *ctx, const RHVRunIn *in, RHVRunOut *out);
     int (*vmcs_read_many)(void *ctx, const RHVReadMany *in, RHVReadManyOut *out);
+    /*
+     * More than one vCPU (ABI 9). With these the per-vCPU functions above (vmcs_*, *_regs, *_fpu, msr, run, run_ex, kick,
+     * vmcs_read_many) get the pointer vcpu_open returned instead of `ctx`; the VM-wide ones keep using `ctx`.
+     * vcpu_open(index 0) returns the vCPU that vm_create made. Without vcpu_open there is one vCPU and its ctx is `ctx`.
+     */
+    int (*vcpu_open)(void *ctx, uint32_t index, void **vctx);
+    int (*vcpu_close)(void *ctx, uint32_t index, void *vctx);
 } RhvBackend;
 
 /* Installs the backend. The core copies it. Must be called before the first API call. */
 void rhv_core_init(const RhvBackend *backend);
+
+/* Whether hv_vmx_read_capability offers the TPR shadow (CPU-based control bit 21); default no. */
+extern int rhv_core_offer_tpr_shadow;
 
 /* Optional trace sink, printf style; NULL (the default) disables tracing. */
 extern void (*rhv_core_trace)(const char *fmt, ...);
@@ -102,6 +112,7 @@ int32_t rhv_vm_sync_tsc(uint64_t tsc);
 int32_t rhv_vcpu_create(uint32_t *vcpu, uint64_t flags);
 int32_t rhv_vcpu_destroy(uint32_t vcpu);
 int32_t rhv_vcpu_run(uint32_t vcpu);
+void rhv_vcpu_override_exit(uint32_t vcpu, uint64_t reason, uint64_t instrLen);
 int32_t rhv_vcpu_interrupt(const uint32_t *vcpus, unsigned int count);
 int32_t rhv_vcpu_read_register(uint32_t vcpu, uint32_t reg, uint64_t *value);
 int32_t rhv_vcpu_write_register(uint32_t vcpu, uint32_t reg, uint64_t value);

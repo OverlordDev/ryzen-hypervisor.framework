@@ -2,62 +2,137 @@
 #
 # Runs Parallels' VM process (prl_vm_app) with the Hypervisor.framework shim loaded.
 #
-#   sudo ./scripts/parallels-shim.sh install     # prl_vm_app becomes a small wrapper script, the real one is kept
-#   sudo ./scripts/parallels-shim.sh uninstall   # puts the original back
+#   ./scripts/parallels-shim.sh prepare          # builds a private copy of the VM app with the shim built in (no sudo)
+#   sudo ./scripts/parallels-shim.sh install     # prl_vm_app in /Applications becomes a wrapper that starts that copy
+#   sudo ./scripts/parallels-shim.sh uninstall   # puts Parallels' own prl_vm_app back
 #   ./scripts/parallels-shim.sh status
 #
-# Why a wrapper: Parallels' dispatcher (a root daemon) starts the VM process, so an environment variable set in a
-# shell never reaches it. The wrapper sets DYLD_INSERT_LIBRARIES and then execs the real binary (same pid, same
-# signature on the process that connects back to the dispatcher). Parallels updates replace the file: run install again.
+# Why this much: Parallels' dispatcher (a root daemon) starts the VM process, so an environment variable set in a shell
+# never reaches it, and prl_vm_app is a hardened-runtime binary that ignores DYLD_INSERT_LIBRARIES anyway. The dispatcher
+# also checks that the process is signed by Parallels, so it cannot be re-signed. What works: a copy of the app (own
+# signature intact) in ~/.ryzenhv/prl, laid out exactly like /Applications/Parallels Desktop.app, in which the library
+# libPrlXmlModel.1.dylib (loaded at launch from Contents/Frameworks) is the shim re-exporting the real one (shim/hijack.c).
+# Nothing inside the installed Parallels app changes except the small wrapper that replaces prl_vm_app.
 #
-# Needs the kext started with boot-arg rhv_allow_users=1 (the VM process runs as you, not as root), and AMFI relaxed
-# (amfi_get_out_of_my_way=0x1 on this machine) because prl_vm_app is a hardened-runtime binary.
+# Needs the kext started with rhv_allow_users=1 if the VM process runs as you, and AMFI relaxed on this machine
+# (amfi_get_out_of_my_way=0x1) so the stand-in library passes library validation. Parallels updates replace the wrapper:
+# run install again (and prepare, if the app changed).
 set -eu
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-LIB="$HERE/build/libryzenhv.dylib"
-DIR="/Applications/Parallels Desktop.app/Contents/MacOS/Parallels VM.app/Contents/MacOS"
-APP="$DIR/prl_vm_app"
+APP="/Applications/Parallels Desktop.app"
+DIR="$APP/Contents/MacOS/Parallels VM.app/Contents/MacOS"
+WRAPPER="$DIR/prl_vm_app"
 REAL="$DIR/prl_vm_app.real"
+ORIG="$DIR/prl_vm_app.orig"      # untouched copy of Parallels' binary, what uninstall puts back
+OWNER="${SUDO_USER:-$(id -un)}"
+OWNER_HOME="$(eval echo "~$OWNER")"
+FARM="$OWNER_HOME/.ryzenhv/prl/Parallels Desktop.app"
+FARM_BIN="$FARM/Contents/MacOS/Parallels VM.app/Contents/MacOS/prl_vm_app"
+
+is_wrapper() { [ -e "$WRAPPER" ] && head -c 2 "$WRAPPER" | grep -q '#!'; }
+
+# The pristine VM binary: Parallels' own, whatever state a previous install left things in.
+pristine() {
+    if [ -e "$ORIG" ]; then echo "$ORIG"
+    elif [ -e "$WRAPPER" ] && ! is_wrapper; then echo "$WRAPPER"
+    else echo "$REAL"; fi
+}
 
 case "${1:-status}" in
+prepare)
+    [ "$(id -u)" != 0 ] || { echo "run prepare as yourself, not with sudo" >&2; exit 1; }
+    [ -d "$APP" ] || { echo "Parallels is not installed at $APP" >&2; exit 1; }
+    SRC_BIN="$(pristine)"
+    codesign -dv "$SRC_BIN" 2>&1 | grep -q "TeamIdentifier=4C6364ACXT" || \
+        { echo "$SRC_BIN is not Parallels' signed binary (a leftover of an older install?); run: sudo $0 uninstall" >&2; exit 1; }
+    rm -rf "$OWNER_HOME/.ryzenhv/prl"
+    mkdir -p "$FARM/Contents/Frameworks" "$FARM/Contents/MacOS"
+    # Everything that is not ours points at the real app.
+    for e in "$APP/Contents"/*; do
+        n="$(basename "$e")"
+        case "$n" in Frameworks|MacOS) ;; *) ln -s "$e" "$FARM/Contents/$n" ;; esac
+    done
+    for e in "$APP/Contents/Frameworks"/*; do
+        n="$(basename "$e")"
+        [ "$n" = "libPrlXmlModel.1.dylib" ] || ln -s "$e" "$FARM/Contents/Frameworks/$n"
+    done
+    for e in "$APP/Contents/MacOS"/*; do
+        n="$(basename "$e")"
+        [ "$n" = "Parallels VM.app" ] || ln -s "$e" "$FARM/Contents/MacOS/$n"
+    done
+    # The VM app is a real copy, with Parallels' binary and signature back in place.
+    cp -R "$DIR/../.." "$FARM/Contents/MacOS/Parallels VM.app"
+    rm -f "$FARM/Contents/MacOS/Parallels VM.app/Contents/MacOS/prl_vm_app.real" \
+          "$FARM/Contents/MacOS/Parallels VM.app/Contents/MacOS/prl_vm_app.orig"
+    cp -p "$SRC_BIN" "$FARM_BIN"
+    # The real library, untouched (its signature stays Parallels'), next to the stand-in.
+    cp -p "$APP/Contents/Frameworks/libPrlXmlModel.1.dylib" "$FARM/Contents/Frameworks/libPrlXmlModel.1.orig.dylib"
+    # For the linker only: a copy whose install name says where the real library will be.
+    mkdir -p "$HERE/build/hijack-link"
+    cp "$APP/Contents/Frameworks/libPrlXmlModel.1.dylib" "$HERE/build/hijack-link/libPrlXmlModel.1.dylib"
+    install_name_tool -id "@loader_path/libPrlXmlModel.1.orig.dylib" "$HERE/build/hijack-link/libPrlXmlModel.1.dylib" 2>/dev/null
+    make -C "$HERE" hijack >/dev/null
+    cp "$HERE/build/libPrlXmlModel.1.dylib" "$FARM/Contents/Frameworks/libPrlXmlModel.1.dylib"
+    codesign --force --sign - "$FARM/Contents/Frameworks/libPrlXmlModel.1.dylib" 2>/dev/null
+    # libMonitor (Parallels' hypervisor backend) refuses a CPU whose CPUID vendor is not GenuineIntel. CPUID is an
+    # instruction, nothing can intercept it, so the library in the private copy gets that one branch changed.
+    rm -f "$FARM/Contents/MacOS/libMonitor.dylib"
+    cp -p "$APP/Contents/MacOS/libMonitor.dylib" "$FARM/Contents/MacOS/libMonitor.dylib"
+    python3 - "$FARM/Contents/MacOS/libMonitor.dylib" <<'PY'
+import sys
+p = sys.argv[1]
+d = bytearray(open(p, 'rb').read())
+off = 0x207b5                      # je <Intel path> after the "GenuineIntel" comparison (Parallels 26.5.0 build 57613)
+if bytes(d[off:off + 2]) != b'\x74\x5d' or bytes(d[off - 3:off]) != b'\x48\x09\xc2':
+    sys.exit("libMonitor.dylib is not the build this patch was written for; not patching")
+d[off] = 0xEB                      # je -> jmp: every vendor takes the Intel path
+open(p, 'wb').write(d)
+PY
+    codesign --force --sign - "$FARM/Contents/MacOS/libMonitor.dylib" 2>/dev/null
+    echo "prepared: $FARM"
+    ;;
 install)
     [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 1; }
-    [ -f "$LIB" ] || { echo "build the shim first: make shim" >&2; exit 1; }
-    [ -e "$APP" ] || { echo "Parallels is not installed at $APP" >&2; exit 1; }
-    if [ ! -e "$REAL" ]; then
-        mv "$APP" "$REAL"
-    elif ! head -c 2 "$APP" | grep -q '#!'; then
-        # Parallels was updated and put a new binary in place: keep that one as the real one.
-        mv "$APP" "$REAL"
+    [ -x "$FARM_BIN" ] || { echo "run ./scripts/parallels-shim.sh prepare first (as yourself)" >&2; exit 1; }
+    [ -e "$WRAPPER" ] || { echo "Parallels is not installed at $WRAPPER" >&2; exit 1; }
+    if ! is_wrapper; then                       # first install, or Parallels was updated
+        [ -e "$ORIG" ] && rm -f "$ORIG"
+        cp -p "$WRAPPER" "$ORIG"
+        mv "$WRAPPER" "$REAL"
     fi
-    cat > "$APP" <<WRAP
+    [ -e "$ORIG" ] || cp -p "$REAL" "$ORIG"
+    cp -p "$ORIG" "$REAL"                       # drop any older re-signed copy
+    cat > "$WRAPPER" <<WRAP
 #!/bin/bash
 # RyzenHV wrapper, see scripts/parallels-shim.sh in the ryzen-hypervisor repository.
-export DYLD_INSERT_LIBRARIES="$LIB"
-export RYZENHV_TRACE=\${RYZENHV_TRACE:-2} RYZENHV_TRACE_FILE=/tmp/rhv-prl-trace.txt
-export RYZENHV_STATS=1 RYZENHV_STATS_FILE=/tmp/rhv-prl-stats.txt
+# Starts the private copy of the VM app that has the Hypervisor.framework shim built in.
+# One trace file per process: /tmp/rhv-prl-<pid>.trace
+export RYZENHV_TRACE=\${RYZENHV_TRACE:-2} RYZENHV_TRACE_FILE=/tmp/rhv-prl-\$\$.trace
+export RYZENHV_STATS=1 RYZENHV_STATS_FILE=/tmp/rhv-prl-\$\$.stats
+if [ -x "$FARM_BIN" ]; then exec "$FARM_BIN" "\$@"; fi
 exec "\$(dirname "\$0")/prl_vm_app.real" "\$@"
 WRAP
-    chmod 755 "$APP"
-    chown root:wheel "$APP"
-    echo "installed: $APP -> wrapper (original: $REAL)"
+    chmod 755 "$WRAPPER"
+    chown root:wheel "$WRAPPER"
+    echo "installed: $WRAPPER now starts $FARM_BIN"
     ;;
 uninstall)
     [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 1; }
-    if [ -e "$REAL" ]; then
-        rm -f "$APP"
-        mv "$REAL" "$APP"
+    if [ -e "$ORIG" ]; then
+        rm -f "$WRAPPER" "$REAL"
+        mv "$ORIG" "$WRAPPER"
         echo "restored the original prl_vm_app"
     else
         echo "nothing to restore"
     fi
     ;;
 status)
-    if [ -e "$REAL" ] && head -c 2 "$APP" | grep -q '#!'; then echo "wrapper installed"; else echo "original prl_vm_app in place"; fi
+    if is_wrapper; then echo "wrapper installed (private copy: $([ -x "$FARM_BIN" ] && echo present || echo missing))"
+    else echo "original prl_vm_app in place"; fi
     ;;
 *)
-    echo "usage: $0 install|uninstall|status" >&2
+    echo "usage: $0 prepare|install|uninstall|status" >&2
     exit 2
     ;;
 esac

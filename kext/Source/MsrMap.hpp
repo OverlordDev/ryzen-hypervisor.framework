@@ -31,14 +31,16 @@ enum : uint32_t {
     MSR_SFMASK         = 0xC0000084,
     MSR_FS_BASE        = 0xC0000100,
     MSR_GS_BASE        = 0xC0000101,
-    MSR_KERNEL_GS_BASE = 0xC0000102
+    MSR_KERNEL_GS_BASE = 0xC0000102,
+    MSR_TSC_AUX        = 0xC0000103
 };
 
 enum Kind : uint8_t {
     K_UNKNOWN = 0,   /* not a guest MSR we keep: always intercepted, the client emulates it */
     K_VMCB,          /* a plain 64-bit slot in the VMCB */
     K_TSC,           /* guest TSC = host TSC + VMCB tsc offset */
-    K_EFER           /* the guest EFER, with SVME hidden */
+    K_EFER,          /* the guest EFER, with SVME hidden */
+    K_TSC_AUX        /* RDTSCP's value: not in the VMCB, the kext swaps the real MSR around VMRUN */
 };
 
 struct Info {
@@ -56,6 +58,7 @@ static inline Info info(uint32_t msr)
     switch (msr) {
     case MSR_TSC:            return { K_TSC, 0, 8, 64 };
     case MSR_EFER:           return { K_EFER, RHV_MSR_SAVE(efer), 8, 64 };
+    case MSR_TSC_AUX:        return { K_TSC_AUX, 0, 8, 32 };
     case MSR_PAT:            return { K_VMCB, RHV_MSR_SAVE(gPat), 8, 64 };
     case MSR_SYSENTER_CS:    return { K_VMCB, RHV_MSR_SAVE(sysenterCs), 8, 32 };
     case MSR_SYSENTER_ESP:   return { K_VMCB, RHV_MSR_SAVE(sysenterEsp), 8, 64 };

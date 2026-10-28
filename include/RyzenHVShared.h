@@ -15,9 +15,11 @@
 extern "C" {
 #endif
 
-#define RHV_ABI_VERSION 8
+#define RHV_ABI_VERSION 11
 #define RHV_SERVICE_NAME "com_overlorddev_RyzenHV"
 #define RHV_MAX_CPUS 64
+/* Largest number of vCPUs in one VM. */
+#define RHV_MAX_VCPUS_PER_VM 16
 
 /*
  * IOUserClient selectors. Add new ones at the end.
@@ -30,7 +32,7 @@ extern "C" {
  *
  * Phase 1: one VM with one vCPU per user client (root only).
  *   VmCreate     in: scalar[0] = RHV_VMCREATE_* flags
- *                out: scalar[0] = built-in guest RAM size (0 with NO_RAM). Needs SVM
+ *                out: scalar[0] = built-in guest RAM size (0 with NO_RAM), scalar[1] = the VM's id (for VmJoin). Needs SVM
  *                active on all CPUs (boot-arg rhv_enable_svm=1). The built-in RAM is
  *                mappable with IOConnectMapMemory64(conn, kRHVMemGuestRam, ...).
  *   VmDestroy
@@ -75,6 +77,19 @@ extern "C" {
  *   VmKick       no arguments. Makes a running VmRun (on another thread) return soon with RHV_EXIT_TIMESLICE, which a
  *                VMX-mode client sees as an external-interrupt exit, like hv_vcpu_interrupt does. Does not wait.
  *
+ * More than one vCPU (ABI 9). One user client is one vCPU. The first client creates the VM (VmCreate); every further vCPU
+ * is another user client of the same task that joins it. All the VM-wide calls (VmMap, VmUnmap, VmProtect) work from any
+ * of them; every other call acts on that client's own vCPU. The VM lives until its last vCPU is destroyed.
+ *   VmJoin       in: scalar[0] = RHV_VMCREATE_* flags (the same as VmCreate was given), scalar[1] = the VM's id
+ *                out: scalar[0] = the vCPU's index in the VM (0 is the one that created it)
+ *                kIOReturnNotFound when there is no such VM of this task, kIOReturnNoResources when it is full
+ *                (RHV_MAX_VCPUS_PER_VM)
+ *
+ * ABI 10: VmRunEx also returns the CPU-based controls. ABI 11: and the whole segment group (selectors, limits, GDTR/IDTR,
+ * access rights, bases), so the client needs no second call after an exit. The kext also offers the TPR shadow:
+ * a guest MOV to CR8 does not exit unless the client has set a non-zero TPR threshold (VMCS 0x401C) and the new TPR is
+ * below it, which is reported as VMX exit reason 43.
+ *
  * Fast path (ABI 8). A guest exit costs the client dozens of register/VMCS accesses, and every kernel call is
  * microseconds, so the shim batches them: one call applies buffered state, runs, and returns what the client reads
  * after every exit.
@@ -107,6 +122,7 @@ enum {
     kRHVMethodVmKick,
     kRHVMethodVmRunEx,
     kRHVMethodVmcsReadMany,
+    kRHVMethodVmJoin,
     kRHVMethodCount
 };
 
@@ -293,8 +309,15 @@ typedef struct RHVRunIn {
     X(0x440a) /* IDT-vectoring error */  X(0x2400) /* guest physical addr */ X(0x640a) /* guest linear addr */    \
     X(0x4824) /* interruptibility */     X(0x4826) /* activity state */      X(0xF004) /* TPR (extension) */      \
     X(0x6800) /* CR0 */                  X(0x6802) /* CR3 */                 X(0x6804) /* CR4 */                  \
-    X(0x2806) /* EFER */                 X(0x681a) /* DR7 */                 X(0xF000) /* CR2 (extension) */
-#define RHV_RUN_NFIELDS 18
+    X(0x2806) /* EFER */                 X(0x681a) /* DR7 */                 X(0xF000) /* CR2 (extension) */      \
+    X(0x4002) /* CPU-based controls */                                                                           \
+    /* The segment group (ABI 11): the monitor reads some of these after every exit, and they used to cost a      \
+     * second kernel call each time. Selectors, limits and GDTR/IDTR, access rights, bases.                       */ \
+    X(0x0800) X(0x0802) X(0x0804) X(0x0806) X(0x0808) X(0x080a) X(0x080c) X(0x080e)                              \
+    X(0x4800) X(0x4802) X(0x4804) X(0x4806) X(0x4808) X(0x480a) X(0x480c) X(0x480e) X(0x4810) X(0x4812)          \
+    X(0x4814) X(0x4816) X(0x4818) X(0x481a) X(0x481c) X(0x481e) X(0x4820) X(0x4822)                              \
+    X(0x6806) X(0x6808) X(0x680a) X(0x680c) X(0x680e) X(0x6810) X(0x6812) X(0x6814) X(0x6816) X(0x6818)
+#define RHV_RUN_NFIELDS 55
 
 typedef struct RHVRunOut {
     uint32_t failedWrite;                         /* index of the write that failed, when the call failed */

@@ -143,7 +143,7 @@ static void freshFast(void)
     K.thread = 1;
     RhvBackend b = { NULL, f_vm_create, f_vm_destroy, f_vm_map, f_vm_unmap, f_vm_protect, f_vmcs_read, f_vmcs_write,
                      f_get_regs, f_set_regs, f_get_fpu, f_set_fpu, f_msr, f_run, f_kick, f_now, f_tsc, f_thread,
-                     f_run_ex, f_read_many };
+                     f_run_ex, f_read_many, NULL, NULL };
     rhv_core_init(&b);
 }
 
@@ -155,7 +155,7 @@ static void fresh(void)
     K.thread = 1;
     RhvBackend b = { NULL, f_vm_create, f_vm_destroy, f_vm_map, f_vm_unmap, f_vm_protect, f_vmcs_read, f_vmcs_write,
                      f_get_regs, f_set_regs, f_get_fpu, f_set_fpu, f_msr, f_run, f_kick, f_now, f_tsc, f_thread,
-                     NULL, NULL };               /* the one-call-per-field path */
+                     NULL, NULL, NULL, NULL };   /* the one-call-per-field path */
     rhv_core_init(&b);
 }
 
@@ -242,10 +242,17 @@ static void testRegisters(void)
     };
     for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
         CHECK(rhv_core_register_field(map[i].reg) == map[i].field);
+        if (map[i].reg == RHV_X86_TPR)                       /* 8-bit APIC TPR in the API, the 4-bit class in the kernel */
+            continue;
         CHECK(rhv_vcpu_write_register(v, map[i].reg, 0x5000 + i) == RHV_HV_SUCCESS);
         CHECK(K.vmcs[map[i].field] == 0x5000 + i);
         CHECK(rhv_vcpu_read_register(v, map[i].reg, &x) == RHV_HV_SUCCESS && x == 0x5000 + i);
     }
+    /* HV_X86_TPR is the 8-bit APIC TPR (0xF0 = class 15); the kernel keeps the 4-bit class in V_TPR. */
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_TPR, 0xF0) == RHV_HV_SUCCESS && K.vmcs[0xF004] == 0xF);
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_TPR, &x) == RHV_HV_SUCCESS && x == 0xF0);
+    K.vmcs[0xF004] = 0xC; rhv_core_cache_reset();
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_TPR, &x) == RHV_HV_SUCCESS && x == 0xC0);
     /* DR4/DR5 alias DR6/DR7. */
     CHECK(rhv_vcpu_write_register(v, RHV_X86_DR4, 0xD6) == RHV_HV_SUCCESS && K.vmcs[0xF002] == 0xD6);
     CHECK(rhv_vcpu_read_register(v, RHV_X86_DR5, &x) == RHV_HV_SUCCESS && x == K.vmcs[0x681a]);
@@ -315,7 +322,7 @@ static void testFastPath(void)
     CHECK(K.vmcs[0x2806] == 0xd01);
     CHECK(rhv_vcpu_write_msr(v, 0xC0000082, 5) == RHV_HV_SUCCESS);
 
-    /* Segment state comes in one call. */
+    /* Segment state comes back with the run (ABI 11), no extra call. */
     for (uint32_t i = 0; i < 8; i++) { K.vmcs[0x800 + 2 * i] = 0x10 + i; K.vmcs[0x6806 + 2 * i] = 0x1000 * i; K.vmcs[0x4814 + 2 * i] = 0x93 + i; }
     CHECK(rhv_vcpu_run(v) == RHV_HV_SUCCESS);                                         /* drops the cache */
     int rm = K.readMany, rd = K.vmcsReads;
@@ -323,10 +330,9 @@ static void testFastPath(void)
     CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x6808, &x) == RHV_HV_SUCCESS && x == 0x1000);    /* CS base */
     CHECK(rhv_vmx_vcpu_read_vmcs(v, 0x4816, &x) == RHV_HV_SUCCESS && x == 0x94);      /* CS access rights */
     CHECK(rhv_vcpu_read_register(v, RHV_X86_TR, &x) == RHV_HV_SUCCESS && x == 0x17);
-    CHECK(K.readMany == rm + 1 && K.vmcsReads == rd);
-    /* ... and not twice for the same exit, but again after the next run. */
+    CHECK(K.readMany == rm && K.vmcsReads == rd);
     CHECK(rhv_vcpu_run(v) == RHV_HV_SUCCESS);
-    CHECK(rhv_vcpu_read_register(v, RHV_X86_DS, &x) == RHV_HV_SUCCESS && K.readMany == rm + 2);
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_DS, &x) == RHV_HV_SUCCESS && K.readMany == rm && K.vmcsReads == rd);
 
     /* More writes than fit in one call: flushed on the way, none lost, order kept. */
     uint32_t many[100];
@@ -348,6 +354,38 @@ static void testFastPath(void)
     CHECK(rhv_vcpu_run(v) != RHV_HV_SUCCESS);
     K.failNext = 0;
     CHECK(rhv_vcpu_flush(v) == RHV_HV_SUCCESS);
+}
+
+/* An XSAVE image that marks components XCR0 has not enabled yet (Parallels writes XSTATE_BV=7 at XCR0=1). */
+static void testFpuWhole(void)
+{
+    fresh();
+    uint32_t v = makeVcpu();
+    uint8_t img[1024], back[1024];
+    uint64_t bv, x;
+    memset(img, 0, sizeof(img));
+    for (int i = 576; i < 832; i++) img[i] = (uint8_t)i;                              /* YMM_Hi data */
+    bv = 7;
+    memcpy(img + 512, &bv, 8);
+    CHECK(rhv_vcpu_write_fpstate(v, img, 832) == RHV_HV_SUCCESS);
+    memcpy(&bv, K.fpu.area + 512, 8);
+    CHECK(bv == 3 && K.fpu.xcr0 == 1);                                                /* the kernel got what XRSTOR accepts */
+    CHECK(rhv_vcpu_read_fpstate(v, back, sizeof(back)) == RHV_HV_SUCCESS && memcmp(back, img, 832) == 0);   /* the client gets it all back */
+
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_XCR0, 7) == RHV_HV_SUCCESS);
+    memcpy(&bv, K.fpu.area + 512, 8);
+    CHECK(bv == 7 && K.fpu.xcr0 == 7 && K.fpu.area[600] == (uint8_t)600);             /* AVX state arrived once AVX was enabled */
+    CHECK(rhv_vcpu_read_register(v, RHV_X86_XCR0, &x) == RHV_HV_SUCCESS && x == 7);
+
+    /* The guest running makes the kernel's image the only truth. */
+    fresh();
+    v = makeVcpu();
+    bv = 7; memcpy(img + 512, &bv, 8);
+    CHECK(rhv_vcpu_write_fpstate(v, img, 832) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_run(v) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_write_register(v, RHV_X86_XCR0, 7) == RHV_HV_SUCCESS);
+    memcpy(&bv, K.fpu.area + 512, 8);
+    CHECK(bv == 3);                                                                   /* nothing is resurrected after a run */
 }
 
 /* The functions Parallels uses beyond the basics. */
@@ -515,7 +553,7 @@ static void testRunAndThreads(void)
 
     /* hv_vcpu_interrupt arguments. */
     uint32_t ids[2] = { 0, 0 }, bad = 3;
-    CHECK(rhv_vcpu_interrupt(ids, 2) == RHV_HV_SUCCESS && K.kicks == 1);
+    CHECK(rhv_vcpu_interrupt(ids, 2) == RHV_HV_SUCCESS && K.kicks == 2);
     CHECK(rhv_vcpu_interrupt(&bad, 1) == RHV_HV_BAD_ARGUMENT);
     CHECK(rhv_vcpu_interrupt(NULL, 1) == RHV_HV_BAD_ARGUMENT && rhv_vcpu_interrupt(ids, 0) == RHV_HV_BAD_ARGUMENT);
 
@@ -566,6 +604,12 @@ static void testCapabilities(void)
     CHECK((ctl & (1u << 7)) && (ctl & (1u << 10)) && (ctl & (1u << 3)));                  /* what we implement: kept */
     CHECK(!(ctl & (1u << 21)) && !(ctl & (1u << 22)));                                    /* TPR shadow, NMI window: dropped */
     CHECK(!(ctl & (1u << 15)) && !(ctl & (1u << 16)));                                    /* CR3 exiting is not forced */
+    rhv_core_offer_tpr_shadow = 1;                                                        /* Parallels: TPR shadow on offer */
+    CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_PROCBASED, &v) == RHV_HV_SUCCESS);
+    CHECK((uint32_t)(v >> 32) & (1u << 21));
+    CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_TRUE_PROCBASED, &v) == RHV_HV_SUCCESS);
+    CHECK((uint32_t)(v >> 32) & (1u << 21));
+    rhv_core_offer_tpr_shadow = 0;
     CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_PROCBASED2, &v) == RHV_HV_SUCCESS);
     CHECK(!(((uint32_t)(v >> 32)) & (1u << 0)));                                          /* no APIC virtualization */
     CHECK(((uint32_t)(v >> 32)) & (1u << 7));                                             /* unrestricted guest */
@@ -575,6 +619,67 @@ static void testCapabilities(void)
     CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_CR4_FIXED0, &v) == RHV_HV_SUCCESS && v == 0);
 }
 
+
+/* ---- several vCPUs: each has its own backend context and its own cached state ---- */
+static struct { RHVRegs regs; int kicks, opened, closed; } MV[3];
+static int m_vcpu_open(void *c, uint32_t i, void **v) { (void)c; if (i >= 3) return (int)IOR_BAD; MV[i].opened++; *v = (void *)(uintptr_t)(i + 1); return 0; }
+static int m_vcpu_close(void *c, uint32_t i, void *v) { (void)c; (void)v; MV[i].closed++; return 0; }
+static int m_get_regs(void *c, RHVRegs *r) { *r = MV[(uintptr_t)c - 1].regs; return 0; }
+static int m_set_regs(void *c, const RHVRegs *r) { MV[(uintptr_t)c - 1].regs = *r; return 0; }
+static int m_kick(void *c) { MV[(uintptr_t)c - 1].kicks++; return 0; }
+static int m_vmcs_read(void *c, uint32_t f, uint64_t *v) { *v = (uint64_t)f * 16 + (uintptr_t)c; return 0; }
+
+static void testMultiVcpu(void)
+{
+    memset(&K, 0, sizeof(K));
+    memset(MV, 0, sizeof(MV));
+    K.thread = 1;
+    RhvBackend b = { NULL, f_vm_create, f_vm_destroy, f_vm_map, f_vm_unmap, f_vm_protect, m_vmcs_read, f_vmcs_write,
+                     m_get_regs, m_set_regs, f_get_fpu, f_set_fpu, f_msr, f_run, m_kick, f_now, f_tsc, f_thread,
+                     NULL, NULL, m_vcpu_open, m_vcpu_close };
+    rhv_core_init(&b);
+    CHECK(rhv_vm_create(0) == RHV_HV_SUCCESS);
+    uint32_t a = 99, c = 99, d = 99, e = 99;
+    CHECK(rhv_vcpu_create(&a, 0) == RHV_HV_SUCCESS && a == 0);
+    CHECK(rhv_vcpu_create(&c, 0) == RHV_HV_SUCCESS && c == 1);
+    CHECK(rhv_vcpu_create(&d, 0) == RHV_HV_SUCCESS && d == 2);
+    CHECK(rhv_vcpu_create(&e, 0) != RHV_HV_SUCCESS);                    /* the backend refuses a fourth */
+
+    /* registers are per vCPU */
+    CHECK(rhv_vcpu_write_register(a, RHV_X86_RAX, 5) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_write_register(c, RHV_X86_RAX, 9) == RHV_HV_SUCCESS);
+    uint64_t v = 0;
+    CHECK(rhv_vcpu_read_register(a, RHV_X86_RAX, &v) == RHV_HV_SUCCESS && v == 5);
+    CHECK(rhv_vcpu_read_register(c, RHV_X86_RAX, &v) == RHV_HV_SUCCESS && v == 9);
+    CHECK(rhv_vcpu_flush(a) == RHV_HV_SUCCESS && rhv_vcpu_flush(c) == RHV_HV_SUCCESS);
+    CHECK(MV[0].regs.rax == 5 && MV[1].regs.rax == 9);
+
+    /* VMCS reads go to the vCPU asked (the fake answers field*16 + its context) */
+    CHECK(rhv_vmx_vcpu_read_vmcs(a, 0x4402, &v) == RHV_HV_SUCCESS && v == 0x4402u * 16 + 1);
+    CHECK(rhv_vmx_vcpu_read_vmcs(d, 0x4402, &v) == RHV_HV_SUCCESS && v == 0x4402u * 16 + 3);
+
+    /* hv_vcpu_interrupt kicks exactly the vCPUs named */
+    uint32_t list[2] = { c, d };
+    CHECK(rhv_vcpu_interrupt(list, 2) == RHV_HV_SUCCESS);
+    CHECK(MV[0].kicks == 0 && MV[1].kicks == 1 && MV[2].kicks == 1);
+    uint32_t bad = 7;
+    CHECK(rhv_vcpu_interrupt(&bad, 1) == RHV_HV_BAD_ARGUMENT);
+
+    /* the APIC base: only the first vCPU is the bootstrap processor */
+    CHECK(rhv_vcpu_read_msr(a, 0x1B, &v) == RHV_HV_SUCCESS && (v & 0x100));
+    CHECK(rhv_vcpu_read_msr(c, 0x1B, &v) == RHV_HV_SUCCESS && !(v & 0x100) && (v & 0x800));
+
+    /* the VM goes only after its last vCPU */
+    CHECK(rhv_vcpu_destroy(c) == RHV_HV_SUCCESS && MV[1].closed == 1);
+    CHECK(rhv_vm_destroy() == RHV_HV_BUSY);
+    CHECK(rhv_vcpu_destroy(a) == RHV_HV_SUCCESS && rhv_vcpu_destroy(d) == RHV_HV_SUCCESS);
+    CHECK(rhv_vm_destroy() == RHV_HV_SUCCESS);
+    /* a freed slot is reused */
+    CHECK(rhv_vm_create(0) == RHV_HV_SUCCESS);
+    CHECK(rhv_vcpu_create(&a, 0) == RHV_HV_SUCCESS && a == 0);
+    CHECK(rhv_vcpu_destroy(a) == RHV_HV_SUCCESS && rhv_vm_destroy() == RHV_HV_SUCCESS);
+}
+
 int main(void)
 {
     testLifecycle();
@@ -582,6 +687,8 @@ int main(void)
     testRegisters();
     testCache();
     testParallelsApi();
+    testFpuWhole();
+    testMultiVcpu();
     testFastPath();
     testFpuMsrVmcs();
     testRunAndThreads();

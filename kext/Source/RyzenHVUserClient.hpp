@@ -8,7 +8,8 @@ class com_overlorddev_RyzenHVVm;
 
 /*
  * One instance per IOServiceOpen() from userland (the shim, rhv-info, ...).
- * Each client may own one VM, destroyed when the client goes away.
+ * Each client owns one vCPU (the first one also created its VM, the others joined it); it is destroyed when the
+ * client goes away.
  */
 class com_overlorddev_RyzenHVUserClient : public IOUserClient {
     OSDeclareDefaultStructors(com_overlorddev_RyzenHVUserClient)
@@ -48,6 +49,7 @@ private:
     static IOReturn sVmKick(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sVmRunEx(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sVmcsReadMany(OSObject *target, void *reference, IOExternalMethodArguments *args);
+    static IOReturn sVmJoin(OSObject *target, void *reference, IOExternalMethodArguments *args);
 
     void destroyVm();
 

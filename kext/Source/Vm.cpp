@@ -10,6 +10,7 @@
 #define super OSObject
 
 OSDefineMetaClassAndStructors(com_overlorddev_RyzenHVVm, OSObject)
+OSDefineMetaClassAndStructors(com_overlorddev_RyzenHVVmShared, OSObject)
 
 using namespace rhv;
 using namespace rhv::vmcb;
@@ -85,128 +86,130 @@ void setSeg(Seg &s, uint16_t selector, uint64_t base, uint32_t limit, uint16_t a
 
 } // namespace
 
-com_overlorddev_RyzenHVVm *com_overlorddev_RyzenHVVm::create(const RHVInfo &info, uint32_t flags,
-                                                             IOReturn *err)
+/* ---- the part of a VM all its vCPUs share ---- */
+
+namespace {
+IOLock *gSharedLock;                       /* guards the registry below */
+com_overlorddev_RyzenHVVmShared *gShared[16];
+uint64_t gNextId = 1;
+
+IOLock *sharedLock()
 {
-    if (flags & ~(uint32_t)(RHV_VMCREATE_NO_RAM | RHV_VMCREATE_VMX)) {
-        *err = kIOReturnBadArgument;
-        return nullptr;
+    if (!gSharedLock) {
+        IOLock *l = IOLockAlloc();
+        if (l && !OSCompareAndSwapPtr(nullptr, l, &gSharedLock))
+            IOLockFree(l);
     }
+    return gSharedLock;
+}
+} // namespace
 
-    if (info.nCpusSvmActive == 0 || info.nCpusSvmActive != info.nCpusSvmUsable) {
-        RHV_WARN("VmCreate: SVM is not active on all CPUs (%u of %u), boot with rhv_enable_svm=1",
-                 info.nCpusSvmActive, info.nCpusSvmUsable);
-        *err = kIOReturnNotReady;
-        return nullptr;
-    }
-    if (!(info.svmFeatures & RHV_SVM_FEAT_NP) || !(info.svmFeatures & RHV_SVM_FEAT_NRIPS)) {
-        RHV_ERR("VmCreate: CPU needs NPT and NRIPS (features=0x%x)", info.svmFeatures);
-        *err = kIOReturnUnsupported;
-        return nullptr;
-    }
-    if (info.numAsids < 2) {
-        /* ASID 0 is the host's; the guest uses 1. */
-        RHV_ERR("VmCreate: CPU offers %u ASIDs, need at least 2", info.numAsids);
-        *err = kIOReturnUnsupported;
-        return nullptr;
-    }
-
-    com_overlorddev_RyzenHVVm *vm = OSTypeAlloc(com_overlorddev_RyzenHVVm);
-    if (!vm) {
+com_overlorddev_RyzenHVVmShared *com_overlorddev_RyzenHVVmShared::create(uint32_t flags, task_t owner, IOReturn *err)
+{
+    IOLock *reg = sharedLock();
+    if (!reg) {
         *err = kIOReturnNoMemory;
         return nullptr;
     }
-    if (!vm->init() || !vm->setup(flags)) {
-        vm->release();
+    com_overlorddev_RyzenHVVmShared *sh = OSTypeAlloc(com_overlorddev_RyzenHVVmShared);
+    if (!sh) {
         *err = kIOReturnNoMemory;
         return nullptr;
     }
-
-    RHV_STAT_INC(vmCreates);
+    if (!sh->init() || !sh->setup(flags, owner)) {
+        sh->release();
+        *err = kIOReturnNoMemory;
+        return nullptr;
+    }
+    IOLockLock(reg);
+    int slot = -1;
+    for (unsigned i = 0; i < sizeof(gShared) / sizeof(gShared[0]); i++) {
+        if (!gShared[i]) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot >= 0) {
+        sh->fId = gNextId++;
+        gShared[slot] = sh;            /* not retained: free() takes it out again */
+    }
+    IOLockUnlock(reg);
+    if (slot < 0) {
+        RHV_WARN("VmCreate: too many VMs");
+        sh->release();
+        *err = kIOReturnNoResources;
+        return nullptr;
+    }
     *err = kIOReturnSuccess;
-    return vm;
+    return sh;
 }
 
-bool com_overlorddev_RyzenHVVm::init()
+com_overlorddev_RyzenHVVmShared *com_overlorddev_RyzenHVVmShared::find(uint64_t id, task_t owner)
 {
-    if (!super::init())
+    IOLock *reg = sharedLock();
+    if (!reg)
+        return nullptr;
+    com_overlorddev_RyzenHVVmShared *found = nullptr;
+    IOLockLock(reg);
+    for (unsigned i = 0; i < sizeof(gShared) / sizeof(gShared[0]); i++) {
+        if (gShared[i] && gShared[i]->fId == id && gShared[i]->fOwner == owner) {
+            found = gShared[i];
+            found->retain();          /* free() takes the lock before it unlinks, so it cannot be mid-destruction here */
+            break;
+        }
+    }
+    IOLockUnlock(reg);
+    return found;
+}
+
+bool com_overlorddev_RyzenHVVmShared::init()
+{
+    if (!OSObject::init())
         return false;
-
-    /* free() must be safe after any partial failure in setup(), so do not rely on zeroed allocations. */
+    fId = 0;
+    fOwner = nullptr;
+    fRw = nullptr;
+    fRegLock = nullptr;
+    bzero(fVcpus, sizeof(fVcpus));
     fRam = nullptr;
-    bzero(&fVmcb, sizeof(fVmcb));
-    bzero(&fHostVmcb, sizeof(fHostVmcb));
-    bzero(&fIopm, sizeof(fIopm));
-    bzero(&fMsrpm, sizeof(fMsrpm));
     fPagesMapped = 0;
-    fVmx         = false;
-    bzero(&fGprs, sizeof(fGprs));
-    bzero(&fHostFpu, sizeof(fHostFpu));
-    bzero(&fGuestFpu, sizeof(fGuestFpu));
-    bzero(&fScratchFpu, sizeof(fScratchFpu));
-    fGuestXcr0     = rhv::fpu::XCR0_X87;
-    fXcr0Supported = 0;
-    fFpuSize       = 0;
-    fKick          = 0;
-    fRunCpu        = -1;
-    fFirstRun    = true;
-    fHaveNextRip = false;
-
-    fLock = IOLockAlloc();
-    return fLock != nullptr;
+    fRw = IORWLockAlloc();
+    fRegLock = IOLockAlloc();
+    return fRw && fRegLock;
 }
 
-void com_overlorddev_RyzenHVVm::free()
+void com_overlorddev_RyzenHVVmShared::free()
 {
+    IOLock *reg = gSharedLock;
+    if (reg) {
+        IOLockLock(reg);
+        for (unsigned i = 0; i < sizeof(gShared) / sizeof(gShared[0]); i++)
+            if (gShared[i] == this)
+                gShared[i] = nullptr;
+        IOLockUnlock(reg);
+    }
     /* Unpins every buffer that is still mapped, then returns the tables. */
     fNpt.shutdown(&releaseOwner, this);
-    physFree(&fScratchFpu);
-    physFree(&fGuestFpu);
-    physFree(&fHostFpu);
-    physFree(&fMsrpm);
-    physFree(&fIopm);
-    physFree(&fHostVmcb);
-    physFree(&fVmcb);
     if (fRam) {
         fRam->release();
         fRam = nullptr;
     }
-    if (fLock) {
-        IOLockFree(fLock);
-        fLock = nullptr;
+    if (fRw) {
+        IORWLockFree(fRw);
+        fRw = nullptr;
     }
-    super::free();
+    if (fRegLock) {
+        IOLockFree(fRegLock);
+        fRegLock = nullptr;
+    }
+    OSObject::free();
 }
 
-bool com_overlorddev_RyzenHVVm::setup(uint32_t flags)
+bool com_overlorddev_RyzenHVVmShared::setup(uint32_t flags, task_t owner)
 {
-    if (!physAlloc(&fVmcb, 4096) || !physAlloc(&fHostVmcb, 4096) || !physAlloc(&fIopm, 12288) ||
-        !physAlloc(&fMsrpm, 8192) || !fNpt.init(kNptAllocator))
+    fOwner = owner;
+    if (!fNpt.init(kNptAllocator))
         return false;
-
-    /* Extended state areas. The size is what XSAVE needs for the XCR0 this thread has now. */
-    {
-        uint32_t r[4];
-        rhv_cpuid(0xD, 0, r);
-        fXcr0Supported = ((uint64_t)r[3] << 32) | r[0];
-        fFpuSize       = r[1];
-        if (fFpuSize < rhv::fpu::kHeaderEnd || fFpuSize > RHV_FPU_AREA_MAX) {
-            RHV_ERR("VM: XSAVE area of %u bytes is not supported (limit %u)", fFpuSize, RHV_FPU_AREA_MAX);
-            return false;
-        }
-        if (!physAlloc(&fHostFpu, 4096) || !physAlloc(&fGuestFpu, 4096) || !physAlloc(&fScratchFpu, 4096))
-            return false;
-        rhv::fpu::initArea((uint8_t *)fGuestFpu.va, 4096);
-        fGuestXcr0 = rhv::fpu::XCR0_X87;
-    }
-
-    fVmx = (flags & RHV_VMCREATE_VMX) != 0;
-    fVmcs.attach((rhv::vmcb::Vmcb *)fVmcb.va);
-
-    /* Intercept every I/O port and every MSR: userland decides what the guest may touch. */
-    memset(fIopm.va, 0xFF, fIopm.size);
-    memset(fMsrpm.va, 0xFF, fMsrpm.size);
-
     if (!(flags & RHV_VMCREATE_NO_RAM)) {
         /* Not contiguous on purpose: the NPT maps it page by page. kIOMemoryKernelUserShared lets userland map it. */
         fRam = IOBufferMemoryDescriptor::inTaskWithOptions(
@@ -223,16 +226,46 @@ bool com_overlorddev_RyzenHVVm::setup(uint32_t flags)
             return false;
         }
     }
-
-    fFirstRun = true;
-    resetLocked(0, 0);
-    RHV_INFO("VM created: %u KiB built-in RAM, vmcb pa 0x%llx, npt root pa 0x%llx",
-             ramSize() / 1024, (unsigned long long)fVmcb.pa, (unsigned long long)fNpt.rootPa());
     return true;
 }
 
+IOReturn com_overlorddev_RyzenHVVmShared::attach(com_overlorddev_RyzenHVVm *vcpu, uint32_t *index)
+{
+    IOReturn rc = kIOReturnNoResources;
+    IOLockLock(fRegLock);
+    for (uint32_t i = 0; i < RHV_MAX_VCPUS_PER_VM; i++) {
+        if (!fVcpus[i]) {
+            fVcpus[i] = vcpu;
+            *index = i;
+            rc = kIOReturnSuccess;
+            break;
+        }
+    }
+    IOLockUnlock(fRegLock);
+    return rc;
+}
+
+void com_overlorddev_RyzenHVVmShared::detach(com_overlorddev_RyzenHVVm *vcpu)
+{
+    IOLockLock(fRegLock);
+    for (uint32_t i = 0; i < RHV_MAX_VCPUS_PER_VM; i++)
+        if (fVcpus[i] == vcpu)
+            fVcpus[i] = nullptr;
+    IOLockUnlock(fRegLock);
+}
+
+/* Sends every vCPU that is inside the guest back to userland now, so a writer of the page tables need not wait a slice. */
+void com_overlorddev_RyzenHVVmShared::kickAll()
+{
+    IOLockLock(fRegLock);
+    for (uint32_t i = 0; i < RHV_MAX_VCPUS_PER_VM; i++)
+        if (fVcpus[i])
+            fVcpus[i]->kick();
+    IOLockUnlock(fRegLock);
+}
+
 /* Called for every page that stops pointing into `b`. The last one unpins and frees it. */
-void com_overlorddev_RyzenHVVm::dropPage(Backing *b)
+void com_overlorddev_RyzenHVVmShared::dropPage(Backing *b)
 {
     if (--b->live != 0)
         return;
@@ -242,9 +275,9 @@ void com_overlorddev_RyzenHVVm::dropPage(Backing *b)
 }
 
 /* Table::clear/shutdown callback: one call per page that is still mapped. */
-void com_overlorddev_RyzenHVVm::releaseOwner(void *ctx, void *owner)
+void com_overlorddev_RyzenHVVmShared::releaseOwner(void *ctx, void *owner)
 {
-    com_overlorddev_RyzenHVVm *vm = static_cast<com_overlorddev_RyzenHVVm *>(ctx);
+    com_overlorddev_RyzenHVVmShared *vm = static_cast<com_overlorddev_RyzenHVVmShared *>(ctx);
     vm->fPagesMapped--;
     RHV_STAT_ADD(vmPagesMapped, -1);
     dropPage(static_cast<Backing *>(owner));
@@ -270,7 +303,7 @@ static bool mdSegment(void *ctx, uint64_t offset, uint64_t *pa, uint64_t *len)
  * Wires `md` (prepare) and holds a reference on it until the last page is unmapped.
  * Caller holds the lock or is still constructing the VM.
  */
-IOReturn com_overlorddev_RyzenHVVm::mapDescriptorLocked(IOMemoryDescriptor *md, uint64_t gpa,
+IOReturn com_overlorddev_RyzenHVVmShared::mapDescriptorLocked(IOMemoryDescriptor *md, uint64_t gpa,
                                                         uint64_t size, uint32_t perm)
 {
     for (uint64_t off = 0; off < size; off += 4096) {
@@ -326,7 +359,7 @@ IOReturn com_overlorddev_RyzenHVVm::mapDescriptorLocked(IOMemoryDescriptor *md, 
     return rc;
 }
 
-IOReturn com_overlorddev_RyzenHVVm::map(task_t task, uint64_t uva, uint64_t gpa, uint64_t size,
+IOReturn com_overlorddev_RyzenHVVmShared::map(task_t task, uint64_t uva, uint64_t gpa, uint64_t size,
                                         uint32_t flags)
 {
     uint32_t perm = flags;
@@ -339,9 +372,10 @@ IOReturn com_overlorddev_RyzenHVVm::map(task_t task, uint64_t uva, uint64_t gpa,
     if (!md)
         return kIOReturnVMError;   /* typically an unmapped or non-writable range */
 
-    IOLockLock(fLock);
+    kickAll();
+    IORWLockWrite(fRw);            /* no vCPU is inside the guest while the tables change */
     IOReturn rc = mapDescriptorLocked(md, gpa, size, perm);
-    IOLockUnlock(fLock);
+    IORWLockUnlock(fRw);
 
     md->release();                 /* the backing took its own reference */
     if (rc == kIOReturnSuccess) {
@@ -356,13 +390,14 @@ IOReturn com_overlorddev_RyzenHVVm::map(task_t task, uint64_t uva, uint64_t gpa,
     return rc;
 }
 
-IOReturn com_overlorddev_RyzenHVVm::unmap(uint64_t gpa, uint64_t size)
+IOReturn com_overlorddev_RyzenHVVmShared::unmap(uint64_t gpa, uint64_t size)
 {
     if (size == 0 || ((gpa | size) & 0xFFF) || gpa >= rhv::npt::kGpaLimit ||
         size > rhv::npt::kGpaLimit - gpa)
         return kIOReturnBadArgument;
 
-    IOLockLock(fLock);
+    kickAll();
+    IORWLockWrite(fRw);
     for (uint64_t off = 0; off < size; off += 4096) {
         void *owner = fNpt.unmap(gpa + off);
         if (owner) {
@@ -371,20 +406,21 @@ IOReturn com_overlorddev_RyzenHVVm::unmap(uint64_t gpa, uint64_t size)
             dropPage(static_cast<Backing *>(owner));
         }
     }
-    IOLockUnlock(fLock);   /* the TLB is flushed on every VMRUN, see run() */
+    IORWLockUnlock(fRw);   /* the TLB is flushed on every VMRUN, see run() */
 
     RHV_STAT_INC(vmUnmaps);
     return kIOReturnSuccess;
 }
 
-IOReturn com_overlorddev_RyzenHVVm::protect(uint64_t gpa, uint64_t size, uint32_t flags)
+IOReturn com_overlorddev_RyzenHVVmShared::protect(uint64_t gpa, uint64_t size, uint32_t flags)
 {
     uint32_t perm = flags;
     if (!rhv::npt::normalizePerm(&perm) || size == 0 || ((gpa | size) & 0xFFF) ||
         gpa >= rhv::npt::kGpaLimit || size > rhv::npt::kGpaLimit - gpa)
         return kIOReturnBadArgument;
 
-    IOLockLock(fLock);
+    kickAll();
+    IORWLockWrite(fRw);
     IOReturn rc = kIOReturnSuccess;
     for (uint64_t off = 0; off < size; off += 4096) {
         if (!fNpt.isMapped(gpa + off)) {
@@ -397,8 +433,188 @@ IOReturn com_overlorddev_RyzenHVVm::protect(uint64_t gpa, uint64_t size, uint32_
             fNpt.protect(gpa + off, perm);
         RHV_STAT_INC(vmProtects);
     }
-    IOLockUnlock(fLock);
+    IORWLockUnlock(fRw);
     return rc;
+}
+
+
+/* ---- one vCPU ---- */
+
+com_overlorddev_RyzenHVVm *com_overlorddev_RyzenHVVm::create(const RHVInfo &info, uint32_t flags, task_t owner,
+                                                             com_overlorddev_RyzenHVVmShared *shared, IOReturn *err)
+{
+    if (flags & ~(uint32_t)(RHV_VMCREATE_NO_RAM | RHV_VMCREATE_VMX)) {
+        *err = kIOReturnBadArgument;
+        return nullptr;
+    }
+
+    if (info.nCpusSvmActive == 0 || info.nCpusSvmActive != info.nCpusSvmUsable) {
+        RHV_WARN("VmCreate: SVM is not active on all CPUs (%u of %u), boot with rhv_enable_svm=1",
+                 info.nCpusSvmActive, info.nCpusSvmUsable);
+        *err = kIOReturnNotReady;
+        return nullptr;
+    }
+    if (!(info.svmFeatures & RHV_SVM_FEAT_NP) || !(info.svmFeatures & RHV_SVM_FEAT_NRIPS)) {
+        RHV_ERR("VmCreate: CPU needs NPT and NRIPS (features=0x%x)", info.svmFeatures);
+        *err = kIOReturnUnsupported;
+        return nullptr;
+    }
+    if (info.numAsids < 2) {
+        /* ASID 0 is the host's; the guest uses 1. */
+        RHV_ERR("VmCreate: CPU offers %u ASIDs, need at least 2", info.numAsids);
+        *err = kIOReturnUnsupported;
+        return nullptr;
+    }
+
+    com_overlorddev_RyzenHVVmShared *sh = shared;
+    if (sh)
+        sh->retain();
+    else
+        sh = com_overlorddev_RyzenHVVmShared::create(flags, owner, err);
+    if (!sh)
+        return nullptr;
+
+    com_overlorddev_RyzenHVVm *vm = OSTypeAlloc(com_overlorddev_RyzenHVVm);
+    if (!vm) {
+        sh->release();
+        *err = kIOReturnNoMemory;
+        return nullptr;
+    }
+    vm->fShared = sh;                  /* the vCPU owns this reference from now on */
+    if (!vm->init()) {
+        vm->release();
+        *err = kIOReturnNoMemory;
+        return nullptr;
+    }
+    IOReturn arc = sh->attach(vm, &vm->fIndex);
+    if (arc != kIOReturnSuccess) {
+        RHV_WARN("VmCreate: VM %llu has no room for another vCPU", (unsigned long long)sh->id());
+        vm->release();
+        *err = arc;
+        return nullptr;
+    }
+    if (!vm->setup(flags)) {
+        vm->release();
+        *err = kIOReturnNoMemory;
+        return nullptr;
+    }
+
+    RHV_STAT_INC(vmCreates);
+    *err = kIOReturnSuccess;
+    return vm;
+}
+
+bool com_overlorddev_RyzenHVVm::init()
+{
+    if (!super::init())
+        return false;
+
+    /* free() must be safe after any partial failure in setup(), so do not rely on zeroed allocations. */
+    com_overlorddev_RyzenHVVmShared *keep = fShared;       /* set by create() before init() */
+    bzero(&fVmcb, sizeof(fVmcb));
+    bzero(&fHostVmcb, sizeof(fHostVmcb));
+    bzero(&fIopm, sizeof(fIopm));
+    bzero(&fMsrpm, sizeof(fMsrpm));
+    fShared      = keep;
+    fIndex       = ~0u;
+    fVmx         = false;
+    bzero(&fGprs, sizeof(fGprs));
+    bzero(&fHostFpu, sizeof(fHostFpu));
+    bzero(&fGuestFpu, sizeof(fGuestFpu));
+    bzero(&fScratchFpu, sizeof(fScratchFpu));
+    fGuestXcr0     = rhv::fpu::XCR0_X87;
+    fXcr0Supported = 0;
+    fFpuSize       = 0;
+    fKick          = 0;
+    fHasTscAux     = false;
+    fRunCpu        = -1;
+    fFirstRun    = true;
+    fHaveNextRip = false;
+
+    fLock = IOLockAlloc();
+    return fLock != nullptr;
+}
+
+void com_overlorddev_RyzenHVVm::free()
+{
+    if (fShared) {
+        if (fIndex != ~0u)
+            fShared->detach(this);
+    }
+    physFree(&fScratchFpu);
+    physFree(&fGuestFpu);
+    physFree(&fHostFpu);
+    physFree(&fMsrpm);
+    physFree(&fIopm);
+    physFree(&fHostVmcb);
+    physFree(&fVmcb);
+    if (fLock) {
+        IOLockFree(fLock);
+        fLock = nullptr;
+    }
+    if (fShared) {                    /* last: the page tables go when the last vCPU is gone */
+        fShared->release();
+        fShared = nullptr;
+    }
+    super::free();
+}
+
+bool com_overlorddev_RyzenHVVm::setup(uint32_t flags)
+{
+    if (!physAlloc(&fVmcb, 4096) || !physAlloc(&fHostVmcb, 4096) || !physAlloc(&fIopm, 12288) ||
+        !physAlloc(&fMsrpm, 8192))
+        return false;
+
+    {
+        uint32_t r[4];
+        rhv_cpuid(0x80000001u, 0, r);
+        fHasTscAux = (r[3] >> 27) & 1;           /* RDTSCP */
+    }
+
+    /* Extended state areas. The size is what XSAVE needs for the XCR0 this thread has now. */
+    {
+        uint32_t r[4];
+        rhv_cpuid(0xD, 0, r);
+        fXcr0Supported = ((uint64_t)r[3] << 32) | r[0];
+        fFpuSize       = r[1];
+        if (fFpuSize < rhv::fpu::kHeaderEnd || fFpuSize > RHV_FPU_AREA_MAX) {
+            RHV_ERR("VM: XSAVE area of %u bytes is not supported (limit %u)", fFpuSize, RHV_FPU_AREA_MAX);
+            return false;
+        }
+        if (!physAlloc(&fHostFpu, 4096) || !physAlloc(&fGuestFpu, 4096) || !physAlloc(&fScratchFpu, 4096))
+            return false;
+        rhv::fpu::initArea((uint8_t *)fGuestFpu.va, 4096);
+        fGuestXcr0 = rhv::fpu::XCR0_X87;
+    }
+
+    fVmx = (flags & RHV_VMCREATE_VMX) != 0;
+    fVmcs.attach((rhv::vmcb::Vmcb *)fVmcb.va);
+
+    /* Intercept every I/O port and every MSR: userland decides what the guest may touch. */
+    memset(fIopm.va, 0xFF, fIopm.size);
+    memset(fMsrpm.va, 0xFF, fMsrpm.size);
+
+    fFirstRun = true;
+    resetLocked(0, 0);
+    RHV_INFO("vCPU %u of VM %llu created: %u KiB built-in RAM, vmcb pa 0x%llx, npt root pa 0x%llx", fIndex,
+             (unsigned long long)fShared->id(), ramSize() / 1024, (unsigned long long)fVmcb.pa,
+             (unsigned long long)fShared->npt().rootPa());
+    return true;
+}
+
+IOReturn com_overlorddev_RyzenHVVm::map(task_t task, uint64_t uva, uint64_t gpa, uint64_t size, uint32_t flags)
+{
+    return fShared->map(task, uva, gpa, size, flags);
+}
+
+IOReturn com_overlorddev_RyzenHVVm::unmap(uint64_t gpa, uint64_t size)
+{
+    return fShared->unmap(gpa, size);
+}
+
+IOReturn com_overlorddev_RyzenHVVm::protect(uint64_t gpa, uint64_t size, uint32_t flags)
+{
+    return fShared->protect(gpa, size, flags);
 }
 
 /* Real-mode reset state. Caller holds the lock (or is still constructing). */
@@ -420,7 +636,7 @@ void com_overlorddev_RyzenHVVm::resetLocked(uint16_t cs, uint16_t ip)
     c.tlbCtl        = TLB_FLUSH_ALL;
     c.intCtl        = INT_CTL_V_INTR_MASKING;  /* guest EFLAGS.IF does not gate host interrupts */
     c.nestedCtl     = NESTED_CTL_NP_ENABLE;
-    c.nestedCr3     = fNpt.rootPa();
+    c.nestedCr3     = fShared->npt().rootPa();
 
     Save &s = v->save;
     setSeg(s.es, 0, 0, 0xFFFF, ATTR_REAL_DATA);
@@ -579,7 +795,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
     if (fFirstRun) {
         fFirstRun = false;
         /* A wrong VMCB here shows up as VMEXIT_INVALID, anything worse as a panic: leave a trail. */
-        RHV_SYNC("VM: first VMRUN, rip=0x%llx cs.base=0x%llx efer=0x%llx cr0=0x%llx nCr3=0x%llx",
+        RHV_SYNC("vCPU %u: first VMRUN, rip=0x%llx cs.base=0x%llx efer=0x%llx cr0=0x%llx nCr3=0x%llx", fIndex,
                  (unsigned long long)v->save.rip, (unsigned long long)v->save.cs.base,
                  (unsigned long long)v->save.efer, (unsigned long long)v->save.cr0,
                  (unsigned long long)v->control.nestedCr3);
@@ -593,6 +809,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
     uint64_t deadline = mach_absolute_time() + sliceAbs;
     uint64_t code = 0;
     bool timeslice = false;
+    uint32_t syntheticReason = 0;       /* VMX exit reason to report instead of an external interrupt (TPR below threshold) */
     /*
      * An event waiting to go in (the client's injection, or one whose delivery a host interrupt cut short) when we
      * leave without having run the guest long enough to deliver it. It goes back to the client as IDT-vectoring
@@ -608,13 +825,42 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         }
     };
 
+    /*
+     * An event the client injected must be delivered before the run is cut short, as on Intel: the entry delivers it,
+     * and only then can an external-interrupt exit (hv_vcpu_interrupt, the time slice) happen. A client may not look at
+     * IDT-vectoring information on such an exit (Parallels does not) and would take the event for delivered, so
+     * handing it back is the last resort. `deferrals` bounds how often the exit is put off for it.
+     */
+    unsigned deferrals = 0;
+    auto injectionWaiting = [&]() { return (v->control.eventInj & (1u << 31)) != 0 && deferrals < 16; };
+
     for (;;) {
         if (fKick) {                  /* hv_vcpu_interrupt from another thread */
+            if (injectionWaiting()) {
+                deferrals++;          /* enter first; the flag stays set and ends the run right after the delivery */
+            } else {
+                fKick = 0;
+                timeslice = true;
+                takePendingEvent();
+                break;
+            }
+        }
+        /*
+         * The page tables must not change while this vCPU is inside the guest: hold them for reading from here until the
+         * exit has been looked at (a VmMap/VmUnmap/VmProtect on another thread waits for this, after kicking us out).
+         */
+        struct NptReadGuard {
+            IORWLock *l;
+            explicit NptReadGuard(IORWLock *x) : l(x) { IORWLockRead(l); }
+            ~NptReadGuard() { IORWLockUnlock(l); }
+        } nptGuard(fShared->rw());
+        if (fKick && !injectionWaiting()) {     /* a kick that came in while we waited for the page tables */
             fKick = 0;
             timeslice = true;
             takePendingEvent();
             break;
         }
+
         v->control.exitCode = 0;
         v->control.tlbCtl   = TLB_FLUSH_ALL;
         v->control.clean    = 0;      /* every field is dirty, we never use clean bits yet */
@@ -626,7 +872,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         int ints = ml_set_interrupts_enabled(0);
         fRunCpu = cpu_number();               /* interrupts are off: the thread cannot move before VMRUN */
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
-        if (fKick) {                          /* a kick that arrived before fRunCpu was visible */
+        if (fKick && !injectionWaiting()) {   /* a kick that arrived before fRunCpu was visible */
             fRunCpu = -1;
             ml_set_interrupts_enabled(ints);
             continue;
@@ -680,8 +926,20 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
                 rhv_write_dr(i, fVmcs.dr(i));
         }
 
+        /* RDTSCP reads IA32_TSC_AUX, which VMRUN does not switch: put the guest's value in for the run. */
+        uint64_t hostTscAux = 0;
+        if (fVmx && fHasTscAux) {
+            hostTscAux = rhv_rdmsr(rhv::msr::MSR_TSC_AUX);
+            rhv_wrmsr(rhv::msr::MSR_TSC_AUX, fVmcs.tscAux());
+        }
+
         rhv_svm_vmrun(&fGprs, fVmcb.pa, fHostVmcb.pa);
         fRunCpu = -1;
+
+        if (fVmx && fHasTscAux) {
+            fVmcs.setTscAux(rhv_rdmsr(rhv::msr::MSR_TSC_AUX));
+            rhv_wrmsr(rhv::msr::MSR_TSC_AUX, hostTscAux);
+        }
 
         if (fVmx) {
             for (unsigned i = 0; i < 4; i++)
@@ -727,12 +985,60 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
                 v->control.eventInjErr = v->control.exitIntInfoErr;
             }
             /* The host needed the CPU. It has it now; run on unless the slice is over. */
-            if (mach_absolute_time() >= deadline) {
+            if (mach_absolute_time() >= deadline && !injectionWaiting()) {
                 timeslice = true;
                 takePendingEvent();
                 break;
             }
             continue;
+        }
+
+        /*
+         * TPR shadow, see VmcsState::applyControls: a MOV to CR8 is intercepted only while the client waits for the TPR
+         * to drop below its threshold. Handle it here, without a trip to userland: set V_TPR, step over the instruction,
+         * and report "TPR below threshold" only when the new value really is below the threshold.
+         */
+        if (fVmx && code == 0x18 && fVmcs.tprShadowActive() && (v->control.exitInfo1 >> 63) && v->control.nextRip) {
+            unsigned gpr = (unsigned)(v->control.exitInfo1 & 0xF);
+            uint64_t val;
+            switch (gpr) {
+            case 0:  val = v->save.rax; break;
+            case 1:  val = fGprs.rcx; break;
+            case 2:  val = fGprs.rdx; break;
+            case 3:  val = fGprs.rbx; break;
+            case 4:  val = v->save.rsp; break;
+            case 5:  val = fGprs.rbp; break;
+            case 6:  val = fGprs.rsi; break;
+            case 7:  val = fGprs.rdi; break;
+            case 8:  val = fGprs.r8; break;
+            case 9:  val = fGprs.r9; break;
+            case 10: val = fGprs.r10; break;
+            case 11: val = fGprs.r11; break;
+            case 12: val = fGprs.r12; break;
+            case 13: val = fGprs.r13; break;
+            case 14: val = fGprs.r14; break;
+            default: val = fGprs.r15; break;
+            }
+            if (val <= 0xF) {                               /* anything else is a #GP the client emulates */
+                v->control.intCtl = (v->control.intCtl & ~0xFFu) | (uint32_t)val;
+                v->save.rip       = v->control.nextRip;
+                if (v->control.exitIntInfo & (1u << 31)) {  /* an event that was being delivered goes in again */
+                    v->control.eventInj    = v->control.exitIntInfo;
+                    v->control.eventInjErr = v->control.exitIntInfoErr;
+                }
+                if (val < fVmcs.tprThreshold()) {
+                    timeslice = true;
+                    syntheticReason = rhv::vmx::VMX_TPR_BELOW_THRESHOLD;
+                    takePendingEvent();
+                    break;
+                }
+                if (mach_absolute_time() >= deadline && !injectionWaiting()) {
+                    timeslice = true;
+                    takePendingEvent();
+                    break;
+                }
+                continue;
+            }
         }
         break;
     }
@@ -742,7 +1048,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         if (timeslice) {
             out->reason = RHV_EXIT_TIMESLICE;
             if (fVmx)
-                fVmcs.recordSynthetic(rhv::vmx::VMX_EXT_INTR, carryInfo, carryErr);
+                fVmcs.recordSynthetic(syntheticReason ? syntheticReason : rhv::vmx::VMX_EXT_INTR, carryInfo, carryErr);
         } else {
             out->reason   = classify(code);
             if (out->reason == RHV_EXIT_NPF)
@@ -754,8 +1060,11 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             fHaveNextRip  = v->control.nextRip != 0;
             if (fVmx) {
                 uint32_t perm = 0;
-                if (code == EXIT_NPF)
-                    fNpt.lookup(v->control.exitInfo2 & ~(uint64_t)0xFFF, nullptr, &perm);
+                if (code == EXIT_NPF) {
+                    IORWLockRead(fShared->rw());
+                    fShared->npt().lookup(v->control.exitInfo2 & ~(uint64_t)0xFFF, nullptr, &perm);
+                    IORWLockUnlock(fShared->rw());
+                }
                 if (!fVmcs.recordExit(perm))
                     out->reason = RHV_EXIT_UNHANDLED;      /* e.g. the guest executed an SVM instruction */
             }
@@ -901,9 +1210,11 @@ IOReturn com_overlorddev_RyzenHVVm::runEx(const RHVRunIn *in, RHVRunOut *out)
 
     getRegs(&out->regs);
     unsigned n = 0;
-#define RHV_X(enc) do { uint64_t v_ = 0; if (fVmx) (void)vmcsRead(enc, &v_); out->fields[n++] = v_; } while (0);
+    IOLockLock(fLock);                                    /* one lock for all the fields, not one per field */
+#define RHV_X(enc) do { uint64_t v_ = 0; if (fVmx) (void)fVmcs.read(enc, &v_); out->fields[n++] = v_; } while (0);
     RHV_RUN_FIELDS_LIST(RHV_X)
 #undef RHV_X
+    IOLockUnlock(fLock);
     return kIOReturnSuccess;
 }
 

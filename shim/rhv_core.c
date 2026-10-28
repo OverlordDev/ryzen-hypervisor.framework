@@ -4,6 +4,7 @@
 #include "rhv_core.h"
 #include "rhv_fields.h"
 
+#include <pthread.h>
 #include <string.h>
 
 void (*rhv_core_trace)(const char *fmt, ...);
@@ -33,9 +34,6 @@ enum {
 static RhvBackend B;
 static int  gInit;
 static int  gVm;
-static int  gVcpu;
-static unsigned long gOwner;
-static uint64_t gExecTime;
 
 /*
  * Every call into the kernel costs a few microseconds, and a guest I/O exit makes QEMU touch ~40 registers and VMCS
@@ -46,19 +44,59 @@ static uint64_t gExecTime;
  *   - other VMCS fields are cached on read and dropped when written.
  * Everything is dropped when the guest runs (it changes state) and when an MSR is written (that can change a VMCS
  * field behind the scenes, EFER for one).
+ *
+ * All of it is per vCPU. A vCPU is only ever driven from the thread that created it, so there is no locking; the entry
+ * point of each API call selects the vCPU's state in V (thread-local) and the code below reads it through the g* names.
  */
 enum { kVcSlots = 64 };
-static struct { uint32_t enc; uint64_t val; uint8_t valid; } gVc[kVcSlots];
-static RHVRegs gRegs;
-static int     gRegsValid, gRegsDirty;
 
-/*
- * With the fast path (a backend with run_ex) VMCS writes are not sent at once: they wait here and travel with the
- * next run (or the next read that could depend on them). The run call also returns the registers and the fields in
- * RHV_RUN_FIELDS_LIST, so the usual "what happened?" reads after an exit are served from the cache.
- */
-static RHVVmcsWrite gPend[RHV_RUN_MAX_WRITES];
-static unsigned     gNPend;
+typedef struct VState {
+    int used;
+    int creating;                       /* the slot is being set up by rhv_vcpu_create */
+    void *ctx;                          /* what the backend's per-vCPU functions are given */
+    unsigned long owner;
+    uint64_t execTime;
+    uint64_t apicBase;
+    struct { uint32_t enc; uint64_t val; uint8_t valid; } vc[kVcSlots];
+    RHVRegs regs;
+    int regsValid, regsDirty;
+    /*
+     * An XSAVE image written while XCR0 had not enabled all the components it marks in use (Parallels writes XSTATE_BV=7
+     * at XCR0=1 and enables AVX afterwards). The kernel cannot accept that (XRSTOR would fault), so it gets the image
+     * without those bits and this copy keeps the whole thing until XCR0 is written or the guest runs.
+     */
+    RHVFpuState fpuWhole;
+    int fpuWholeValid;
+    /*
+     * With the fast path (a backend with run_ex) VMCS writes are not sent at once: they wait here and travel with the
+     * next run (or the next read that could depend on them). The run call also returns the registers and the fields in
+     * RHV_RUN_FIELDS_LIST, so the usual "what happened?" reads after an exit are served from the cache.
+     */
+    RHVVmcsWrite pend[RHV_RUN_MAX_WRITES];
+    unsigned nPend;
+    RHVRunIn runIn;
+    RHVRunOut runOut;
+} VState;
+
+static VState gV[RHV_MAX_VCPUS_PER_VM];
+/* vCPUs are created (and destroyed) from their own threads, all at once at VM start: slot choice must be serialised. */
+static pthread_mutex_t gSlotLock = PTHREAD_MUTEX_INITIALIZER;
+static __thread VState *V;
+
+#define gVc          (V->vc)
+#define gRegs        (V->regs)
+#define gRegsValid   (V->regsValid)
+#define gRegsDirty   (V->regsDirty)
+#define gFpuWhole    (V->fpuWhole)
+#define gFpuWholeValid (V->fpuWholeValid)
+#define gPend        (V->pend)
+#define gNPend       (V->nPend)
+#define gExecTime    (V->execTime)
+#define gApicBase    (V->apicBase)
+
+/* The guest's TSC as the client last synchronised it (hv_vm_sync_tsc): applied to every vCPU, also ones made later. */
+static int      gTscOffsetValid;
+static uint64_t gTscOffset;
 
 static const uint32_t kRunFields[RHV_RUN_NFIELDS] = {
 #define X(e) e,
@@ -80,9 +118,19 @@ static void cacheReset(void)
     memset(gVc, 0, sizeof(gVc));
     gRegsValid = gRegsDirty = 0;
     gNPend = 0;
+    gFpuWholeValid = 0;
 }
 
-void rhv_core_cache_reset(void) { cacheReset(); }
+/* Drops the cache of every vCPU (the tests change the fake kernel's state behind the core's back). */
+void rhv_core_cache_reset(void)
+{
+    VState *keep = V;
+    for (unsigned i = 0; i < RHV_MAX_VCPUS_PER_VM; i++) {
+        V = &gV[i];
+        cacheReset();
+    }
+    V = keep;
+}
 
 static unsigned vcSlot(uint32_t enc) { return ((enc >> 1) ^ (enc >> 7)) & (kVcSlots - 1); }
 
@@ -130,7 +178,7 @@ static int regsFetch(void)
         return 0;
     if (!B.get_regs)
         return (int)0xe00002c7;
-    int k = B.get_regs(B.ctx, &gRegs);
+    int k = B.get_regs(V->ctx, &gRegs);
     if (!k)
         gRegsValid = 1;
     return k;
@@ -140,7 +188,7 @@ static int regsFlush(void)
 {
     if (!gRegsDirty)
         return 0;
-    int k = B.set_regs ? B.set_regs(B.ctx, &gRegs) : (int)0xe00002c7;
+    int k = B.set_regs ? B.set_regs(V->ctx, &gRegs) : (int)0xe00002c7;
     if (!k)
         gRegsDirty = 0;
     return k;
@@ -167,6 +215,20 @@ static void adoptReply(const RHVRunOut *o)
         vcPut(kRunFields[i], o->fields[i]);
 }
 
+/*
+ * Turns the exit just reported into another one, for a client-side fix-up (shim/hv_shim.c: VMCALL on an AMD CPU is #UD,
+ * and the exit the client has to see is VMX_REASON_VMCALL). The read-only fields come from the cache.
+ */
+void rhv_vcpu_override_exit(uint32_t vcpu, uint64_t reason, uint64_t instrLen)
+{
+    if (vcpu >= RHV_MAX_VCPUS_PER_VM || !gV[vcpu].used)
+        return;
+    V = &gV[vcpu];
+    vcPut(0x4402, reason);             /* VM-exit reason */
+    vcPut(0x440c, instrLen);           /* VM-exit instruction length */
+    vcPut(0x4404, 0);                  /* VM-exit interruption information: no exception any more */
+}
+
 static int pendingFor(uint32_t field)
 {
     for (unsigned i = 0; i < gNPend; i++)
@@ -182,19 +244,19 @@ static int flushPending(void)
         return regsFlush();
     if (!gNPend && !gRegsDirty)
         return 0;
-    static RHVRunIn  in;
-    static RHVRunOut out;
-    in.flags = RHV_RUN_NO_RUN | (gRegsDirty ? RHV_RUN_REGS : 0);
-    in.regs = gRegs;
-    in.nWrites = gNPend;
-    memcpy(in.writes, gPend, gNPend * sizeof(gPend[0]));
-    int k = B.run_ex(B.ctx, &in, &out);
+    RHVRunIn  *in  = &V->runIn;
+    RHVRunOut *out = &V->runOut;
+    in->flags = RHV_RUN_NO_RUN | (gRegsDirty ? RHV_RUN_REGS : 0);
+    in->regs = gRegs;
+    in->nWrites = gNPend;
+    memcpy(in->writes, gPend, gNPend * sizeof(gPend[0]));
+    int k = B.run_ex(V->ctx, in, out);
     gNPend = 0;
     if (k) {
         cacheReset();
         return k;
     }
-    adoptReply(&out);
+    adoptReply(out);
     return 0;
 }
 
@@ -229,12 +291,17 @@ static int vmcsGet(uint32_t field, uint64_t *value)
     if (vcGet(field, value))
         return 0;
     if (B.vmcs_read_many && segGroupHas(field)) {
+        {
+            static unsigned noted;
+            if (rhv_core_trace && noted++ < 3000 && (noted % 100) == 1)
+                rhv_core_trace("segment group fetched because of field %#x", field);
+        }
         RHVReadMany in;
         RHVReadManyOut out;
         in.count = SEG_GROUP_N;
         for (unsigned i = 0; i < SEG_GROUP_N; i++)
             in.fields[i] = kSegGroup[i];
-        if (B.vmcs_read_many(B.ctx, &in, &out) == 0) {
+        if (B.vmcs_read_many(V->ctx, &in, &out) == 0) {
             for (unsigned i = 0; i < SEG_GROUP_N; i++)
                 vcPut(kSegGroup[i], out.values[i]);
             if (vcGet(field, value))
@@ -243,7 +310,7 @@ static int vmcsGet(uint32_t field, uint64_t *value)
     }
     if (!B.vmcs_read)
         return (int)0xe00002c7;
-    int k = B.vmcs_read(B.ctx, field, value);
+    int k = B.vmcs_read(V->ctx, field, value);
     if (!k)
         vcPut(field, *value);
     return k;
@@ -286,7 +353,7 @@ static int vmcsSet(uint32_t field, uint64_t value)
     }
     if (!B.vmcs_write)
         return (int)0xe00002c7;
-    int k = B.vmcs_write(B.ctx, field, value);
+    int k = B.vmcs_write(V->ctx, field, value);
     vcDrop(field);
     return k;
 }
@@ -296,17 +363,17 @@ static int vmcsSet(uint32_t field, uint64_t value)
  * MSR exists), and QEMU reads it without checking the result. Default: BSP, APIC enabled, base 0xFEE00000.
  */
 #define MSR_IA32_APICBASE 0x1B
-#define APICBASE_DEFAULT  0xFEE00900ull
-static uint64_t gApicBase = APICBASE_DEFAULT;
+#define APICBASE_BSP      0xFEE00900ull      /* enabled, bootstrap processor */
+#define APICBASE_AP       0xFEE00800ull      /* enabled */
 
 void rhv_core_init(const RhvBackend *backend)
 {
     B = *backend;
     gInit = 1;
-    gVm = gVcpu = 0;
-    gOwner = 0;
-    gExecTime = 0;
-    cacheReset();
+    gVm = 0;
+    gTscOffsetValid = 0;
+    memset(gV, 0, sizeof(gV));
+    rhv_core_cache_reset();
 }
 
 int32_t rhv_hv_from_ioreturn(int ior)
@@ -340,17 +407,26 @@ static int32_t needVm(void)
     return gInit && gVm ? RHV_HV_SUCCESS : RHV_HV_NO_DEVICE;
 }
 
-/* A vCPU call must name the vCPU we created and come from the thread that created it. */
+/* A vCPU call must name a vCPU we created and come from the thread that created it. Selects its state in V. */
 static int32_t needVcpu(uint32_t vcpu)
 {
     int32_t r = needVm();
     if (r)
         return r;
-    if (!gVcpu || vcpu != 0)
+    if (vcpu >= RHV_MAX_VCPUS_PER_VM || !gV[vcpu].used)
         return RHV_HV_BAD_ARGUMENT;
-    if (B.thread_id && B.thread_id(B.ctx) != gOwner)
+    V = &gV[vcpu];
+    if (B.thread_id && B.thread_id(B.ctx) != V->owner)
         return RHV_HV_BAD_ARGUMENT;
     return RHV_HV_SUCCESS;
+}
+
+static unsigned vcpuCount(void)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < RHV_MAX_VCPUS_PER_VM; i++)
+        n += gV[i].used;
+    return n;
 }
 
 #define NEED(fn) do { if (!B.fn) return RHV_HV_UNSUPPORTED; } while (0)
@@ -370,8 +446,6 @@ int32_t rhv_vm_create(uint64_t flags)
     if (r)
         return rhv_hv_from_ioreturn(r);
     gVm = 1;
-    gVcpu = 0;
-    gExecTime = 0;
     return RHV_HV_SUCCESS;
 }
 
@@ -381,8 +455,8 @@ int32_t rhv_vm_destroy(void)
     if (r)
         return r;
     NEED(vm_destroy);
-    if (gVcpu)
-        return RHV_HV_BUSY;       /* destroy the vCPU first */
+    if (vcpuCount())
+        return RHV_HV_BUSY;       /* destroy the vCPUs first */
     int k = B.vm_destroy(B.ctx);
     gVm = 0;
     return k ? rhv_hv_from_ioreturn(k) : RHV_HV_SUCCESS;
@@ -419,7 +493,7 @@ int32_t rhv_vm_protect(uint64_t gpa, size_t size, uint64_t flags)
     return rhv_hv_from_ioreturn(B.vm_protect(B.ctx, gpa, size, (uint32_t)flags));
 }
 
-/* The guest sees the TSC `tsc` at this moment: guest TSC = host TSC + offset. */
+/* The guest sees the TSC `tsc` at this moment: guest TSC = host TSC + offset. Every vCPU gets the same offset. */
 int32_t rhv_vm_sync_tsc(uint64_t tsc)
 {
     int32_t r = needVm();
@@ -427,9 +501,24 @@ int32_t rhv_vm_sync_tsc(uint64_t tsc)
         return r;
     NEED(vmcs_write);
     NEED(tsc);
-    if (gVcpu && flushPending() == 0) {}           /* keep the order with buffered writes */
-    vcDrop(F_TSC_OFFSET);
-    return rhv_hv_from_ioreturn(B.vmcs_write(B.ctx, F_TSC_OFFSET, tsc - B.tsc(B.ctx)));
+    gTscOffset = tsc - B.tsc(B.ctx);
+    gTscOffsetValid = 1;
+    int32_t result = RHV_HV_SUCCESS;
+    unsigned n = 0;
+    for (unsigned i = 0; i < RHV_MAX_VCPUS_PER_VM; i++) {
+        if (!gV[i].used)
+            continue;
+        n++;
+        V = &gV[i];
+        if (flushPending() == 0) {}                   /* keep the order with buffered writes */
+        vcDrop(F_TSC_OFFSET);
+        int32_t k = rhv_hv_from_ioreturn(B.vmcs_write(V->ctx, F_TSC_OFFSET, gTscOffset));
+        if (k)
+            result = k;
+    }
+    if (!n)                                           /* no vCPU yet: the one the kernel made with the VM gets it now */
+        result = rhv_hv_from_ioreturn(B.vmcs_write(B.ctx, F_TSC_OFFSET, gTscOffset));
+    return result;
 }
 
 /* ---- vCPU ---- */
@@ -441,13 +530,38 @@ int32_t rhv_vcpu_create(uint32_t *vcpu, uint64_t flags)
         return r;
     if (!vcpu || flags > 3)       /* HV_VCPU_DEFAULT, ACCEL_RDPMC, TSC_RELATIVE */
         return RHV_HV_BAD_ARGUMENT;
-    if (gVcpu)
-        return RHV_HV_NO_RESOURCES;   /* one vCPU per VM for now */
-    gVcpu = 1;
-    cacheReset();
-    gApicBase = APICBASE_DEFAULT;
-    gOwner = B.thread_id ? B.thread_id(B.ctx) : 0;
-    *vcpu = 0;
+    pthread_mutex_lock(&gSlotLock);
+    unsigned i = 0;
+    while (i < RHV_MAX_VCPUS_PER_VM && (gV[i].used || gV[i].creating))
+        i++;
+    if (i == RHV_MAX_VCPUS_PER_VM) {
+        pthread_mutex_unlock(&gSlotLock);
+        return RHV_HV_NO_RESOURCES;
+    }
+    void *vctx = B.ctx;
+    if (B.vcpu_open) {
+        gV[i].creating = 1;                /* the slot is ours while the kernel connection is made */
+        int k = B.vcpu_open(B.ctx, i, &vctx);
+        TRACE("vcpu_open(%u) -> %#x", i, k);
+        if (k) {
+            gV[i].creating = 0;
+            pthread_mutex_unlock(&gSlotLock);
+            return rhv_hv_from_ioreturn(k);
+        }
+    } else if (i != 0) {
+        pthread_mutex_unlock(&gSlotLock);
+        return RHV_HV_NO_RESOURCES;   /* the backend knows one vCPU only */
+    }
+    memset(&gV[i], 0, sizeof(gV[i]));
+    V = &gV[i];
+    V->ctx = vctx;
+    V->used = 1;
+    pthread_mutex_unlock(&gSlotLock);
+    V->owner = B.thread_id ? B.thread_id(B.ctx) : 0;
+    V->apicBase = i == 0 ? APICBASE_BSP : APICBASE_AP;
+    if (gTscOffsetValid && B.vmcs_write)
+        B.vmcs_write(V->ctx, F_TSC_OFFSET, gTscOffset);
+    *vcpu = i;
     return RHV_HV_SUCCESS;
 }
 
@@ -456,8 +570,9 @@ int32_t rhv_vcpu_destroy(uint32_t vcpu)
     int32_t r = needVcpu(vcpu);
     if (r)
         return r;
-    gVcpu = 0;
-    cacheReset();
+    if (B.vcpu_close)
+        B.vcpu_close(B.ctx, vcpu, V->ctx);
+    memset(V, 0, sizeof(*V));
     return RHV_HV_SUCCESS;
 }
 
@@ -470,20 +585,20 @@ int32_t rhv_vcpu_run(uint32_t vcpu)
 
     if (B.run_ex) {
         /* One call: send what is buffered, run, get the registers and the exit information back. */
-        static RHVRunIn  in;
-        static RHVRunOut out;
-        in.flags = gRegsDirty ? RHV_RUN_REGS : 0;
-        in.regs = gRegs;
-        in.nWrites = gNPend;
-        memcpy(in.writes, gPend, gNPend * sizeof(gPend[0]));
+        RHVRunIn  *in  = &V->runIn;
+        RHVRunOut *out = &V->runOut;
+        in->flags = gRegsDirty ? RHV_RUN_REGS : 0;
+        in->regs = gRegs;
+        in->nWrites = gNPend;
+        memcpy(in->writes, gPend, gNPend * sizeof(gPend[0]));
         uint64_t t0 = B.now ? B.now(B.ctx) : 0;
-        int k = B.run_ex(B.ctx, &in, &out);
+        int k = B.run_ex(V->ctx, in, out);
         if (B.now)
             gExecTime += B.now(B.ctx) - t0;
         cacheReset();                 /* the guest ran: all of it may have changed */
         if (k)
             return rhv_hv_from_ioreturn(k);
-        adoptReply(&out);
+        adoptReply(out);
         return RHV_HV_SUCCESS;
     }
 
@@ -493,7 +608,7 @@ int32_t rhv_vcpu_run(uint32_t vcpu)
     RHVExit ex;
     memset(&ex, 0, sizeof(ex));
     uint64_t t0 = B.now ? B.now(B.ctx) : 0;
-    int k = B.run(B.ctx, &ex);
+    int k = B.run(V->ctx, &ex);
     if (B.now)
         gExecTime += B.now(B.ctx) - t0;
     cacheReset();                     /* the guest ran: all of it may have changed */
@@ -512,11 +627,17 @@ int32_t rhv_vcpu_interrupt(const uint32_t *vcpus, unsigned int count)
     if (!vcpus || count == 0)
         return RHV_HV_BAD_ARGUMENT;
     for (unsigned int i = 0; i < count; i++) {
-        if (!gVcpu || vcpus[i] != 0)
+        if (vcpus[i] >= RHV_MAX_VCPUS_PER_VM || !gV[vcpus[i]].used)
             return RHV_HV_BAD_ARGUMENT;
     }
     NEED(kick);
-    return rhv_hv_from_ioreturn(B.kick(B.ctx));
+    int32_t result = RHV_HV_SUCCESS;
+    for (unsigned int i = 0; i < count; i++) {
+        int32_t k = rhv_hv_from_ioreturn(B.kick(gV[vcpus[i]].ctx));
+        if (k)
+            result = k;
+    }
+    return result;
 }
 
 int32_t rhv_vcpu_flush(uint32_t vcpu)
@@ -675,7 +796,7 @@ int32_t rhv_vcpu_read_register(uint32_t vcpu, uint32_t reg, uint64_t *value)
     if (reg == RHV_X86_XCR0) {
         NEED(get_fpu);
         RHVFpuState f;
-        int k = B.get_fpu(B.ctx, &f);
+        int k = B.get_fpu(V->ctx, &f);
         if (k)
             return rhv_hv_from_ioreturn(k);
         *value = f.xcr0;
@@ -693,7 +814,13 @@ int32_t rhv_vcpu_read_register(uint32_t vcpu, uint32_t reg, uint64_t *value)
     if (!field)
         return RHV_HV_BAD_ARGUMENT;         /* CR1 */
     NEED(vmcs_read);
-    return rhv_hv_from_ioreturn(vmcsGet(field, value));
+    {
+        int k = vmcsGet(field, value);
+        /* HV_X86_TPR is the 8-bit APIC task priority (class in bits 7:4); the kernel's V_TPR holds the 4-bit class. */
+        if (!k && reg == RHV_X86_TPR)
+            *value = (*value & 0xF) << 4;
+        return rhv_hv_from_ioreturn(k);
+    }
 }
 
 int32_t rhv_vcpu_write_register(uint32_t vcpu, uint32_t reg, uint64_t value)
@@ -708,16 +835,22 @@ int32_t rhv_vcpu_write_register(uint32_t vcpu, uint32_t reg, uint64_t value)
         NEED(get_fpu);
         NEED(set_fpu);
         RHVFpuState f;
-        int k = B.get_fpu(B.ctx, &f);
+        int k = B.get_fpu(V->ctx, &f);
         if (k)
             return rhv_hv_from_ioreturn(k);
+        if (gFpuWholeValid)                           /* the image written earlier, whole: components may be on now */
+            memcpy(f.area, gFpuWhole.area, f.size);
         /* Components the new XCR0 turns off must not stay marked as in use in the saved image. */
         uint64_t bv;
         memcpy(&bv, f.area + 512, 8);
+        uint64_t whole = bv;
         bv &= value | 3;
         memcpy(f.area + 512, &bv, 8);
         f.xcr0 = value;
-        return rhv_hv_from_ioreturn(B.set_fpu(B.ctx, &f));
+        int rc = B.set_fpu(V->ctx, &f);
+        if (rc == 0 && gFpuWholeValid && !(whole & ~(value | 3)))
+            gFpuWholeValid = 0;                       /* everything it marked is enabled now */
+        return rhv_hv_from_ioreturn(rc);
     }
     if (reg <= RHV_X86_R15) {
         NEED(get_regs);
@@ -733,6 +866,8 @@ int32_t rhv_vcpu_write_register(uint32_t vcpu, uint32_t reg, uint64_t value)
     if (!field)
         return RHV_HV_BAD_ARGUMENT;
     NEED(vmcs_write);
+    if (reg == RHV_X86_TPR)
+        value = (value >> 4) & 0xF;                    /* 8-bit APIC TPR -> the kernel's 4-bit class */
     return rhv_hv_from_ioreturn(vmcsSet(field, value));
 }
 
@@ -747,12 +882,13 @@ int32_t rhv_vcpu_read_fpstate(uint32_t vcpu, void *buffer, size_t size)
     if (!buffer)
         return RHV_HV_BAD_ARGUMENT;
     RHVFpuState f;
-    int k = B.get_fpu(B.ctx, &f);
+    int k = B.get_fpu(V->ctx, &f);
     if (k)
         return rhv_hv_from_ioreturn(k);
+    TRACE("read_fpstate: buffer %zu, area %u, xcr0 %#llx", size, f.size, (unsigned long long)f.xcr0);
     if (size < f.size)
         return RHV_HV_BAD_ARGUMENT;
-    memcpy(buffer, f.area, f.size);
+    memcpy(buffer, gFpuWholeValid ? gFpuWhole.area : f.area, f.size);
     return RHV_HV_SUCCESS;
 }
 
@@ -766,13 +902,37 @@ int32_t rhv_vcpu_write_fpstate(uint32_t vcpu, const void *buffer, size_t size)
     if (!buffer)
         return RHV_HV_BAD_ARGUMENT;
     RHVFpuState f;
-    int k = B.get_fpu(B.ctx, &f);
+    int k = B.get_fpu(V->ctx, &f);
     if (k)
         return rhv_hv_from_ioreturn(k);
+    TRACE("write_fpstate: buffer %zu, area %u, xcr0 %#llx", size, f.size, (unsigned long long)f.xcr0);
     if (size < f.size)
         return RHV_HV_BAD_ARGUMENT;
     memcpy(f.area, buffer, f.size);
-    return rhv_hv_from_ioreturn(B.set_fpu(B.ctx, &f));
+    {
+        uint64_t bv;
+        memcpy(&bv, f.area + 512, 8);
+        gFpuWholeValid = 0;
+        if (bv & ~(f.xcr0 | 3)) {                     /* marks components XCR0 has not enabled yet */
+            gFpuWhole = f;
+            gFpuWholeValid = 1;
+            bv &= f.xcr0 | 3;
+            memcpy(f.area + 512, &bv, 8);
+        }
+    }
+    if (rhv_core_trace) {
+        uint64_t bv, comp;
+        uint32_t mxcsr;
+        memcpy(&bv, f.area + 512, 8);
+        memcpy(&comp, f.area + 520, 8);
+        memcpy(&mxcsr, f.area + 24, 4);
+        int junk = 0;
+        for (unsigned i = 528; i < 576; i++)
+            junk |= f.area[i];
+        rhv_core_trace("write_fpstate: xstate_bv %#llx xcomp_bv %#llx mxcsr %#x header-junk %d", (unsigned long long)bv,
+                       (unsigned long long)comp, mxcsr, junk);
+    }
+    return rhv_hv_from_ioreturn(B.set_fpu(V->ctx, &f));
 }
 
 int32_t rhv_vcpu_read_msr(uint32_t vcpu, uint32_t msr, uint64_t *value)
@@ -790,7 +950,7 @@ int32_t rhv_vcpu_read_msr(uint32_t vcpu, uint32_t msr, uint64_t *value)
     int fk = flushPending();                  /* an MSR and a VMCS field can be the same state (EFER) */
     if (fk)
         return rhv_hv_from_ioreturn(fk);
-    return rhv_hv_from_ioreturn(B.msr(B.ctx, RHV_MSR_READ, msr, 0, value));
+    return rhv_hv_from_ioreturn(B.msr(V->ctx, RHV_MSR_READ, msr, 0, value));
 }
 
 int32_t rhv_vcpu_write_msr(uint32_t vcpu, uint32_t msr, uint64_t value)
@@ -807,7 +967,7 @@ int32_t rhv_vcpu_write_msr(uint32_t vcpu, uint32_t msr, uint64_t value)
     int fk = flushPending();
     if (fk)
         return rhv_hv_from_ioreturn(fk);
-    int k = B.msr(B.ctx, RHV_MSR_WRITE, msr, value, &out);
+    int k = B.msr(V->ctx, RHV_MSR_WRITE, msr, value, &out);
     for (unsigned i = 0; i < kVcSlots; i++) gVc[i].valid = 0;       /* EFER and friends are VMCS fields too */
     return rhv_hv_from_ioreturn(k);
 }
@@ -822,7 +982,7 @@ int32_t rhv_vcpu_enable_native_msr(uint32_t vcpu, uint32_t msr, int enable)
     int fk = flushPending();
     if (fk)
         return rhv_hv_from_ioreturn(fk);
-    return rhv_hv_from_ioreturn(B.msr(B.ctx, enable ? RHV_MSR_NATIVE_ENABLE : RHV_MSR_NATIVE_DISABLE, msr, 0, &out));
+    return rhv_hv_from_ioreturn(B.msr(V->ctx, enable ? RHV_MSR_NATIVE_ENABLE : RHV_MSR_NATIVE_DISABLE, msr, 0, &out));
 }
 
 /* ---- VMX ---- */
@@ -856,7 +1016,8 @@ int32_t rhv_vmx_vcpu_write_vmcs(uint32_t vcpu, uint32_t field, uint64_t value)
  * must be 1, high 32 bits = controls that may be 1. Clients compute their controls as (wanted | low) & high, so a bit
  * we leave out of "high" is silently not requested. Everything claimed here is either implemented by VmcsState
  * (kext/Source/VmcsState.hpp) or harmless to ignore (the VM-entry/exit "load" controls: the state fields are
- * authoritative). APIC virtualization, posted interrupts, the preemption timer and NMI-window exiting are NOT offered.
+ * authoritative). The TPR shadow is implemented in the kext (CR8 writes only exit below the TPR threshold). APIC
+ * virtualization, posted interrupts, the preemption timer and NMI-window exiting are NOT offered.
  */
 static uint64_t cap(uint32_t must1, uint32_t may1)
 {
@@ -867,7 +1028,7 @@ enum {
     PIN_EXTINT = 1u << 0, PIN_NMI = 1u << 3,
     CPU_INTR_WINDOW = 1u << 2, CPU_TSC_OFFSETING = 1u << 3, CPU_HLT = 1u << 7, CPU_INVLPG = 1u << 9,
     CPU_MWAIT = 1u << 10, CPU_RDPMC = 1u << 11, CPU_RDTSC = 1u << 12, CPU_CR3_LOAD = 1u << 15, CPU_CR3_STORE = 1u << 16,
-    CPU_CR8_LOAD = 1u << 19, CPU_CR8_STORE = 1u << 20, CPU_MOV_DR = 1u << 23, CPU_IO = 1u << 24,
+    CPU_CR8_LOAD = 1u << 19, CPU_CR8_STORE = 1u << 20, CPU_TPR_SHADOW = 1u << 21, CPU_MOV_DR = 1u << 23, CPU_IO = 1u << 24,
     CPU_IO_BITMAPS = 1u << 25, CPU_MSR_BITMAPS = 1u << 28, CPU_MONITOR = 1u << 29, CPU_PAUSE = 1u << 30,
     CPU_SECONDARY = 1u << 31,
     CPU2_EPT = 1u << 1, CPU2_RDTSCP = 1u << 3, CPU2_VPID = 1u << 5, CPU2_WBINVD = 1u << 6,
@@ -877,12 +1038,15 @@ enum {
     EXIT_SAVE_EFER = 1u << 20, EXIT_LOAD_EFER = 1u << 21
 };
 
+/* Set by the shim for a client that knows what to do with the TPR shadow (Parallels); QEMU keeps CR8 exiting. */
+int rhv_core_offer_tpr_shadow;
+
 int32_t rhv_vmx_read_capability(uint32_t c, uint64_t *value)
 {
     if (!value)
         return RHV_HV_BAD_ARGUMENT;
     const uint32_t proc = CPU_INTR_WINDOW | CPU_TSC_OFFSETING | CPU_HLT | CPU_INVLPG | CPU_MWAIT | CPU_RDPMC | CPU_RDTSC |
-                          CPU_CR3_LOAD | CPU_CR3_STORE | CPU_CR8_LOAD | CPU_CR8_STORE | CPU_MOV_DR | CPU_IO |
+                          CPU_CR3_LOAD | CPU_CR3_STORE | CPU_CR8_LOAD | CPU_CR8_STORE | (rhv_core_offer_tpr_shadow ? CPU_TPR_SHADOW : 0) | CPU_MOV_DR | CPU_IO |
                           CPU_IO_BITMAPS | CPU_MSR_BITMAPS | CPU_MONITOR | CPU_PAUSE | CPU_SECONDARY;
     switch (c) {
     case RHV_VMX_CAP_PINBASED:
@@ -919,6 +1083,12 @@ int32_t rhv_vmx_read_capability(uint32_t c, uint64_t *value)
     case RHV_VMX_CAP_CR0_FIXED0: *value = 0x20; break;             /* NE; PE and PG are free (unrestricted guest) */
     case RHV_VMX_CAP_CR0_FIXED1: *value = 0xFFFFFFFFull; break;
     case RHV_VMX_CAP_CR4_FIXED0: *value = 0; break;                /* no VMXE: the guest is not run inside VMX */
+    case RHV_VMX_CAP_VMCS_ENUM: *value = 0x2E << 1; break;                /* highest VMCS field index: bits 9:1 */
+    case RHV_VMX_CAP_EPT_VPID_CAP:
+        /* 4-level walks, write-back, 2 MiB pages, INVEPT (single/all context); INVVPID (all four types) */
+        *value = (1ull << 6) | (1ull << 14) | (1ull << 16) | (1ull << 20) | (1ull << 25) | (1ull << 26) |
+                 (1ull << 32) | (1ull << 40) | (1ull << 41) | (1ull << 42) | (1ull << 43);
+        break;
     case RHV_VMX_CAP_CR4_FIXED1: *value = 0x00FFFFFFull; break;    /* bit 13 (VMXE) is accepted and kept out of the VMCB */
     default:
         return RHV_HV_BAD_ARGUMENT;

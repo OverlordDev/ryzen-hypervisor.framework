@@ -17,6 +17,7 @@ int main()
     i = info(MSR_CSTAR);                 CHECK(i.kind == K_VMCB && i.vmcbOff == 0x400 + 0x210);
     i = info(MSR_SFMASK);                CHECK(i.kind == K_VMCB && i.vmcbOff == 0x400 + 0x218);
     i = info(MSR_KERNEL_GS_BASE);        CHECK(i.kind == K_VMCB && i.vmcbOff == 0x400 + 0x220);
+    i = info(MSR_TSC_AUX);               CHECK(i.kind == K_TSC_AUX && i.valueBits == 32);
     i = info(MSR_SYSENTER_CS);           CHECK(i.kind == K_VMCB && i.vmcbOff == 0x400 + 0x228 && i.valueBits == 32);
     i = info(MSR_SYSENTER_ESP);          CHECK(i.kind == K_VMCB && i.vmcbOff == 0x400 + 0x230);
     i = info(MSR_SYSENTER_EIP);          CHECK(i.kind == K_VMCB && i.vmcbOff == 0x400 + 0x238);
@@ -26,7 +27,7 @@ int main()
     i = info(MSR_EFER);                  CHECK(i.kind == K_EFER && i.vmcbOff == 0x400 + 0x0D0);
     i = info(MSR_TSC);                   CHECK(i.kind == K_TSC);
     CHECK(info(0x1B).kind == K_UNKNOWN); /* APIC base: the client emulates it */
-    CHECK(info(0xC0000103).kind == K_UNKNOWN); /* TSC_AUX: the host uses it, never native */
+    CHECK(info(0xC0000103).kind == K_TSC_AUX); /* TSC_AUX: kept by the kext, swapped around VMRUN */
     CHECK(info(0x80).kind == K_UNKNOWN);
 
     /* MSRPM layout, checked against the manual's examples. */

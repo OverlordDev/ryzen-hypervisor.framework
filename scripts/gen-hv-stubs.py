@@ -19,6 +19,7 @@ IMPLEMENTED = {
     'hv_vmx_vcpu_read_vmcs', 'hv_vmx_vcpu_write_vmcs', 'hv_vmx_read_capability',
     'hv_vcpu_set_tsc_relative', 'hv_vcpu_set_msr_access', 'hv_vmx_get_msr_info',
     'hv_vmx_vcpu_set_apic_address', 'hv_vmx_vcpu_set_apic_address_space',
+    'hv_vm_allocate', 'hv_vm_deallocate',
 }
 
 with tempfile.TemporaryDirectory() as d:
