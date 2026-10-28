@@ -93,10 +93,18 @@ APIC/IOAPIC (скорее всего да, раз API появился) и не�
      `hv_vmx_get_msr_info`, `hv_vmx_vcpu_set_apic_address[_space]`, ёмкости VMX `VMCS_ENUM`/`EPT_VPID_CAP`, XSAVE-образ с
      `XSTATE_BV`, шире текущего `XCR0` (Parallels пишет его до включения AVX), `IA32_TSC_AUX` как «родной» MSR.
    - Ядро: boot-arg `rhv_allow_users=1` пускает локального пользователя; ВМ Parallels работает от пользователя.
-   С 1 vCPU (`prlctl set <ВМ> --cpus 1`) ВМ уже создаётся: vCPU, 8 ГБ памяти и устройства отображаются в гостя.
-   **Ещё нет:** несколько vCPU (Parallels создаёт по vCPU на поток, у нас один на ВМ), адресные пространства
-   (`hv_vm_space_*`, `hv_vm_{map,unmap,protect}_space`, `hv_vcpu_set_space`), встроенные APIC/IOAPIC/ATPIC, если понадобятся;
-   дальше выяснится по первому запуску гостя.
+   **Состояние (этап 8, ABI 11): Windows 11 Home ставится и работает в Parallels 26.5.0 на 1–4 vCPU**, окно установки
+   через ~45–50 с, Parallels Tools, сеть. Сделано сверх списка выше (подробно в `docs/PARALLELS.md`):
+   - несколько vCPU на ВМ (общая часть + объект на vCPU, `VmJoin`, соединение ядра на vCPU, блокировка таблиц NPT);
+   - клавиатура (монитор отбрасывает клавиши до записи 0 в порт 0x80), страница APIC без отображения, скрытие гипервизора,
+     `VMCALL` Hyper-V через перехват #UD, обработка перезагрузки монитора (адрес `libMonitor` ищется заново);
+   - TPR shadow в ядре (выходы CR8 исчезли), 8-битный `HV_X86_TPR`, `RDTSCP` вместе с `RDTSC exiting`,
+     один вызов ядра на выход (55 полей в `VmRunEx`);
+   - топология CPUID для гостя (иначе Windows Home запускает один процессор);
+   - отладка: дамп triple fault и аварийного дампа Windows, трасса MSR/MMIO/ICR/CPUID, таблица MADT, статистика.
+   **Ещё нет:** адресные пространства (`hv_vm_space_*`, `hv_vm_{map,unmap,protect}_space`, `hv_vcpu_set_space`), сон/пробуждение
+   и snapshot с несколькими vCPU, 3D-ускорение (на машине автора падает драйвер Metal NVIDIA), другие гости, другие
+   сборки Parallels (правки по адресам привязаны к 26.5.0 (57613)).
 8. Всё остальное, что потребуется Parallels.
 
 ## Риски
