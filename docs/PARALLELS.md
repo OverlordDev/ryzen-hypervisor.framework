@@ -1,122 +1,122 @@
-# Parallels Desktop на Ryzen: установка и использование
+# Parallels Desktop on a Ryzen: installation and use
 
-Состояние: **Windows 11 (Home) устанавливается и работает в Parallels Desktop 26.5.0 (57613) на Ryzen 7 5800H,
-macOS Sequoia 15.8.1, OpenCore, до 4 vCPU.** Загрузка до окна установки ~45–50 с, клавиатура, сеть, Parallels Tools
-(`prlctl exec`) работают. Всё сделано без правки файлов внутри `/Applications/Parallels Desktop.app`, кроме одной
-подмены `prl_vm_app` на обёртку (откатывается).
+State: **Windows 11 (Home) installs and runs in Parallels Desktop 26.5.0 (57613) on a Ryzen 7 5800H,
+macOS Sequoia 15.8.1, OpenCore, up to 4 vCPUs.** Boot to the Setup window takes ~45–50 s, the keyboard, network and Parallels Tools
+(`prlctl exec`) work. Everything is done without editing files inside `/Applications/Parallels Desktop.app`, except one
+replacement of `prl_vm_app` with a wrapper (reversible).
 
-> Из готового релиза всё ниже делает `./rhv kext` и `./rhv parallels` (шаги 4–5 и установка обёртки); этот документ описывает,
-> что именно происходит.
+> From the ready-made release, everything below is done by `./rhv kext` and `./rhv parallels` (steps 4–5 and installing the wrapper); this document describes
+> what exactly happens.
 
-> Это эксперимент, а не продукт. Работает на **точной сборке Parallels 26.5.0 (57613)**: часть правок привязана к её
-> адресам и при другой сборке молча не применяется (ВМ тогда просто не стартует). После обновления Parallels
-> повтори шаги 4–5. Правка проприетарного приложения на своей машине это твоя ответственность; в репозитории нет
-> ничего от Parallels, копия собирается из установленного у тебя приложения.
+> This is an experiment, not a product. It works on the **exact Parallels build 26.5.0 (57613)**: some of the patches are tied to its
+> addresses and on another build they silently do not apply (the VM then simply does not start). After a Parallels update
+> repeat steps 4–5. Patching a proprietary application on your own machine is your responsibility; the repository contains
+> nothing from Parallels, the copy is built from the application installed on your machine.
 
-## Что нужно
+## What you need
 
 | | |
 |---|---|
-| Процессор | AMD Ryzen с SVM и NPT (проверено: Ryzen 7 5800H, Zen 3). SVM включён в BIOS |
-| Система | macOS Sequoia, OpenCore (проверено 15.8.1), Xcode/Command Line Tools для сборки |
-| Parallels Desktop | **26.5.0 (57613)**, пробная версия подходит |
-| Гость | проверено: Windows 11 Home (1–4 vCPU). Linux и macOS в роли гостя не проверялись |
-| Запасной EFI | флешка с рабочей копией `EFI/` **без** кекста (см. `docs/RYZENTOSH.md`) |
+| CPU | an AMD Ryzen with SVM and NPT (tested: Ryzen 7 5800H, Zen 3). SVM enabled in the BIOS |
+| System | macOS Sequoia, OpenCore (tested 15.8.1), Xcode/Command Line Tools for building |
+| Parallels Desktop | **26.5.0 (57613)**, the trial version is fine |
+| Guest | tested: Windows 11 Home (1–4 vCPUs). Linux and macOS guests were not tested |
+| Fallback EFI | a USB stick with a working copy of `EFI/` **without** the kext (see `docs/RYZENTOSH.md`) |
 
-## Установка
+## Installation
 
-1. **Сборка** (на самом хакинтоше):
+1. **Build** (on the hackintosh itself):
    ```
-   make test            # чистая логика, должна пройти целиком
+   make test            # the pure logic, must pass completely
    make kext tools shim
    ```
-2. **Кекст в OpenCore.** Подмонтируй EFI, `./scripts/install-to-efi.sh /Volumes/EFI`, при первой установке добавь запись
-   `Kernel → Add` (таблица в `docs/RYZENTOSH.md`).
-3. **boot-args** (`Misc → Boot → boot-args`) и перезагрузка:
+2. **The kext in OpenCore.** Mount the EFI, `./scripts/install-to-efi.sh /Volumes/EFI`, and on the first installation add the
+   `Kernel → Add` entry (the table is in `docs/RYZENTOSH.md`).
+3. **boot-args** (`Misc → Boot → boot-args`) and a reboot:
    ```
    rhv_enable_svm=1 rhv_allow_users=1 amfi_get_out_of_my_way=0x1
    ```
-   - `rhv_enable_svm=1`: включить SVM на всех ядрах;
-   - `rhv_allow_users=1`: ВМ Parallels работает от обычного пользователя, а не от root;
-   - AMFI ослаблен, чтобы запустился процесс с нашей подменной библиотекой (на машине автора ещё стоит `amfi=0x80`).
-   Проверка после загрузки: `./build/rhv-info` должен написать `RyzenHV kext (ABI 11)` и `SVM usable on N, active on N`.
-4. **Копия Parallels с шимом** (без sudo, лежит в `~/.ryzenhv/prl`):
+   - `rhv_enable_svm=1`: enable SVM on all cores;
+   - `rhv_allow_users=1`: the Parallels VM runs as an ordinary user, not as root;
+   - AMFI is relaxed so that the process with our stand-in library can start (the author's machine also has `amfi=0x80`).
+   Check after booting: `./build/rhv-info` must print `RyzenHV kext (ABI 11)` and `SVM usable on N, active on N`.
+4. **A copy of Parallels with the shim** (no sudo, lives in `~/.ryzenhv/prl`):
    ```
    ./scripts/parallels-shim.sh prepare
    ```
-5. **Обёртка вместо `prl_vm_app`** (один раз и после каждого обновления Parallels):
+5. **A wrapper instead of `prl_vm_app`** (once, and after every Parallels update):
    ```
    sudo ./scripts/parallels-shim.sh install
    ./scripts/parallels-shim.sh status
    ```
-6. **ВМ.** Создай ВМ в Parallels как обычно (Windows 11 из ISO), затем:
+6. **The VM.** Create a VM in Parallels as usual (Windows 11 from an ISO), then:
    ```
-   prlctl set "Windows 11" --cpus 4                      # проверено 1 и 4 (в кексте до 16 vCPU на ВМ)
+   prlctl set "Windows 11" --cpus 4                      # tested with 1 and 4 (the kext allows up to 16 vCPUs per VM)
    prlctl set "Windows 11" --3d-accelerate off --high-resolution off --high-resolution-in-guest off --vertical-sync off
    ```
-   Тип гипервизора должен быть Apple (`prlctl list -i "Windows 11" | grep Hypervisor` → `apple`; иначе
+   The hypervisor type must be Apple (`prlctl list -i "Windows 11" | grep Hypervisor` → `apple`; otherwise
    `prlctl set "Windows 11" --hypervisor-type apple`).
-7. Запусти ВМ. На экране «Press any key to boot from CD or DVD» нажми клавишу.
+7. Start the VM. At "Press any key to boot from CD or DVD" press a key.
 
-Удаление: `sudo ./scripts/parallels-shim.sh uninstall`, затем убери кекст из `Kernel → Add` и из `EFI/OC/Kexts`.
+To remove: `sudo ./scripts/parallels-shim.sh uninstall`, then remove the kext from `Kernel → Add` and from `EFI/OC/Kexts`.
 
-## Советы по гостю
+## Tips for the guest
 
-- **Не убивай ВМ** (`prlctl stop --kill`, закрытие окна с «Stop») во время установки и первого запуска (OOBE): после
-  нескольких внеплановых перезапусков Windows показывает «Why did my PC restart?» и уходит в автовосстановление.
-- Выключай Windows **полностью**: `shutdown /s /full /t 0`. «Быстрый запуск» хранит старое число процессоров.
-- Windows 11 **Home** запускает один физический процессор. Шим сам отдаёт гостю правильную топологию (4 ядра в одном
-  пакете, кэш), поэтому все vCPU работают.
-- `prlctl exec "Windows 11" cmd /c ...` работает, когда стоят Parallels Tools (можно читать журнал событий, реестр).
-- 3D-ускорение (`--3d-accelerate`) на машине автора роняет `prl_vm_app` внутри Metal-драйвера NVIDIA (NVMTL поверх NVK
-  для RTX 3070, не штатный драйвер Apple): держи его выключенным. С другим GPU результат может быть другим.
+- **Do not kill the VM** (`prlctl stop --kill`, closing the window with "Stop") during installation and the first start (OOBE): after
+  a few unplanned restarts Windows shows "Why did my PC restart?" and goes into automatic recovery.
+- Shut Windows down **completely**: `shutdown /s /full /t 0`. "Fast startup" stores the old number of processors.
+- Windows 11 **Home** runs one physical processor. The shim itself gives the guest the right topology (4 cores in one
+  package, cache), so all vCPUs work.
+- `prlctl exec "Windows 11" cmd /c ...` works when Parallels Tools are installed (you can read the event log, the registry).
+- 3D acceleration (`--3d-accelerate`) crashes `prl_vm_app` on the author's machine inside NVIDIA's Metal driver (NVMTL on top of NVK
+  for an RTX 3070, not Apple's own driver): keep it off. With another GPU the result may differ.
 
-## Что делает шим внутри Parallels
+## What the shim does inside Parallels
 
-| проблема | решение |
+| problem | solution |
 |---|---|
-| `kern.hv_support` = 0, Parallels уходит на свой движок | `sysctlbyname` отдаёт 1, `hv_*` подменены на вызовы кекста |
-| `prl_vm_app` hardened, `DYLD_INSERT_LIBRARIES` не работает, подпись проверяет диспетчер | зеркало приложения в `~/.ryzenhv/prl`, в нём `libPrlXmlModel.1.dylib` = шим, перезапись импортов по имени (`shim/hijack.c`) |
-| проверка вендора `GenuineIntel` (инструкция CPUID) | одна правка перехода в памяти `prl_vm_app` и в копии `libMonitor.dylib` |
-| клавиатура не работает | монитор Parallels отбрасывает клавиши, пока гость не запишет 0 в порт 0x80: шим сам вызывает его обработчик |
-| triple fault при старте ядра Windows | гипервызов Hyper-V `VMCALL` на AMD это #UD: шим перехватывает #UD и превращает его в обычный VMX-выход |
-| гость «спит» после загрузки ядра | страница APIC (0xFEE00000) оставлена без отображения, обращения идут в монитор; гипервизор скрыт от гостя |
-| ~60% выходов приходится на CR8 | TPR shadow в ядре (запись CR8 не выходит, пока нет порога), `HV_X86_TPR` 8-битный |
-| QPC отрицательный, OOBE «перезапускается» | `RDTSC exiting` перехватывает и `RDTSCP` |
-| Windows Home запускает 1 CPU | CPUID: `0x80000008`, `0x80000001`, `0x80000005/6`, лист 4 (ядер в пакете, кэш) |
-| несколько vCPU | VM = общая часть (NPT, память) + объект на каждый vCPU; шим открывает по соединению на vCPU |
+| `kern.hv_support` = 0, Parallels falls back to its own engine | `sysctlbyname` returns 1, `hv_*` are replaced with calls into the kext |
+| `prl_vm_app` is hardened, `DYLD_INSERT_LIBRARIES` does not work, the dispatcher checks the signature | a mirror of the application in `~/.ryzenhv/prl` in which `libPrlXmlModel.1.dylib` = the shim, imports rewritten by name (`shim/hijack.c`) |
+| the `GenuineIntel` vendor check (the CPUID instruction) | one branch patched in the memory of `prl_vm_app` and in the copy of `libMonitor.dylib` |
+| the keyboard does not work | the Parallels monitor drops keys until the guest writes 0 to port 0x80: the shim calls its handler itself |
+| triple fault when the Windows kernel starts | the Hyper-V hypercall `VMCALL` is a #UD on AMD: the shim intercepts #UD and turns it into an ordinary VMX exit |
+| the guest "sleeps" after the kernel boots | the APIC page (0xFEE00000) is left unmapped, accesses go to the monitor; the hypervisor is hidden from the guest |
+| ~60% of exits are CR8 | TPR shadow in the kernel (a CR8 write does not exit while there is no threshold), `HV_X86_TPR` is 8-bit |
+| QPC is negative, OOBE "restarts" | `RDTSC exiting` intercepts `RDTSCP` too |
+| Windows Home runs 1 CPU | CPUID: `0x80000008`, `0x80000001`, `0x80000005/6`, leaf 4 (cores per package, cache) |
+| several vCPUs | VM = a shared part (NPT, memory) + an object per vCPU; the shim opens one connection per vCPU |
 
-Подробности и история отладки: `docs/PHASE3.md` (этап 8).
+Details and the debugging history: `docs/PHASE3.md` (stage 8).
 
-## Отладка
+## Debugging
 
-Трасса и статистика **выключены**: они дают сотни тысяч строк в секунду и заметно нагружают систему. Включить:
+Trace and statistics are **off**: they produce hundreds of thousands of lines per second and noticeably load the system. To turn them on:
 
 ```
-touch /tmp/rhv-debug          # (или ~/.ryzenhv/debug) и перезапустить ВМ
-# файлы: /tmp/rhv-prl-<pid>.trace и .stats
+touch /tmp/rhv-debug          # (or ~/.ryzenhv/debug) and restart the VM
+# files: /tmp/rhv-prl-<pid>.trace and .stats
 rm /tmp/rhv-debug
 ```
 
-Прочие переключатели (файлы в `/tmp`, действуют при следующем запуске ВМ):
+Other switches (files in `/tmp`, effective at the next VM start):
 
-| файл / переменная | эффект |
+| file / variable | effect |
 |---|---|
-| `/tmp/rhv-no-vtpr` | не предлагать TPR shadow (вернуть выходы CR8) |
-| `/tmp/rhv-show-hv`, `RYZENHV_SHOW_HYPERVISOR=1` | не скрывать гипервизор от гостя (и не править CPUID) |
-| `/tmp/rhv-map-apic` | отобразить страницу APIC как память |
-| `RYZENHV_NO_KBD_ARM=1` | не «взводить» клавиатуру монитора |
-| `/tmp/rhv-dump`, `/tmp/rhv-madt` | (с трассой) дамп регистров/кода гостя раз в секунду; таблица MADT |
+| `/tmp/rhv-no-vtpr` | do not offer TPR shadow (brings CR8 exits back) |
+| `/tmp/rhv-show-hv`, `RYZENHV_SHOW_HYPERVISOR=1` | do not hide the hypervisor from the guest (and do not patch CPUID) |
+| `/tmp/rhv-map-apic` | map the APIC page as memory |
+| `RYZENHV_NO_KBD_ARM=1` | do not "arm" the monitor's keyboard |
+| `/tmp/rhv-dump`, `/tmp/rhv-madt` | (with the trace) a dump of guest registers/code once a second; the MADT table |
 
-С трассой при запросе сброса гостя ищется заголовок аварийного дампа Windows (`BUGCHECK`), при triple fault
-печатается состояние гостя (`TRIPLE FAULT`). Падения `prl_vm_app` смотри в `/Library/Logs/DiagnosticReports`
-(`prl_vm_app-*.ips`), лог ВМ: `~/Parallels/<ВМ>.pvm/parallels.log`.
+With the trace on, a guest reset request searches for the header of a Windows crash dump (`BUGCHECK`), and on a triple fault
+the guest state is printed (`TRIPLE FAULT`). For `prl_vm_app` crashes look in `/Library/Logs/DiagnosticReports`
+(`prl_vm_app-*.ips`), the VM log is `~/Parallels/<VM>.pvm/parallels.log`.
 
-## Известные ограничения
+## Known limitations
 
-- Только сборка Parallels 26.5.0 (57613); после обновления запускай `prepare` и `install` заново, а на другой
-  сборке жди, что правки по адресам не применятся (шим пишет об этом в трассу и ничего не трогает).
-- Не проверено: сон/пробуждение, `kextunload`, длительная нагрузка, гости кроме Windows 11, snapshot/suspend
-  с несколькими vCPU, адресные пространства `hv_vm_space_*`.
-- Окно «Why did my PC restart?» после внеплановых остановок: см. советы выше.
-- `rhv_allow_users=1` даёт любому локальному пользователю доступ к гипервизору: включай только на личной машине.
+- Only Parallels build 26.5.0 (57613); after an update run `prepare` and `install` again, and on another
+  build expect the address-based patches not to apply (the shim says so in the trace and touches nothing).
+- Not verified: sleep/wake, `kextunload`, sustained load, guests other than Windows 11, snapshot/suspend
+  with several vCPUs, the `hv_vm_space_*` address spaces.
+- The "Why did my PC restart?" window after unplanned stops: see the tips above.
+- `rhv_allow_users=1` gives any local user access to the hypervisor: enable it on a personal machine only.

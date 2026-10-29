@@ -1,92 +1,92 @@
-# Отладка
+# Debugging
 
-Кернел-код отлаживать тяжело: ошибка = паника или зависание, а не красивый стектрейс. Поэтому в проект
-сразу заложены логи, счётчики, аварийный выключатель и самопроверка. Эта страница про то, как ими пользоваться.
+Kernel code is hard to debug: a bug means a panic or a hang, not a nice stack trace. So the project has logs, counters,
+an emergency switch and a self-test built in from the start. This page is about how to use them.
 
 ## Boot-args
 
-Задаются в `Misc → Boot → boot-args` в `config.plist` OpenCore (или через `nvram`).
+Set them in `Misc → Boot → boot-args` in the OpenCore `config.plist` (or through `nvram`).
 
-| boot-arg | значение |
+| boot-arg | meaning |
 |---|---|
-| `-rhv_off` | **аварийный выключатель.** Кекст грузится, но ничего не делает. Первое, что пробовать, если после кекста что-то сломалось. |
-| `rhv_enable_svm=1` | включить SVM на всех ядрах. Без него кекст только читает. |
-| `rhv_selftest=1` | после включения (и после пробуждения) проверить EFER и `VM_HSAVE_PA` на каждом ядре |
-| `rhv_loglevel=N` | уровень кольцевого лога ядра, 0..5 (none, error, warn, info, debug, trace). По умолчанию 3 |
-| `rhv_iolog=N` | до какого уровня дублировать в системный лог (IOLog). По умолчанию 3 |
-| `rhv_stage=N` | **поиск шага, на котором падает загрузка**, см. ниже. Без флага выполняются все шаги |
-| `rhv_slow=N` | подождать N секунд (максимум 10) после объявления каждого шага, чтобы прочитать экран |
+| `-rhv_off` | **emergency switch.** The kext loads but does nothing. The first thing to try if something broke after the kext. |
+| `rhv_enable_svm=1` | enable SVM on all cores. Without it the kext only reads. |
+| `rhv_selftest=1` | after enabling (and after wake) check EFER and `VM_HSAVE_PA` on every core |
+| `rhv_loglevel=N` | kernel ring log level, 0..5 (none, error, warn, info, debug, trace). Default 3 |
+| `rhv_iolog=N` | up to which level to duplicate into the system log (IOLog). Default 3 |
+| `rhv_stage=N` | **finding the step at which boot crashes**, see below. Without the flag all steps run |
+| `rhv_slow=N` | wait N seconds (at most 10) after announcing each step, to read the screen |
 
-### OpenCore пишет `Prelinked injection RyzenHV.kext - Invalid Parameter`
+### OpenCore prints `Prelinked injection RyzenHV.kext - Invalid Parameter`
 
-Кекст не внедрён и в систему не попадёт, поэтому в логе macOS не будет ни одной строки `RyzenHV`.
-Лог OpenCore лежит в корне раздела EFI (`opencore-ГГГГ-ММ-ДД-ЧЧММСС.txt`, включается `Misc → Debug → Target`).
-Самая частая причина: кекст импортирует символ, которого нет в ядре (API, написанный по памяти).
-`make kext` теперь проверяет это сам (`scripts/check-kext-symbols.sh`, сверка с работающим ядром);
-запусти его отдельно после обновления macOS: `./scripts/check-kext-symbols.sh build/RyzenHV.kext`.
-Проверено на практике: `ml_get_max_cpus` отсутствует в ядре Sequoia, из-за него OpenCore отвергал кекст.
+The kext is not injected and will not get into the system, so there will not be a single `RyzenHV` line in the macOS log.
+The OpenCore log is in the root of the EFI partition (`opencore-YYYY-MM-DD-HHMMSS.txt`, enabled with `Misc → Debug → Target`).
+The most common cause: the kext imports a symbol that does not exist in the kernel (an API written from memory).
+`make kext` now checks this itself (`scripts/check-kext-symbols.sh`, compared against the running kernel);
+run it separately after a macOS update: `./scripts/check-kext-symbols.sh build/RyzenHV.kext`.
+Confirmed in practice: `ml_get_max_cpus` does not exist in the Sequoia kernel, and OpenCore rejected the kext because of it.
 
-### Если машина перезагружается сразу после загрузки
+### If the machine reboots right after booting
 
-Сначала добавь `-v keepsyms=1 debug=0x100`: без `debug=0x100` ядро перезагружается сразу после паники и
-текст не успевает появиться. Потом иди по шагам, на каждой загрузке на один шаг дальше, и смотри на
-**последнюю строку `RyzenHV: [stage N]` на экране** (она печатается ДО выполнения шага):
+First add `-v keepsyms=1 debug=0x100`: without `debug=0x100` the kernel reboots right after the panic and
+the text has no time to appear. Then go step by step, one step further on every boot, and look at the
+**last `RyzenHV: [stage N]` line on the screen** (it is printed BEFORE the step runs):
 
-| `rhv_stage` | что выполняется |
+| `rhv_stage` | what runs |
 |---|---|
-| `0` | кекст только объявляет `start() reached` и отказывается стартовать. Если падает уже здесь, дело не в нашем коде, а в самой загрузке кекста через OpenCore |
-| `1` | + `IOService::start`, кольцевой лог |
-| `2` | + `CPUID` на каждом ядре (MSR не читаются) |
-| `3` | + чтение `VM_CR` и `EFER` на каждом ядре, то есть полная read-only проба |
-| `4` | + уведомления о сне и `registerService` (с этого шага работает `rhv-info`) |
-| `5` | + включение SVM по `rhv_enable_svm=1` (поведение по умолчанию) |
+| `0` | the kext only announces `start() reached` and refuses to start. If it already crashes here, the cause is not our code but the loading of the kext through OpenCore itself |
+| `1` | + `IOService::start`, the ring log |
+| `2` | + `CPUID` on every core (MSRs are not read) |
+| `3` | + reading `VM_CR` and `EFER` on every core, i.e. the full read-only probe |
+| `4` | + sleep notifications and `registerService` (`rhv-info` works from this step on) |
+| `5` | + enabling SVM by `rhv_enable_svm=1` (the default behavior) |
 
-Пример: `rhv_stage=2 rhv_slow=3 -v debug=0x100`. После загрузки без падения читай
+Example: `rhv_stage=2 rhv_slow=3 -v debug=0x100`. After a boot without a crash read
 `log show --last 5m --predicate 'eventMessage CONTAINS "RyzenHV"'`.
 
-Для самого ядра при отладке обычно добавляют `-v` (подробная загрузка) и `keepsyms=1` (символы в паниках).
-Часто встречается ещё `debug=0x100`, чтобы система не перезагружалась сразу после паники и можно было
-сфотографировать экран. Точное значение флагов проверь по своей версии macOS.
+For the kernel itself, when debugging, people usually add `-v` (verbose boot) and `keepsyms=1` (symbols in panics).
+`debug=0x100` is also common, so that the system does not reboot right after a panic and the screen can be
+photographed. Check the exact value of the flags for your macOS version.
 
-## Логи
+## Logs
 
-Кекст пишет в **собственный кольцевой буфер 64 КиБ** (его читают без `log show` и он не теряется, если
-системный лог переполнен) и дублирует важное в системный лог.
+The kext writes to **its own 64 KiB ring buffer** (it can be read without `log show` and it is not lost if
+the system log overflows) and duplicates the important lines into the system log.
 
 ```
-./build/rhv-info log          # весь буфер
-./build/rhv-info log -f       # читать непрерывно (как tail -f)
-sudo ./build/rhv-info level 5 # включить trace на лету, без перезагрузки
+./build/rhv-info log          # the whole buffer
+./build/rhv-info log -f       # read continuously (like tail -f)
+sudo ./build/rhv-info level 5 # turn trace on the fly, no reboot
 log show --last boot --predicate 'eventMessage CONTAINS "RyzenHV"'
 ```
 
-Формат строки:
+Line format:
 
 ```
 [   12.345678] I cpu3 SVM enabled on 16 CPUs
- ^ секунды      ^ уровень (E W I D T)   ^ номер ядра, на котором вызвали
+ ^ seconds      ^ level (E W I D T)   ^ number of the core that made the call
 ```
 
-Если буфер переполнился раньше, чем ты его прочитал, `log` напечатает, сколько байт потеряно.
+If the buffer overflowed before you read it, `log` prints how many bytes were lost.
 
-### Правила для кода кекста
+### Rules for the kext code
 
-- В `mp_rendezvous` и любом контексте с выключенными прерываниями **не логировать**. Результаты кладём в массивы, а печатаем после.
-- Перед операцией, которая может уронить ядро, используем `RHV_SYNC(...)`: строка сразу идёт в IOLog.
-  Последняя такая строка перед паникой подскажет, где упало (см. `enableAll()`).
-- `RHV_ASSERT(cond)` не паникует: пишет ошибку в лог и увеличивает счётчик `assertFailures`.
+- In `mp_rendezvous` and any context with interrupts disabled **do not log**. Put results into arrays and print afterwards.
+- Before an operation that can bring the kernel down, use `RHV_SYNC(...)`: the line goes straight to IOLog.
+  The last such line before a panic shows where it failed (see `enableAll()`).
+- `RHV_ASSERT(cond)` does not panic: it writes an error to the log and increments the `assertFailures` counter.
 
-## Счётчики
+## Counters
 
 ```
 ./build/rhv-info stats
 ```
 
-Отвечает на вопрос «этот код вообще выполнялся?»: `probeRuns`, `enableCalls`, `enableFailures`,
-`sleepEvents`/`wakeEvents`, `clientCalls`, `assertFailures`, `selftestCpusOk`, а для ВМ `vmCreates`, `vmRuns`,
-`vmExits` (все выходы, включая прерывания хоста) и `vmInvalidExits` (VMRUN отверг VMCB). См. также `docs/PHASE1.md`.
+They answer "did this code run at all?": `probeRuns`, `enableCalls`, `enableFailures`,
+`sleepEvents`/`wakeEvents`, `clientCalls`, `assertFailures`, `selftestCpusOk`, and for VMs `vmCreates`, `vmRuns`,
+`vmExits` (all exits, including host interrupts) and `vmInvalidExits` (VMRUN rejected the VMCB). See also `docs/PHASE1.md`.
 
-## Самопроверка SVM
+## SVM self-test
 
 ```
 # boot-args: rhv_enable_svm=1
@@ -94,31 +94,31 @@ sudo ./build/rhv-info selftest
 ./build/rhv-info log | tail
 ```
 
-Для каждого ядра читает `EFER` и `VM_HSAVE_PA` и сверяет с тем, что мы записали. Пример хорошего результата:
-`selftest: 16 of 16 CPUs ok`. Любое расхождение печатается как `selftest cpu N: MISMATCH ...`.
+For every core it reads `EFER` and `VM_HSAVE_PA` and compares them with what we wrote. An example of a good result:
+`selftest: 16 of 16 CPUs ok`. Any mismatch is printed as `selftest cpu N: MISMATCH ...`.
 
-## Сон и пробуждение
+## Sleep and wake
 
-Перед сном SVM выключается (`sleep: turning SVM off`), после пробуждения включается заново
-(`wake: SVM re-enabled on N CPUs`). Проверь: усыпи машину, разбуди, потом `rhv-info stats`
-(`sleepEvents` и `wakeEvents` должны вырасти) и `sudo rhv-info selftest`.
+SVM is turned off before sleep (`sleep: turning SVM off`) and turned on again after wake
+(`wake: SVM re-enabled on N CPUs`). To check: put the machine to sleep, wake it, then `rhv-info stats`
+(`sleepEvents` and `wakeEvents` must grow) and `sudo rhv-info selftest`.
 
-Если на Ryzentosh-ноутбуке сон вообще не работает независимо от этого кекста, сначала чини его, это отдельная тема.
+If sleep does not work at all on a Ryzentosh laptop regardless of this kext, fix that first, it is a separate topic.
 
-## Если загрузка сломалась
+## If booting is broken
 
-1. Загрузись с запасным EFI (без кекста), либо в меню OpenCore добавь boot-arg `-rhv_off`.
-2. После загрузки: `./scripts/collect-debug.sh`. Скрипт соберёт CPU, boot-args, логи RyzenHV и последнюю панику в один файл.
-3. Если панику не успел увидеть: добавь `-v keepsyms=1 debug=0x100`, повтори, сфотографируй экран.
-4. Пришли мне файл от скрипта и фото паники, начнём с последней строки `RHV_SYNC` в логе.
+1. Boot from the fallback EFI (without the kext), or add the boot-arg `-rhv_off` in the OpenCore menu.
+2. After booting: `./scripts/collect-debug.sh`. The script collects the CPU, boot-args, the RyzenHV logs and the last panic into one file.
+3. If you did not manage to see the panic: add `-v keepsyms=1 debug=0x100`, repeat, photograph the screen.
+4. Send the script's file and the photo of the panic; we start from the last `RHV_SYNC` line in the log.
 
-## Быстрая итерация
+## Fast iteration
 
 ```
-make kext tools DEBUG=1        # -O0 -g, уровень лога debug по умолчанию
+make kext tools DEBUG=1        # -O0 -g, debug log level by default
 ./scripts/install-to-efi.sh /Volumes/EFI
-# перезагрузка
+# reboot
 ```
 
-`DEBUG=1` собирает только кекст (`kext/Makefile`). Для разработки именно ядра с минимальным риском держи
-`rhv_enable_svm` выключенным, пока проба не выглядит правильно.
+`DEBUG=1` builds only the kext (`kext/Makefile`). For kernel development with minimal risk keep
+`rhv_enable_svm` off until the probe looks right.

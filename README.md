@@ -1,83 +1,83 @@
 # ryzen-hypervisor.framework
 
-Попытка заставить `Hypervisor.framework` работать на **Ryzentosh** (хакинтош на AMD Ryzen).
+An attempt to make `Hypervisor.framework` work on a **Ryzentosh** (a hackintosh on an AMD Ryzen).
 
-Нативный `Hypervisor.framework` на Intel-маках построен поверх Intel VT-x (VMX), поэтому на Ryzen
-`kern.hv_support` равен 0 и всё, что на него опирается (QEMU/HVF, Docker Desktop, эмуляторы
-Android, современные VMware/Parallels), не запускается. Здесь строится слой на **AMD-V (SVM)**,
-который предоставляет тот же API.
+The native `Hypervisor.framework` on Intel Macs is built on Intel VT-x (VMX), so on a Ryzen
+`kern.hv_support` is 0 and everything that depends on it (QEMU/HVF, Docker Desktop, Android
+emulators, current VMware/Parallels) does not start. This project builds a layer on **AMD-V (SVM)**
+that provides the same API.
 
-> **Статус: Windows 11 запускается в Parallels Desktop на Ryzen** (Ryzen 7 5800H, Sequoia 15.8.1, OpenCore, до 4 vCPU,
-> установка и работа гостя, клавиатура, сеть). Пройдены фазы 0–2 (SVM на всех ядрах, гость исполняет код, память процесса
-> как память гостя, NPT) и фаза 3 (слой совместимости с VMX API: QEMU/HVF грузит Linux, Parallels грузит Windows).
-> **Как установить Parallels с этим кекстом: `docs/PARALLELS.md`.** Работает на точной сборке Parallels 26.5.0 (57613).
-> **Готовая сборка без компиляции: архив из Releases и установщик `./rhv`** (кекст в EFI, Parallels, Docker, `./rhv doctor`),
-> см. `START-HERE.md` внутри архива.
-> Не проверено: сон/пробуждение, `kextunload`, час стабильности, гости кроме Windows 11. 3D-ускорение Parallels на машине
-> автора падает в драйвере Metal для NVIDIA, оставляй выключенным.
-> Если что-то падает при загрузке, начни с `docs/DEBUGGING.md` (`rhv_stage`, лог OpenCore, `check-kext-symbols.sh`).
+> **Status: Windows 11 runs in Parallels Desktop on a Ryzen** (Ryzen 7 5800H, Sequoia 15.8.1, OpenCore, up to 4 vCPUs,
+> guest installation and use, keyboard, network). Phases 0–2 are done (SVM on all cores, a guest executes code, process memory
+> as guest memory, NPT) and so is phase 3 (the VMX API compatibility layer: QEMU/HVF boots Linux, Parallels boots Windows).
+> **How to install Parallels with this kext: `docs/PARALLELS.md`.** It works on the exact Parallels build 26.5.0 (57613).
+> **A ready-made build without compiling: the archive from Releases and the `./rhv` installer** (kext into the EFI, Parallels, Docker, `./rhv doctor`),
+> see `START-HERE.md` inside the archive.
+> Not verified: sleep/wake, `kextunload`, an hour of stability, guests other than Windows 11. Parallels 3D acceleration crashes
+> inside NVIDIA's Metal driver on the author's machine, keep it off.
+> If something crashes at boot, start with `docs/DEBUGGING.md` (`rhv_stage`, the OpenCore log, `check-kext-symbols.sh`).
 
-Целевое железо: Ryzen 7 5800H (Zen 3, Cezanne, family 19h model 50h), macOS Sequoia (15), OpenCore.
+Target hardware: Ryzen 7 5800H (Zen 3, Cezanne, family 19h model 50h), macOS Sequoia (15), OpenCore.
 
-## Структура
+## Layout
 
 ```
-include/RyzenHVShared.h   ABI между кекстом, шимом и утилитами (селекторы, RHVInfo)
-include/RHVRing.h         кольцевой буфер лога (чистый C, тестируется на хосте)
-kext/                     RyzenHV.kext: SVM, лог, счётчики, сон/пробуждение, VMCB, VMRUN, NPT (Npt.hpp), IOUserClient
-shim/                     userland-слой Hypervisor.framework: hv_shim.c (перехват hv_*), rhv_core.c (семантика VMX API, кэш,
-                          несколько vCPU), rhv_iokit.c (связь с кекстом), hijack.c (внедрение в Parallels)
-tools/rhv-info/           утилита: инфо, лог, счётчики, самопроверка
-tools/rhv-guest-test/     приёмочный тест фазы 1: гость печатает строку, делает CPUID, останавливается
-tools/rhv-map-test/       приёмочный тест фазы 2: память гостя = память процесса, protect/unmap, NPF
-tools/rhv-vmx-test/       фаза 3: гость ведётся через поля VMCS, как это делает клиент Hypervisor.framework
-tools/rhv-long-test/      фаза 3: 64-бит гость с paging, x87/SSE/AVX, прерывания хоста
-tools/hvf-smoke/          фаза 3: мини-VMM на ПУБЛИЧНОМ API Hypervisor.framework, работает через шим (scripts/run-with-shim.sh)
-scripts/                  collect-debug.sh (отчёт для разбора), install-to-efi.sh, parallels-shim.sh (Parallels), qemu-hvf-test.sh, docker-hvf-test.sh
-tests/host_test.c         unit-тесты чистых функций, запускаются где угодно
-docs/                     архитектура, roadmap, Ryzentosh, отладка, реверс
+include/RyzenHVShared.h   ABI between the kext, the shim and the tools (selectors, RHVInfo)
+include/RHVRing.h         ring buffer for the log (plain C, tested on the host)
+kext/                     RyzenHV.kext: SVM, log, counters, sleep/wake, VMCB, VMRUN, NPT (Npt.hpp), IOUserClient
+shim/                     userland Hypervisor.framework layer: hv_shim.c (hv_* interposition), rhv_core.c (VMX API semantics, cache,
+                          multiple vCPUs), rhv_iokit.c (talks to the kext), hijack.c (injection into Parallels)
+tools/rhv-info/           tool: info, log, counters, self-test
+tools/rhv-guest-test/     phase 1 acceptance test: a guest prints a string, runs CPUID, halts
+tools/rhv-map-test/       phase 2 acceptance test: guest memory = process memory, protect/unmap, NPF
+tools/rhv-vmx-test/       phase 3: a guest driven through VMCS fields, the way a Hypervisor.framework client does it
+tools/rhv-long-test/      phase 3: a 64-bit guest with paging, x87/SSE/AVX, host interrupts
+tools/hvf-smoke/          phase 3: a mini-VMM on the PUBLIC Hypervisor.framework API, runs through the shim (scripts/run-with-shim.sh)
+scripts/                  collect-debug.sh (report for analysis), install-to-efi.sh, parallels-shim.sh (Parallels), qemu-hvf-test.sh, docker-hvf-test.sh
+tests/host_test.c         unit tests of the pure functions, run anywhere
+docs/                     architecture, roadmap, Ryzentosh, debugging, reverse engineering
 ```
 
-## Быстрый старт
+## Quick start
 
-1. Прочитай `docs/RYZENTOSH.md`: включи SVM в BIOS, сделай **запасную запись OpenCore без кекста**.
-2. `make test` : проверить, что чистая логика собирается (работает на любой ОС).
-3. `make kext tools` : собрать `build/RyzenHV.kext` и `build/rhv-info`.
-4. Положить кекст в `EFI/OC/Kexts`, добавить запись в `Kernel -> Add`, перезагрузиться.
-5. `./build/rhv-info` : увидеть CPU, SVM, ASID и фичи (NPT, NRIPS, VmcbClean, ...).
-6. Для включения SVM на всех ядрах добавь boot-arg `rhv_enable_svm=1`. По умолчанию кекст только читает.
-7. Что-то пошло не так: `./scripts/collect-debug.sh` соберёт всё нужное для разбора в один файл.
-   Если система не грузится, добавь boot-arg `-rhv_off` (кекст ничего не делает).
+1. Read `docs/RYZENTOSH.md`: enable SVM in the BIOS, make a **fallback OpenCore entry without the kext**.
+2. `make test`: check that the pure logic builds (works on any OS).
+3. `make kext tools`: build `build/RyzenHV.kext` and `build/rhv-info`.
+4. Put the kext into `EFI/OC/Kexts`, add an entry under `Kernel -> Add`, reboot.
+5. `./build/rhv-info`: see the CPU, SVM, ASIDs and features (NPT, NRIPS, VmcbClean, ...).
+6. To turn SVM on for all cores add the boot-arg `rhv_enable_svm=1`. By default the kext only reads.
+7. If something goes wrong, `./scripts/collect-debug.sh` gathers everything needed for analysis into one file.
+   If the system does not boot, add the boot-arg `-rhv_off` (the kext does nothing).
 
-## Диагностика
+## Diagnostics
 
 ```
 rhv-info                  CPU / SVM
-rhv-info log [-f]         кольцевой лог ядра (-f: непрерывно)
-rhv-info stats            счётчики событий
-sudo rhv-info level 0-5   уровень лога на лету
-sudo rhv-info selftest    проверить EFER/VM_HSAVE_PA на каждом ядре
+rhv-info log [-f]         kernel ring log (-f: follow)
+rhv-info stats            event counters
+sudo rhv-info level 0-5   log level on the fly
+sudo rhv-info selftest    check EFER/VM_HSAVE_PA on every core
 ```
 
-Boot-args: `-rhv_off`, `rhv_enable_svm`, `rhv_selftest`, `rhv_loglevel`, `rhv_iolog`, `rhv_stage`, `rhv_slow`. Подробности в `docs/DEBUGGING.md`.
+Boot-args: `-rhv_off`, `rhv_enable_svm`, `rhv_selftest`, `rhv_loglevel`, `rhv_iolog`, `rhv_stage`, `rhv_slow`. Details in `docs/DEBUGGING.md`.
 
-Если на шаге 5 написано `SVM: supported`, `BIOS disable: no`, `NPT: [x]`, значит фаза 0 пройдена
-и можно писать VMCB и `VMRUN` (см. `docs/ROADMAP.md`).
+If step 5 says `SVM: supported`, `BIOS disable: no`, `NPT: [x]`, phase 0 is done
+and you can write a VMCB and `VMRUN` (see `docs/ROADMAP.md`).
 
-## Документация
+## Documentation
 
-- `docs/ARCHITECTURE.md`: как устроены слои и почему так
-- `docs/ROADMAP.md`: фазы работ и критерии готовности
-- `docs/RYZENTOSH.md`: BIOS, OpenCore, как не убить систему
-- `docs/DEBUGGING.md`: boot-args, логи, счётчики, самопроверка, что делать при панике
-- `docs/PHASE1.md`: как устроен первый гость, как запустить и как читать сбои
-- `docs/PHASE2.md`: отображение памяти процесса в гостя, NPF, как запустить и как читать сбои
-- `docs/PARALLELS.md`: **установка и использование с Parallels Desktop**, отладка, ограничения
-- `docs/DOCKER.md`: Docker через Linux-гостя в QEMU/HVF (`scripts/docker-hvf-test.sh`)
-- `docs/PHASE3.md`: слой совместимости с VMX API и ход работ по QEMU и Parallels
-- `docs/REVERSING.md`: как достать и изучить родной `Hypervisor.framework`
+- `docs/ARCHITECTURE.md`: how the layers work and why
+- `docs/ROADMAP.md`: phases of work and their acceptance criteria
+- `docs/RYZENTOSH.md`: BIOS, OpenCore, how not to kill the system
+- `docs/DEBUGGING.md`: boot-args, logs, counters, self-test, what to do on a panic
+- `docs/PHASE1.md`: how the first guest works, how to run it and how to read failures
+- `docs/PHASE2.md`: mapping process memory into the guest, NPF, how to run it and how to read failures
+- `docs/PARALLELS.md`: **installation and use with Parallels Desktop**, debugging, limits
+- `docs/DOCKER.md`: Docker through a Linux guest in QEMU/HVF (`scripts/docker-hvf-test.sh`)
+- `docs/PHASE3.md`: the VMX API compatibility layer and the progress on QEMU and Parallels
+- `docs/REVERSING.md`: how to extract and study the native `Hypervisor.framework`
 
-## Лицензия
+## License
 
-Не выбрана. Если будешь переносить код из других проектов: bhyve (FreeBSD) под BSD переносить
-можно с сохранением копирайта, Linux KVM под GPL: копировать код нельзя, читать как референс можно.
+Not chosen yet. If you port code from other projects: bhyve (FreeBSD, BSD) can be ported
+with the copyright kept; Linux KVM is GPL: copying code is not allowed, reading it as a reference is.

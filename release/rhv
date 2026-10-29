@@ -34,7 +34,7 @@ bad()  { printf '  %s[FAIL]%s %s\n' "$R" "$N" "$*"; }
 warn() { printf '  %s[warn]%s %s\n' "$Y" "$N" "$*"; }
 say()  { printf '%s%s%s\n' "$B" "$*" "$N"; }
 die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
-confirm() { [ "${RHV_YES:-0}" = 1 ] && return 0; local a; read -r -p "$1 [y/N] " a; case "$a" in y|Y|yes|д|Д) return 0 ;; *) return 1 ;; esac; }
+confirm() { [ "${RHV_YES:-0}" = 1 ] && return 0; local a; read -r -p "$1 [y/N] " a; case "$a" in y|Y|yes) return 0 ;; *) return 1 ;; esac; }
 
 # Files downloaded in a browser carry the quarantine flag; Gatekeeper refuses unsigned libraries and binaries with it.
 if xattr -p com.apple.quarantine "$ROOT/qemu/bin/qemu-system-x86_64" >/dev/null 2>&1; then

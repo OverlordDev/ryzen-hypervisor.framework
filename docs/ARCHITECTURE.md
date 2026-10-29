@@ -1,76 +1,76 @@
-# Архитектура
+# Architecture
 
-## Слои
+## Layers
 
 ```
- приложение (QEMU, Docker, ...)
+ application (QEMU, Docker, ...)
         │  hv_vm_create, hv_vcpu_run, hv_vmx_vcpu_read_vmcs, ...
         ▼
- ┌─────────────────────────────── фронтенд (сменный) ──────────────────────────┐
- │ B. shim/hv_shim.c        dyld interpose, ходит в кекст через IOUserClient   │
- │ A. kernel-перехват       подмена приватных trap-ов родного фреймворка       │
+ ┌─────────────────────────────── front end (replaceable) ─────────────────────┐
+ │ B. shim/hv_shim.c        dyld interpose, talks to the kext via IOUserClient │
+ │ A. kernel interception   replacing the private traps of the native framework│
  └──────────────────────────────────────┬──────────────────────────────────────┘
                                         ▼
- ┌─────────────────────────────── core (кекст) ────────────────────────────────┐
- │ трансляция VMCS-полей и VMX exit reason  ⇄  VMCB и SVM exit code            │
- │ VM / vCPU: жизненный цикл, регистры, прерывания                             │
- │ память: hv_vm_map  →  nested page tables (NPT)                              │
- │ SVM-примитивы: EFER.SVME, VM_HSAVE_PA, VMRUN/VMSAVE/VMLOAD, ASID           │
+ ┌─────────────────────────────── core (kext) ─────────────────────────────────┐
+ │ translation of VMCS fields and VMX exit reasons  ⇄  VMCB and SVM exit codes │
+ │ VM / vCPU: life cycle, registers, interrupts                                │
+ │ memory: hv_vm_map  →  nested page tables (NPT)                              │
+ │ SVM primitives: EFER.SVME, VM_HSAVE_PA, VMRUN/VMSAVE/VMLOAD, ASID           │
  └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Главная идея: **core пишется один раз**, фронтенд можно менять. Так мы не зависим от того, насколько
-легко расшифровать приватный интерфейс ядра.
+The main idea: **the core is written once**, the front end can be swapped. That way we do not depend on how
+easy the private kernel interface is to decipher.
 
-## Почему два фронтенда
+## Why two front ends
 
-| | A. kernel-перехват | B. userland shim |
+| | A. kernel interception | B. userland shim |
 |---|---|---|
-| Совместимость | любое приложение без изменений | только то, что грузит нашу dylib |
-| Hardened runtime / SIP | не мешает | мешает (нужно ослаблять SIP/AMFI) |
-| Нужно знать приватный ABI ядра | да, реверс | нет |
-| Риск | выше (правим ядро) | ниже |
-| Первый результат | позже | быстро |
+| Compatibility | any application unchanged | only what loads our dylib |
+| Hardened runtime / SIP | does not get in the way | gets in the way (SIP/AMFI must be relaxed) |
+| Needs the private kernel ABI | yes, reverse engineering | no |
+| Risk | higher (we patch the kernel) | lower |
+| First result | later | fast |
 
-План: сначала B (быстро проверять core), потом A (чтобы Docker и прочие заработали как есть).
-Для A понадобится разобрать, какие вызовы родной фреймворк делает в ядро: `docs/REVERSING.md`.
-Сам перехват, вероятно, делается через Lilu-подобный роутинг функций ядра, но это надо проверять
-на дизассемблированном ядре, а не по памяти.
+The plan: B first (to test the core quickly), then A (so that Docker and the rest work as they are).
+For A we need to work out which calls the native framework makes into the kernel: `docs/REVERSING.md`.
+The interception itself is probably done with Lilu-style routing of kernel functions, but that has to be checked
+on the disassembled kernel, not from memory.
 
-## Самое сложное: VMX → SVM
+## The hardest part: VMX → SVM
 
-Старый x86 API `Hypervisor.framework` VMX-образный: приложения читают и пишут поля VMCS по
-числовым кодам и ждут VMX-коды выхода. Значит core обязан **эмулировать VMCS поверх VMCB**.
+The old x86 `Hypervisor.framework` API is VMX-shaped: applications read and write VMCS fields by
+numeric codes and expect VMX exit codes. So the core has to **emulate a VMCS on top of a VMCB**.
 
-Что надо переводить (коды сверять с руководствами, ниже по памяти):
+What has to be translated (check the codes against the manuals, the ones below are from memory):
 
-| Событие | VMX exit reason | SVM exit code |
+| Event | VMX exit reason | SVM exit code |
 |---|---|---|
-| внешнее прерывание | 1 | 0x60 (INTR) |
+| external interrupt | 1 | 0x60 (INTR) |
 | CPUID | 10 | 0x72 |
 | HLT | 12 | 0x78 |
-| I/O инструкция | 30 | 0x7B |
-| RDMSR / WRMSR | 31 / 32 | 0x7C (одно событие, различать по EXITINFO1) |
+| I/O instruction | 30 | 0x7B |
+| RDMSR / WRMSR | 31 / 32 | 0x7C (one event, told apart by EXITINFO1) |
 | EPT violation / NPT fault | 48 | 0x400 (NPF) |
 
-Отличия, о которые споткнёмся:
+Differences we will stumble over:
 
-- VMCS живёт за `vmread/vmwrite`, VMCB это обычная структура в памяти. Формат атрибутов сегментов разный.
-- В SVM нет аналога VMX preemption timer: таймер придётся делать на хосте.
-- EPT vs NPT: другие форматы записей и биты прав, другая квалификация нарушений.
-- Что и как перехватывать (MSR/IO bitmaps, intercept-биты в VMCB) задаём сами.
-- Виртуальные capability-MSR (`hv_vmx_read_capability`) придётся синтезировать.
+- The VMCS lives behind `vmread/vmwrite`, the VMCB is an ordinary structure in memory. The segment attribute formats differ.
+- SVM has no analogue of the VMX preemption timer: the timer has to be done on the host.
+- EPT vs NPT: different entry formats and permission bits, different violation qualification.
+- What to intercept and how (MSR/IO bitmaps, intercept bits in the VMCB) is up to us.
+- The virtual capability MSRs (`hv_vmx_read_capability`) have to be synthesized.
 
-## Решения на сейчас
+## Decisions for now
 
-- Кекст, а не DriverKit: VMRUN и MSR нужны в ring 0.
-- Загрузка через OpenCore (Kernel → Add), без подписи.
-- SVM включается только по `boot-arg rhv_enable_svm=1`. По умолчанию кекст только читает.
-- ABI кекст ⇄ userland описан в `include/RyzenHVShared.h`, меняем только с повышением `RHV_ABI_VERSION`.
+- A kext, not DriverKit: VMRUN and MSRs are needed in ring 0.
+- Loaded through OpenCore (Kernel → Add), unsigned.
+- SVM is enabled only by `boot-arg rhv_enable_svm=1`. By default the kext only reads.
+- The kext ⇄ userland ABI is described in `include/RyzenHVShared.h` and changes only together with a bump of `RHV_ABI_VERSION`.
 
-## Референсы
+## References
 
-- AMD64 Architecture Programmer's Manual, Vol. 2, глава 15 (Secure Virtual Machine)
-- Intel SDM, Vol. 3, главы 23-28 (VMX): чтобы знать, что именно эмулируем
-- bhyve, `sys/amd64/vmm/amd/` (BSD): рабочий SVM-бэкенд, можно читать и переносить с копирайтом
-- Linux KVM, `arch/x86/kvm/svm/` (GPL): только читать
+- AMD64 Architecture Programmer's Manual, Vol. 2, chapter 15 (Secure Virtual Machine)
+- Intel SDM, Vol. 3, chapters 23-28 (VMX): to know exactly what is being emulated
+- bhyve, `sys/amd64/vmm/amd/` (BSD): a working SVM back end, can be read and ported with the copyright kept
+- Linux KVM, `arch/x86/kvm/svm/` (GPL): read only

@@ -1,43 +1,43 @@
-# RyzenHV: готовая сборка
+# RyzenHV: ready-made build
 
-`Hypervisor.framework` на AMD Ryzen (хакинтош, OpenCore). Внутри всё собрано: кекст, шим, QEMU и установщик `rhv`.
-Компилировать ничего не нужно, Xcode и Homebrew не требуются.
+`Hypervisor.framework` on AMD Ryzen (hackintosh, OpenCore). Everything is built and inside: the kext, the shim, QEMU and the `rhv` installer.
+Nothing needs compiling; Xcode and Homebrew are not required.
 
-Проверено: Ryzen 7 5800H, macOS 15.8.1, OpenCore. Parallels Desktop только **26.5.0 (build 57613)**. Это экспериментальный
-проект: ставь сначала на тестовый EFI (например, на флешку) и держи рабочий EFI без кекста.
+Tested on: Ryzen 7 5800H, macOS 15.8.1, OpenCore. Parallels Desktop only **26.5.0 (build 57613)**. This is an experimental
+project: install it on a test EFI first (a USB stick, for example) and keep a working EFI without the kext.
 
-## Установка
+## Install
 
 ```bash
 tar xzf ryzenhv-*-macos-x86_64.tar.gz && cd ryzenhv-*/
-xattr -dr com.apple.quarantine .      # если архив скачан браузером
-./rhv                                 # меню
+xattr -dr com.apple.quarantine .      # if the archive was downloaded with a browser
+./rhv                                 # menu
 ```
 
-1. **`./rhv kext`** копирует `RyzenHV.kext` в EFI/OC/Kexts, добавляет запись в `config.plist` (с резервной копией и проверкой)
-   и дописывает boot-args `rhv_enable_svm=1 rhv_allow_users=1 amfi_get_out_of_my_way=0x1`. Перезагрузись с этого EFI.
-   В BIOS должен быть включён SVM Mode.
-2. **`./rhv doctor`** проверяет, что всё на месте: CPU, boot-args, кекст (его ABI должен совпадать с этой сборкой), QEMU, Parallels.
-3. Дальше нужное тебе:
-   - **Docker:** `./rhv docker up`, потом `eval "$(./rhv docker env)"` и `docker run --rm hello-world`.
-     Это маленькая Linux-ВМ (Alpine, 2 vCPU, 2 ГиБ) с `dockerd`, образы живут в `~/.ryzenhv/docker/disk.raw`.
-     Порт контейнера наружу: `./rhv docker up --port 8080`, затем `docker run -p 8080:80 nginx` и `http://127.0.0.1:8080`. Остановка: `./rhv docker down`.
-     Первый запуск скачивает около 150 МБ (ядро Alpine, пакеты, docker CLI) и занимает несколько минут.
-   - **Parallels Desktop 26.5.0:** `./rhv parallels`, потом настройки ВМ, которые он напечатает. Отмена: `./rhv parallels undo`.
+1. **`./rhv kext`** copies `RyzenHV.kext` to EFI/OC/Kexts, adds an entry to `config.plist` (with a backup and a validity check)
+   and appends the boot-args `rhv_enable_svm=1 rhv_allow_users=1 amfi_get_out_of_my_way=0x1`. Reboot from that EFI.
+   SVM Mode must be enabled in the BIOS.
+2. **`./rhv doctor`** checks that everything is in place: CPU, boot-args, the kext (its ABI must match this build), QEMU, Parallels.
+3. Then whatever you need:
+   - **Docker:** `./rhv docker up`, then `eval "$(./rhv docker env)"` and `docker run --rm hello-world`.
+     It is a small Linux VM (Alpine, 2 vCPUs, 2 GiB) running `dockerd`; images live in `~/.ryzenhv/docker/disk.raw`.
+     To reach a container port from the Mac: `./rhv docker up --port 8080`, then `docker run -p 8080:80 nginx` and `http://127.0.0.1:8080`. Stop it with `./rhv docker down`.
+     The first start downloads about 150 MB (the Alpine kernel, packages, the docker CLI) and takes a few minutes.
+   - **Parallels Desktop 26.5.0:** `./rhv parallels`, then the VM settings it prints. To undo: `./rhv parallels undo`.
 
-## Что внутри
+## What is inside
 
-| путь | что |
+| path | what |
 |---|---|
-| `rhv` | установщик и запуск |
-| `RyzenHV.kext` | кекст (AMD-V / SVM), без подписи, грузится через OpenCore |
-| `lib/libryzenhv.dylib` | шим `Hypervisor.framework` |
-| `lib/libPrlXmlModel.1.dylib` | подмена библиотеки Parallels (только build 57613) |
-| `qemu/` | QEMU 11.1.2 с HVF и user-сетью (GPL, исходники: `LICENSES/SOURCES.txt`) |
-| `bin/rhv-info` | диагностика кекста (`rhv-info`, `rhv-info log`) |
-| `docs/` | подробности: Parallels, Docker, установка на Ryzentosh |
+| `rhv` | installer and launcher |
+| `RyzenHV.kext` | the kext (AMD-V / SVM), unsigned, loaded through OpenCore |
+| `lib/libryzenhv.dylib` | the `Hypervisor.framework` shim |
+| `lib/libPrlXmlModel.1.dylib` | stand-in for a Parallels library (build 57613 only) |
+| `qemu/` | QEMU 11.1.2 with HVF and user networking (GPL, sources: `LICENSES/SOURCES.txt`) |
+| `bin/rhv-info` | kext diagnostics (`rhv-info`, `rhv-info log`) |
+| `docs/` | details: Parallels, Docker, installing on a Ryzentosh |
 
-## Если что-то не так
+## If something is wrong
 
-`./rhv doctor` говорит, что чинить. Для кекста: логи `./bin/rhv-info log`; если система не грузится, выбери в OpenCore
-запасной EFI без кекста. Проект: https://github.com/OverlordDev/ryzen-hypervisor.framework
+`./rhv doctor` says what to fix. For the kext: logs with `./bin/rhv-info log`; if the system does not boot, pick the fallback
+EFI without the kext in OpenCore. Project: https://github.com/OverlordDev/ryzen-hypervisor.framework

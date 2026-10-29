@@ -1,75 +1,75 @@
-# Ryzentosh: подготовка, загрузка, отладка
+# Ryzentosh: preparation, booting, debugging
 
-Целевая машина: Ryzen 7 5800H, macOS Sequoia, OpenCore.
+Target machine: Ryzen 7 5800H, macOS Sequoia, OpenCore.
 
-## 0. Страховка (сделай до всего остального)
+## 0. Safety net (do this before anything else)
 
-Баг в кекстах виртуализации может уронить ядро при загрузке.
+A bug in a virtualization kext can bring the kernel down at boot.
 
-- Сохрани рабочую копию `EFI/` на флешку.
-- Держи в OpenCore **вторую запись** (второй `config.plist` или профиль) **без** RyzenHV.kext.
-- Не включай `rhv_enable_svm=1` сразу. Сначала только проба.
+- Save a working copy of `EFI/` to a USB stick.
+- Keep a **second entry** in OpenCore (a second `config.plist` or a profile) **without** RyzenHV.kext.
+- Do not enable `rhv_enable_svm=1` right away. Probe only at first.
 
 ## 1. BIOS
 
-Включи SVM (на ноутбуках часто называется `SVM Mode`, может быть спрятан в расширенных меню).
-Если пункта нет, `rhv-info` покажет `BIOS disable: YES`, и из кекста это не исправить.
+Enable SVM (on laptops it is often called `SVM Mode` and may be hidden in advanced menus).
+If there is no such option, `rhv-info` shows `BIOS disable: YES`, and the kext cannot fix that.
 
-## 2. Сборка
+## 2. Building
 
 ```
-make test           # чистая логика, должна пройти
-make kext tools     # на самом хакинтоше, нужен Xcode / Command Line Tools
+make test           # the pure logic, must pass
+make kext tools     # on the hackintosh itself, needs Xcode / Command Line Tools
 ```
 
-`kext/Makefile` best effort. Если упадёт, пришли ошибку или собери кекст через Xcode-проект.
+`kext/Makefile` is best effort. If it fails, send the error or build the kext with an Xcode project.
 
 ## 3. OpenCore: Kernel → Add
 
-Скопируй `build/RyzenHV.kext` в `EFI/OC/Kexts/`. Добавь в `config.plist` запись:
+Copy `build/RyzenHV.kext` to `EFI/OC/Kexts/`. Add an entry to `config.plist`:
 
-| поле | значение |
+| field | value |
 |---|---|
 | Arch | Any |
 | BundlePath | RyzenHV.kext |
 | Comment | RyzenHV |
 | Enabled | true |
 | ExecutablePath | Contents/MacOS/RyzenHV |
-| MinKernel / MaxKernel | пусто |
+| MinKernel / MaxKernel | empty |
 | PlistPath | Contents/Info.plist |
 
-Порядок: после Lilu и остальных ядерных кекстов. Зависимостей от Lilu сейчас нет.
+Order: after Lilu and the other kernel kexts. There is no dependency on Lilu at the moment.
 
-## 4. Проверка
+## 4. Checking
 
 ```
 ./build/rhv-info
 ./build/rhv-info log
 ```
 
-В логе ожидай строки вида `svm=1 disabledByBios=0 ...`, затем `probe only; add boot-arg rhv_enable_svm=1 ...`.
-Всё про логи, счётчики и самопроверку в `docs/DEBUGGING.md`. Если что-то не так, `./scripts/collect-debug.sh`
-соберёт отчёт для разбора.
+In the log expect lines like `svm=1 disabledByBios=0 ...`, then `probe only; add boot-arg rhv_enable_svm=1 ...`.
+Everything about logs, counters and the self-test is in `docs/DEBUGGING.md`. If something is wrong, `./scripts/collect-debug.sh`
+gathers a report for analysis.
 
-Что читать из вывода:
+How to read the output:
 
-| вывод | значит |
+| output | means |
 |---|---|
-| `SVM: NOT supported` | процессор/прошивка не показывает SVM; проверь, что в CPUID не маскируется |
-| `BIOS disable: YES` | включить SVM в BIOS |
-| `NPT: [ ]` | без nested paging проект не имеет смысла (на Zen 3 такого быть не должно) |
-| `usable N < CPUs` | асимметричная конфигурация; кекст откажется включать SVM |
+| `SVM: NOT supported` | the CPU/firmware does not show SVM; check that it is not masked in CPUID |
+| `BIOS disable: YES` | enable SVM in the BIOS |
+| `NPT: [ ]` | without nested paging the project makes no sense (this should not happen on Zen 3) |
+| `usable N < CPUs` | an asymmetric configuration; the kext refuses to enable SVM |
 
-## 5. Включение SVM
+## 5. Enabling SVM
 
-Добавь boot-args `rhv_enable_svm=1 rhv_selftest=1` (`Misc → Boot → boot-args`). В логе должно быть
-`SVM enabled on N CPUs` и `selftest: N of N CPUs ok`; то же даёт `sudo ./build/rhv-info selftest`.
-Если система стабильно работает, фаза 0 пройдена. Если после включения что-то ломается, добавь `-rhv_off`.
+Add the boot-args `rhv_enable_svm=1 rhv_selftest=1` (`Misc → Boot → boot-args`). The log should contain
+`SVM enabled on N CPUs` and `selftest: N of N CPUs ok`; `sudo ./build/rhv-info selftest` gives the same.
+If the system keeps working stably, phase 0 is done. If something breaks after enabling it, add `-rhv_off`.
 
-## 6. Особенности Ryzentosh
+## 6. Ryzentosh specifics
 
-- **Подделка CPUID.** Патчи AMD Vanilla заставляют ядро считать, что стоит Intel. Мы читаем `cpuid` напрямую
-  в кексте, поэтому видим настоящий AMD. Тем не менее проверь по `rhv-info`, что `CPU: AMD family 0x19 model 0x50`.
-- **Сон/пробуждение.** Состояние SVM после S3 теряется, поэтому кекст выключает SVM перед сном и включает после.
-  Эта логика не проверена на железе: после сна смотри `rhv-info stats` и `sudo rhv-info selftest`.
-- **Выгрузка.** `kextunload` вызывает `disableAll()`, но с OpenCore-инжектом выгрузка обычно недоступна. Для сброса просто перезагрузись.
+- **Spoofed CPUID.** The AMD Vanilla patches make the kernel believe an Intel CPU is installed. We read `cpuid` directly
+  in the kext, so we see the real AMD. Still, check in `rhv-info` that it says `CPU: AMD family 0x19 model 0x50`.
+- **Sleep/wake.** SVM state is lost after S3, so the kext turns SVM off before sleep and on again after it.
+  This logic has not been verified on hardware: after sleep look at `rhv-info stats` and `sudo rhv-info selftest`.
+- **Unloading.** `kextunload` calls `disableAll()`, but with an OpenCore-injected kext unloading is usually unavailable. To reset, just reboot.

@@ -1,23 +1,23 @@
-# Фаза 1: первый гость
+# Phase 1: the first guest
 
-Цель: запустить 25 байт real-mode кода внутри настоящей SVM-виртуальной машины. Гость печатает строку
-через `OUT`, делает `CPUID` и останавливается по `HLT`. Userland играет роль «железа».
+Goal: run 25 bytes of real-mode code inside a real SVM virtual machine. The guest prints a string
+through `OUT`, executes `CPUID` and stops on `HLT`. Userland plays the role of the "hardware".
 
-> **Статус: пройдена на железе (5800H): `rhv-guest-test` печатает `PASS`, 24 выхода, `vmInvalidExits 0`.** Ниже исходное предупреждение, оставлено как напоминание, что это путь к панике ядра при изменениях. Ничего из этого не исполнялось на реальном Ryzen. Это первый код,
-> который сам входит в гостя через `VMRUN`; ошибка здесь это паника ядра, а не сообщение об ошибке.
-> Не запускай, пока фаза 0 не прошла на твоей машине (`rhv-info` зелёный, `selftest` N of N).
+> **Status: done on hardware (5800H): `rhv-guest-test` prints `PASS`, 24 exits, `vmInvalidExits 0`.** The original warning below is kept as a reminder that this path leads to a kernel panic when changed. None of this had run on a real Ryzen at the time of writing. This is the first code
+> that enters a guest by itself through `VMRUN`; a mistake here is a kernel panic, not an error message.
+> Do not run it until phase 0 passed on your machine (`rhv-info` green, `selftest` N of N).
 
-## Как запустить
+## How to run
 
 ```
-# boot-args: rhv_enable_svm=1 rhv_selftest=1 (и запасной EFI на флешке!)
+# boot-args: rhv_enable_svm=1 rhv_selftest=1 (and a fallback EFI on a USB stick!)
 make kext tools DEBUG=1
 sudo ./build/rhv-guest-test
-./build/rhv-info log           # что видело ядро
+./build/rhv-info log           # what the kernel saw
 ./build/rhv-info stats         # vmCreates, vmRuns, vmExits, vmInvalidExits
 ```
 
-Ожидаемый вывод:
+Expected output:
 
 ```
 VM created, 1024 KiB guest RAM
@@ -29,79 +29,79 @@ Hello from the guest!
 PASS: output, CPUID and HLT all handled (24 exits)
 ```
 
-24 выхода: 22 байта через `OUT` (21 символ + `\n`), `CPUID`, `HLT`. Если гость проработал дольше таймслайса, добавятся выходы `TIMESLICE`.
+24 exits: 22 bytes through `OUT` (21 characters + `\n`), `CPUID`, `HLT`. If the guest ran longer than a time slice, `TIMESLICE` exits are added.
 
-## Что делает код
+## What the code does
 
-| файл | роль |
+| file | role |
 |---|---|
-| `kext/Source/VMCB.hpp` | структура VMCB, биты перехватов, коды выходов. Смещения проверяются `static_assert` (`make test`) |
-| `kext/Source/SvmRun.S` | `rhv_svm_vmrun`: `clgi`, `vmsave`/`vmload` хоста и гостя, загрузка и сохранение GPR, `vmrun`, `stgi` |
-| `kext/Source/PhysMem.cpp` | выделение физически непрерывных страниц для VMCB, битовых карт и NPT |
-| `kext/Source/Vm.cpp` | ВМ: сброс в real mode, NPT на 1 МиБ, цикл запуска, классификация выходов |
-| `kext/Source/RyzenHVUserClient.cpp` | `VmCreate/Destroy/Reset/SetRegs/GetRegs/Run`, отображение памяти гостя в процесс |
-| `tools/rhv-guest-test` | тестовый гость и обработчик выходов |
+| `kext/Source/VMCB.hpp` | the VMCB structure, intercept bits, exit codes. Offsets are checked by `static_assert` (`make test`) |
+| `kext/Source/SvmRun.S` | `rhv_svm_vmrun`: `clgi`, host and guest `vmsave`/`vmload`, loading and saving GPRs, `vmrun`, `stgi` |
+| `kext/Source/PhysMem.cpp` | allocation of physically contiguous pages for the VMCB, bitmaps and NPT |
+| `kext/Source/Vm.cpp` | the VM: reset into real mode, NPT for 1 MiB, the run loop, exit classification |
+| `kext/Source/RyzenHVUserClient.cpp` | `VmCreate/Destroy/Reset/SetRegs/GetRegs/Run`, mapping guest memory into the process |
+| `tools/rhv-guest-test` | the test guest and the exit handler |
 
-> **Исправлено в фазе 3:** первые версии входили в гостя с выключенными прерываниями хоста (`IF=0`), а при
-> `V_INTR_MASKING` физические прерывания маскирует именно `IF` хоста. Гость работал с заблокированными прерываниями
-> этого ядра, поэтому таймслайс из описания ниже не срабатывал. Нашлось по счётчикам: `vmRuns == vmExits` при 100 мс
-> работы гостя. Теперь `SvmRun.S` делает `sti` непосредственно перед `vmrun` и `cli` сразу после выхода (так же делает KVM).
+> **Fixed in phase 3:** the first versions entered the guest with host interrupts disabled (`IF=0`), and with
+> `V_INTR_MASKING` physical interrupts are masked precisely by the host's `IF`. The guest ran with this core's interrupts
+> blocked, so the time slice described below did not fire. It was found from the counters: `vmRuns == vmExits` with 100 ms
+> of guest running. Now `SvmRun.S` does `sti` right before `vmrun` and `cli` right after the exit (KVM does the same).
 
-### Цикл запуска (`Vm::run`)
+### The run loop (`Vm::run`)
 
-1. Выключить прерывания хоста (`ml_set_interrupts_enabled(0)`).
-2. Убедиться, что SVM включён на всех ядрах (`activeOnAllUsable`). Проверка именно при выключенных
-   прерываниях: сон или выгрузка не могут выключить SVM, пока это ядро не ответит на rendezvous.
-3. `rhv_svm_vmrun`. Гость выполняется, пока не случится перехваченное событие.
-4. Вернуть прерывания. Если выход был по внешнему прерыванию (`INTR`/`NMI`), оно обрабатывается хостом
-   прямо здесь, и цикл продолжается. Через ~10 мс возвращаемся в userland с `RHV_EXIT_TIMESLICE`,
-   чтобы процесс можно было прервать сигналом.
-5. Остальные выходы (`HLT`, `IO`, `CPUID`, `MSR`, `NPF`, ...) уходят в userland без эмуляции в ядре.
+1. Disable host interrupts (`ml_set_interrupts_enabled(0)`).
+2. Make sure SVM is enabled on all cores (`activeOnAllUsable`). The check is done with interrupts disabled on purpose:
+   sleep or unload cannot turn SVM off until this core answers the rendezvous.
+3. `rhv_svm_vmrun`. The guest runs until an intercepted event happens.
+4. Restore interrupts. If the exit was caused by an external interrupt (`INTR`/`NMI`), the host handles it
+   right here and the loop continues. After ~10 ms we return to userland with `RHV_EXIT_TIMESLICE`
+   so that the process can be interrupted by a signal.
+5. The other exits (`HLT`, `IO`, `CPUID`, `MSR`, `NPF`, ...) go to userland without emulation in the kernel.
 
-### Что перехватывается
+### What is intercepted
 
-Всё, что может навредить хосту или должно решаться userland: `CPUID`, `HLT`, **все** порты ввода-вывода
-и **все** MSR (битовые карты из единиц), `INVD`, `WBINVD`, `MONITOR/MWAIT`, чтения и записи **всех** DR,
-команды SVM (`VMRUN`, `VMLOAD`, ...), `SHUTDOWN` (тройная ошибка; без перехвата она перезагрузила бы
-всю машину), а также `INTR`, `NMI`, `SMI`, `INIT`. `V_INTR_MASKING` включён: `EFLAGS.IF` гостя не влияет на прерывания хоста.
+Everything that can harm the host or has to be decided by userland: `CPUID`, `HLT`, **all** I/O ports
+and **all** MSRs (bitmaps of ones), `INVD`, `WBINVD`, `MONITOR/MWAIT`, reads and writes of **all** DRs,
+the SVM instructions (`VMRUN`, `VMLOAD`, ...), `SHUTDOWN` (a triple fault; without interception it would reboot
+the whole machine), and also `INTR`, `NMI`, `SMI`, `INIT`. `V_INTR_MASKING` is on: the guest's `EFLAGS.IF` does not affect host interrupts.
 
-### Память гостя
+### Guest memory
 
-1 МиБ на гостевых физических адресах `0 .. 0xFFFFF`, обычная wired-память ядра, не непрерывная. NPT
-(PML4 → PDPT → PD → PT, записи `P|RW|US`) отображает её постранично. Без NPT гость в real mode читал бы
-физическую память хоста напрямую, поэтому минимальный NPT понадобился уже здесь, а не в фазе 2.
-Обращение за пределы 1 МиБ даёт `RHV_EXIT_NPF` с адресом в `info2`.
+1 MiB at guest physical addresses `0 .. 0xFFFFF`, ordinary wired kernel memory, not contiguous. The NPT
+(PML4 → PDPT → PD → PT, entries `P|RW|US`) maps it page by page. Without NPT a real-mode guest would read
+the host's physical memory directly, so a minimal NPT was needed already here, not in phase 2.
+An access beyond 1 MiB gives `RHV_EXIT_NPF` with the address in `info2`.
 
-Userland отображает эту память в свой процесс через `IOConnectMapMemory64` и пишет код гостя напрямую.
+Userland maps this memory into its process with `IOConnectMapMemory64` and writes the guest code directly.
 
-## Как читать сбои
+## How to read failures
 
-| симптом | что это значит |
+| symptom | what it means |
 |---|---|
-| `VmCreate failed: 0x...` | нет root, или SVM не включён на всех ядрах (`rhv_enable_svm=1`), или нет NPT/NRIPS. Причина в `rhv-info log` |
-| `FAIL ... INVALID` | `VMRUN` отверг VMCB. В логе `VMCB dump`: проверь `efer` (бит `SVME`), `asid` (не 0), перехват `VMRUN` в `v4`, `nested_ctl`, физические адреса |
-| `unexpected exit: SHUTDOWN` | гость ушёл в тройную ошибку: неверный код гостя или неверное состояние сброса |
-| `unexpected exit: NPF` | гость обратился к несуществующей гостевой памяти; `info2` это адрес |
-| `unexpected exit: UNHANDLED` | включён перехват, которого тест не ждёт; код выхода смотри по таблице C в мануале AMD |
-| паника, потом перезагрузка | последняя строка `RHV_SYNC` в логе покажет, на каком шаге: `first VMRUN` значит упало внутри `vmrun` или сразу после |
-| система зависла | сразу на `VMRUN`: смотри асм-часть (`SvmRun.S`), вероятнее всего потеря состояния хоста |
+| `VmCreate failed: 0x...` | no root, or SVM is not enabled on all cores (`rhv_enable_svm=1`), or no NPT/NRIPS. The cause is in `rhv-info log` |
+| `FAIL ... INVALID` | `VMRUN` rejected the VMCB. In the log, `VMCB dump`: check `efer` (the `SVME` bit), `asid` (not 0), the `VMRUN` intercept in `v4`, `nested_ctl`, physical addresses |
+| `unexpected exit: SHUTDOWN` | the guest went into a triple fault: wrong guest code or wrong reset state |
+| `unexpected exit: NPF` | the guest accessed guest memory that does not exist; `info2` is the address |
+| `unexpected exit: UNHANDLED` | an intercept is on that the test does not expect; look up the exit code in table C of the AMD manual |
+| panic, then reboot | the last `RHV_SYNC` line in the log shows the step: `first VMRUN` means it crashed inside `vmrun` or right after |
+| the system hangs | right at `VMRUN`: look at the assembly part (`SvmRun.S`), most likely the host state was lost |
 
-Для паник добавь `-v keepsyms=1 debug=0x100` и сфотографируй экран, потом `-rhv_off` и `scripts/collect-debug.sh`.
+For panics add `-v keepsyms=1 debug=0x100` and photograph the screen, then `-rhv_off` and `scripts/collect-debug.sh`.
 
-## Что не сделано, и это важно
+## What is not done, and it matters
 
-- **FPU/SSE/AVX состояние не переключается.** Если гость выполнит SSE-инструкцию, он испортит регистры
-  хоста. Тестовый гость их не использует. Нужно в фазе 3 (XSAVE/XRSTOR вокруг `VMRUN`).
-- **Нет защиты от спекулятивных атак** (IBPB, очистка буферов и т.п.). Для запуска недоверенного гостя
-  это недопустимо; для разработки терпимо.
-- **Одна ВМ и один vCPU на клиента, только root, фиксированный 1 МиБ.** Намеренно, чтобы сузить поверхность отладки.
-- **Нет инъекции прерываний и таймеров гостя.** Гость не может получать прерывания (фаза 3).
-- **Смещения VMCB и биты перехватов выписаны по памяти** из AMD APM Vol. 2 (Appendix B, глава 15) и сверены
-  только на согласованность (`make test`). Сверь с мануалом, когда будешь читать код: именно здесь тихая ошибка стоит дороже всего.
-- **`CR2` хоста** сохраняется и восстанавливается вокруг `VMRUN`, но других неподменяемых состояний хоста
-  (например, `TSC_AUX`, `XCR0`) мы не трогаем.
+- **FPU/SSE/AVX state is not switched.** If the guest executes an SSE instruction, it corrupts the host's registers.
+  The test guest does not use them. Needed in phase 3 (XSAVE/XRSTOR around `VMRUN`).
+- **No protection against speculative attacks** (IBPB, buffer clearing, etc.). For running an untrusted guest
+  this is unacceptable; for development it is tolerable.
+- **One VM and one vCPU per client, root only, a fixed 1 MiB.** On purpose, to narrow the debugging surface.
+- **No injection of interrupts and guest timers.** The guest cannot receive interrupts (phase 3).
+- **The VMCB offsets and intercept bits were written down from memory** from AMD APM Vol. 2 (Appendix B, chapter 15) and checked
+  for consistency only (`make test`). Check them against the manual when you read the code: this is where a silent mistake costs the most.
+- **The host's `CR2`** is saved and restored around `VMRUN`, but other host state that is not swapped
+  (for example `TSC_AUX`, `XCR0`) we do not touch.
 
-## Критерий готовности фазы
+## Acceptance criterion of the phase
 
-`sudo rhv-guest-test` печатает `PASS`, а `rhv-info stats` показывает `vmInvalidExits 0`. После этого
-запусти его десятки раз подряд и проверь, что система стабильна. Только тогда переходим к фазе 2.
+`sudo rhv-guest-test` prints `PASS`, and `rhv-info stats` shows `vmInvalidExits 0`. After that
+run it dozens of times in a row and check that the system is stable. Only then do we move on to phase 2.

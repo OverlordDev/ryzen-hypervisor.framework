@@ -1,74 +1,74 @@
 # Roadmap
 
-Каждая фаза имеет проверяемый критерий готовности. Не переходим дальше, пока он не выполнен на железе.
+Each phase has a verifiable acceptance criterion. We do not move on until it is met on hardware.
 
-## Фаза 0: диагностика
+## Phase 0: diagnostics
 
-- [x] Скелет репозитория, ABI, unit-тесты чистых функций
-- [x] Кекст: проба CPUID/MSR на всех ядрах, IOService, IOUserClient
-- [x] Кекст: opt-in включение `EFER.SVME` + `VM_HSAVE_PA` на каждом ядре
-- [x] Утилита `rhv-info` (инфо, лог, счётчики, уровень лога, самопроверка)
-- [x] Кольцевой лог ядра с уровнями, счётчики событий, `RHV_SYNC` перед опасными операциями
-- [x] Аварийный выключатель `-rhv_off`, самопроверка `rhv_selftest`
-- [x] Отключение/включение SVM при сне и пробуждении (не проверено на железе)
-- [x] Скрипты `collect-debug.sh` и `install-to-efi.sh`
-- [x] **Собрать на Ryzentosh**: `make test tools shim kext` проходит на Sequoia 15.8.1 (SDK 26.2), символы кекста резолвятся против ядра 24.6 (`kmutil libraries`)
-- [x] Загрузить кекст, `rhv-info` показывает SVM supported и NPT (5800H: family 0x19 model 0x50, 16 ядер, 32768 ASID)
-- [x] С `rhv_enable_svm=1` кекст включает SVM на всех ядрах: `selftest: 16 of 16 CPUs ok`, система стабильна. Час под нагрузкой и `kextunload` ещё не проверены
+- [x] Repository skeleton, ABI, unit tests of the pure functions
+- [x] Kext: CPUID/MSR probe on all cores, IOService, IOUserClient
+- [x] Kext: opt-in enabling of `EFER.SVME` + `VM_HSAVE_PA` on every core
+- [x] The `rhv-info` tool (info, log, counters, log level, self-test)
+- [x] Kernel ring log with levels, event counters, `RHV_SYNC` before dangerous operations
+- [x] Emergency switch `-rhv_off`, the `rhv_selftest` self-test
+- [x] SVM disable/enable on sleep and wake (not verified on hardware)
+- [x] The `collect-debug.sh` and `install-to-efi.sh` scripts
+- [x] **Build on a Ryzentosh**: `make test tools shim kext` passes on Sequoia 15.8.1 (SDK 26.2), the kext's symbols resolve against kernel 24.6 (`kmutil libraries`)
+- [x] Load the kext, `rhv-info` shows SVM supported and NPT (5800H: family 0x19 model 0x50, 16 cores, 32768 ASIDs)
+- [x] With `rhv_enable_svm=1` the kext enables SVM on all cores: `selftest: 16 of 16 CPUs ok`, the system is stable. An hour under load and `kextunload` are not verified yet
 
-**Готово, когда:** `rhv-info` показывает `active on N` = числу ядер, система живёт час под нагрузкой.
+**Done when:** `rhv-info` shows `active on N` = the number of cores, and the system lives for an hour under load.
 
-## Фаза 1: первый гость (пройдена на железе)
+## Phase 1: the first guest (done on hardware)
 
-Подробности и инструкция: `docs/PHASE1.md`.
+Details and instructions: `docs/PHASE1.md`.
 
-- [x] VMCB со статическими проверками смещений (`tests/vmcb_layout.cpp`)
-- [x] Цикл `VMRUN` / `#VMEXIT`, GIF, `VMSAVE`/`VMLOAD` хоста и гостя (`SvmRun.S`)
-- [x] Гость в real mode; выходы `HLT`, `OUT`, `CPUID`
-- [x] Выход обрабатывается в userland через IOUserClient (`VmRun`, `VmGetRegs`, `VmSetRegs`)
-- [x] Минимальный NPT на 1 МиБ памяти гостя (вынесено из фазы 2: без него гость видел бы физическую память хоста)
-- [x] Таймслайс ~10 мс, чтобы процесс с гостем можно было прервать
-- [x] **Запустить на железе:** `sudo rhv-guest-test` печатает `PASS` (24 выхода, vmInvalidExits 0)
-- [ ] Сверить смещения и биты VMCB с AMD APM Vol. 2
-- [ ] 50 запусков подряд без паники и без `vmInvalidExits`
+- [x] VMCB with static offset checks (`tests/vmcb_layout.cpp`)
+- [x] The `VMRUN` / `#VMEXIT` loop, GIF, host and guest `VMSAVE`/`VMLOAD` (`SvmRun.S`)
+- [x] A real-mode guest; `HLT`, `OUT`, `CPUID` exits
+- [x] Exits are handled in userland through the IOUserClient (`VmRun`, `VmGetRegs`, `VmSetRegs`)
+- [x] A minimal NPT for 1 MiB of guest memory (moved up from phase 2: without it the guest would see the host's physical memory)
+- [x] A ~10 ms time slice so that the process with the guest can be interrupted
+- [x] **Run on hardware:** `sudo rhv-guest-test` prints `PASS` (24 exits, vmInvalidExits 0)
+- [ ] Check the VMCB offsets and bits against AMD APM Vol. 2
+- [ ] 50 runs in a row without a panic and without `vmInvalidExits`
 
-**Готово, когда:** тестовый гость печатает строку через `OUT`, получает ответ на `CPUID` и останавливается по `HLT`.
+**Done when:** the test guest prints a string via `OUT`, gets an answer to `CPUID` and stops on `HLT`.
 
-## Фаза 2: память (пройдена на железе)
+## Phase 2: memory (done on hardware)
 
-Подробности и инструкция: `docs/PHASE2.md`.
+Details and instructions: `docs/PHASE2.md`.
 
-- [x] NPT на 4 КиБ страницах для произвольных гостевых адресов до 2^48, чистый C++ (`Npt.hpp`), хост-тесты с ASan/UBSan, инжекцией отказов аллокатора и независимым обходом таблиц
-- [x] `VmMap` / `VmUnmap` / `VmProtect` (аналог `hv_vm_map` / `hv_vm_unmap` / `hv_vm_protect`), в том числе частичный unmap
-- [x] Закрепление страниц процесса (`IOMemoryDescriptor::prepare`), открепление при unmap и при гибели ВМ
-- [x] NPF с причиной (`rhv_npf_*`), счётчики, ВМ без встроенной памяти (`RHV_VMCREATE_NO_RAM`)
-- [x] **Запустить на железе:** `sudo rhv-map-test` печатает `PASS: all stages`
-- [ ] ASID и выборочный сброс TLB (сейчас сбрасывается всё на каждом `VMRUN`)
-- [ ] Гость с paging в long mode исполняет код из замапленной памяти (нужны FPU/прерывания из фазы 3)
+- [x] NPT with 4 KiB pages for arbitrary guest addresses up to 2^48, plain C++ (`Npt.hpp`), host tests with ASan/UBSan, allocator failure injection and an independent table walk
+- [x] `VmMap` / `VmUnmap` / `VmProtect` (the analogues of `hv_vm_map` / `hv_vm_unmap` / `hv_vm_protect`), including partial unmap
+- [x] Pinning of process pages (`IOMemoryDescriptor::prepare`), unpinning on unmap and when the VM dies
+- [x] NPF with a reason (`rhv_npf_*`), counters, a VM without built-in memory (`RHV_VMCREATE_NO_RAM`)
+- [x] **Run on hardware:** `sudo rhv-map-test` prints `PASS: all stages`
+- [ ] ASIDs and selective TLB flush (everything is flushed on every `VMRUN` for now)
+- [ ] A guest with paging in long mode executes code from mapped memory (needs the FPU/interrupts of phase 3)
 
-**Готово, когда:** `rhv-map-test` проходит на железе, а гость с paging (long mode) исполняет код из замапленной памяти.
+**Done when:** `rhv-map-test` passes on hardware, and a guest with paging (long mode) executes code from mapped memory.
 
-## Фаза 3: VMX-совместимость (в работе: этапы 1–5 пройдены на железе, дальше QEMU, см. `docs/PHASE3.md`)
+## Phase 3: VMX compatibility (in progress: stages 1–5 done on hardware, QEMU next, see `docs/PHASE3.md`)
 
-- [x] Таблица соответствия полей VMCS → VMCB, чтение/запись через `hv_vmx_vcpu_*` (в ядре: `VmcsRead`/`VmcsWrite`; `rhv-vmx-test` PASS)
-- [x] Синтез VMX exit reason и qualification (I/O, MSR, CPUID, HLT, EPT-нарушение, исключения, CR/DR)
-- [ ] Эмуляция `hv_vmx_read_capability`
-- [x] Инъекция прерываний (`event_inj`, окно прерываний), хост-прерывания доходят до ядра во время работы гостя; [ ] таймер, `hv_vcpu_interrupt` из другого потока
-- [x] x87/SSE/AVX и XCR0 гостя и хоста (`rhv-long-test`), long mode с paging
-- [x] Шим форвардит основной API в кекст (`hvf-smoke` на публичном API PASS)
+- [x] A table mapping VMCS fields → VMCB, reading/writing through `hv_vmx_vcpu_*` (in the kernel: `VmcsRead`/`VmcsWrite`; `rhv-vmx-test` PASS)
+- [x] Synthesis of VMX exit reason and qualification (I/O, MSR, CPUID, HLT, EPT violation, exceptions, CR/DR)
+- [ ] Emulation of `hv_vmx_read_capability`
+- [x] Interrupt injection (`event_inj`, interrupt window), host interrupts reach the kernel while the guest runs; [ ] timer, `hv_vcpu_interrupt` from another thread
+- [x] Guest and host x87/SSE/AVX and XCR0 (`rhv-long-test`), long mode with paging
+- [x] The shim forwards the main API to the kext (`hvf-smoke` on the public API PASS)
 
-**Готово, когда:** QEMU с `-accel hvf` грузит Linux до шелла.
+**Done when:** QEMU with `-accel hvf` boots Linux to a shell.
 
-## Фаза 4: совместимость и стабильность
+## Phase 4: compatibility and stability
 
-- [ ] Фронтенд A: перехват на уровне ядра, работают приложения без `DYLD_INSERT_LIBRARIES`
+- [ ] Front end A: interception at kernel level, applications work without `DYLD_INSERT_LIBRARIES`
 - [ ] Docker Desktop / Android Emulator
-- [ ] Сон/пробуждение (S3): проверить на железе (код есть, см. фазу 0), добавить сохранение состояния ВМ
-- [ ] Модель доступа (кто может создавать ВМ), лимиты ресурсов
-- [ ] Совместимость с новыми патчами AMD Vanilla
+- [ ] Sleep/wake (S3): verify on hardware (the code exists, see phase 0), add saving of VM state
+- [ ] Access model (who may create VMs), resource limits
+- [ ] Compatibility with new AMD Vanilla patches
 
-## Риски
+## Risks
 
-- Первые краши ядра неизбежны. Отладка: serial/netdump со второй машины, либо хотя бы запасная запись OpenCore.
-- Приватный ABI между фреймворком и ядром может отличаться между версиями macOS.
-- Apple сворачивает поддержку Intel, поэтому горизонт жизни проекта ограничен. Зато SVM, NPT и kernel-программирование стоят этого сами по себе.
+- The first kernel crashes are unavoidable. Debugging: serial/netdump from a second machine, or at least a fallback OpenCore entry.
+- The private ABI between the framework and the kernel may differ between macOS versions.
+- Apple is winding down Intel support, so the project's horizon is limited. But SVM, NPT and kernel programming are worth it on their own.
