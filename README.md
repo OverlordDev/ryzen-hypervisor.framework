@@ -81,5 +81,8 @@ and you can write a VMCB and `VMRUN` (see `docs/ROADMAP.md`).
 
 ## License
 
-Not chosen yet. If you port code from other projects: bhyve (FreeBSD, BSD) can be ported
-with the copyright kept; Linux KVM is GPL: copying code is not allowed, reading it as a reference is.
+MIT, see `LICENSE`. You may use, change and redistribute the code, also in your own projects, as long as the copyright notice
+and the license text stay with it, so the author is always credited. The bundle ships QEMU, which has its own licenses
+(`LICENSES/`). The repository contains nothing from Parallels or Docker. If you port code from other projects, keep their
+copyright: bhyve (FreeBSD, BSD) can be ported with its copyright kept; Linux KVM is GPL: copying code is not allowed,
+reading it as a reference is.
