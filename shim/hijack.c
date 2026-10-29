@@ -20,9 +20,12 @@
 #include <mach-o/getsect.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include "rhv_patch.h"
 
 #ifndef RHV_HIJACK_PROCESS
 #define RHV_HIJACK_PROCESS "prl_vm_app"
@@ -34,6 +37,8 @@ struct rhv_bind {
 };
 
 extern const struct mach_header_64 _mh_dylib_header;
+void rhv_hijack_log(const char *msg);
+static void patch_vendor_check(const struct mach_header *mh, const char *what);
 void rhv_shim_init(void);
 
 static const struct rhv_bind *g_binds;
@@ -81,6 +86,8 @@ static void on_image(const struct mach_header *mh, intptr_t slide)
     if (dladdr(mh, &info) && info.dli_fname &&
         (strncmp(info.dli_fname, "/System/", 8) == 0 || strncmp(info.dli_fname, "/usr/lib/", 9) == 0))
         return;
+    if (info.dli_fname && strstr(info.dli_fname, "/libMonitor.dylib"))
+        patch_vendor_check(mh, "libMonitor");
 
     const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
     const struct symtab_command *symtab_cmd = NULL;
@@ -121,33 +128,20 @@ static void on_image(const struct mach_header *mh, intptr_t slide)
     }
 }
 
-void rhv_hijack_log(const char *msg);
 
 /*
- * Parallels refuses a host whose CPUID vendor is not GenuineIntel, in prl_vm_app itself: a `je` after the comparison
- * (and the same code in libMonitor, which the private copy patches in its file). prl_vm_app cannot be changed on disk,
- * its signature is what the dispatcher checks, so the branch is made unconditional in memory instead. The bytes are
- * checked first: a different build of Parallels is left alone.
+ * Parallels refuses a host whose CPUID vendor is not GenuineIntel, in prl_vm_app itself and in libMonitor: a `je` after the
+ * comparison. prl_vm_app cannot be changed on disk (the dispatcher checks its signature) and libMonitor does not need to
+ * be either, so the branch is made unconditional in memory. The code is found by the bytes around the branch
+ * (shim/rhv_patch.c), not by an address: it is patched only when the pattern is there exactly once, and another build of
+ * Parallels is left alone.
  */
-static void patch_vendor_check(void)
+static void patch_vendor_check(const struct mach_header *mh, const char *what)
 {
-    const uintptr_t kJe = 0x1000bdc65ull;                       /* Parallels 26.5.0 (57613), x86_64 */
-    uint8_t *p = (uint8_t *)(kJe + (uintptr_t)_dyld_get_image_vmaddr_slide(0));
-    static const uint8_t expect[] = { 0x48, 0x09, 0xc2, 0x74, 0x5d };       /* or %rax,%rdx ; je +0x5d */
-    if (memcmp(p - 3, expect, sizeof(expect)) != 0) {
-        rhv_hijack_log("vendor check: not the expected code, left alone");
-        return;
-    }
-    vm_address_t page = (vm_address_t)p & ~(vm_address_t)(vm_page_size - 1);
-    kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, 0,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) {
-        rhv_hijack_log("vendor check: could not make the code writable");
-        return;
-    }
-    *p = 0xEB;                                                  /* je -> jmp */
-    vm_protect(mach_task_self(), page, vm_page_size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
-    rhv_hijack_log("vendor check: patched, every CPU vendor takes the Intel path");
+    rhv_patch_result r = rhv_patch_image(mh, &rhv_patch_prl_vendor);
+    char msg[160];
+    snprintf(msg, sizeof(msg), "vendor check in %s: %s", what, rhv_patch_result_name(r));
+    rhv_hijack_log(msg);
 }
 
 __attribute__((constructor)) static void rhv_hijack_init(void)
@@ -163,6 +157,6 @@ __attribute__((constructor)) static void rhv_hijack_init(void)
         return;
 
     rhv_shim_init();
-    patch_vendor_check();
+    patch_vendor_check(_dyld_get_image_header(0), "prl_vm_app");
     _dyld_register_func_for_add_image(on_image);     /* reports the images already loaded, then every new one */
 }

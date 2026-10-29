@@ -40,6 +40,7 @@ static int hyperkit_vcpu_hint(void)
 
 #include "rhv_core.h"
 #include "rhv_iokit.h"
+#include "rhv_patch.h"
 
 /*
  * Two ways in. Loaded with DYLD_INSERT_LIBRARIES the tuples live in __interpose and dyld applies them. For a hardened
@@ -134,6 +135,14 @@ __attribute__((constructor)) static void rhv_shim_init(void)
         rhv_core_offer_nmi_window = 1;
         rhv_core_vcpu_hint = hyperkit_vcpu_hint;
         g_hyperkit = 1;
+        /* The two checks HyperKit makes that an AMD CPU cannot pass, found by their bytes (shim/rhv_patch.c). */
+        const struct rhv_patch *hk[] = { &rhv_patch_hyperkit_vendor, &rhv_patch_hyperkit_gla };
+        for (size_t i = 0; i < sizeof(hk) / sizeof(hk[0]); i++) {
+            rhv_patch_result r = rhv_patch_image(_dyld_get_image_header(0), hk[i]);
+            rhv_trace("%s: %s", hk[i]->name, rhv_patch_result_name(r));
+            if (r != RHV_PATCH_APPLIED && r != RHV_PATCH_ALREADY)       /* HyperKit's stderr goes to ~/.ryzenhv/hyperkit.log */
+                fprintf(stderr, "ryzenhv: %s: %s\n", hk[i]->name, rhv_patch_result_name(r));
+        }
     }
     rhv_trace("shim loaded (ABI %d)", RHV_ABI_VERSION);
 }

@@ -33,6 +33,8 @@ test: | $(BUILD)
 	$(BUILD)/fpu_state_test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -g -o $(BUILD)/msr_map_test tests/msr_map_test.cpp
 	$(BUILD)/msr_map_test
+	$(CC) -Wall -Wextra -Werror -fsanitize=address,undefined -g -o $(BUILD)/patch_test tests/patch_test.c shim/rhv_patch.c
+	$(BUILD)/patch_test
 	$(CC) -arch x86_64 -Wall -Wextra -Werror -Wno-nullability-completeness -fsanitize=address,undefined -g -o $(BUILD)/shim_core_test tests/shim_core_test.c shim/rhv_core.c -framework Hypervisor
 	$(BUILD)/shim_core_test
 
@@ -50,7 +52,7 @@ tools: | $(BUILD)
 	$(CC) -arch x86_64 -Wall -Wextra -Wno-nullability-completeness -O2 -o $(BUILD)/hvf-smoke tools/hvf-smoke/main.c \
 		-framework Hypervisor
 
-SHIM_SRC := shim/hv_shim.c shim/rhv_core.c shim/rhv_iokit.c
+SHIM_SRC := shim/hv_shim.c shim/rhv_core.c shim/rhv_iokit.c shim/rhv_patch.c
 
 shim: | $(BUILD)
 	$(CC) -arch x86_64 -Wall -Wextra -Wno-deprecated-declarations -Wno-nullability-completeness -O2 -dynamiclib \

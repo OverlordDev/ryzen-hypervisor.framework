@@ -13,14 +13,14 @@ HPET and virtio devices itself. That is exactly what the shim implements. A few 
 
 | problem | solution |
 |---|---|
-| HyperKit refuses a CPU whose CPUID vendor is not `GenuineIntel` (an instruction, it cannot be intercepted) | one conditional jump in a patched copy of the binary becomes nops |
-| HyperKit compares the guest linear address of an EPT violation with the one it decodes; AMD does not report that address | the "equal" branch of the comparison becomes unconditional |
+| HyperKit refuses a CPU whose CPUID vendor is not `GenuineIntel` (an instruction, it cannot be intercepted) | one conditional jump becomes nops, patched **in memory** by the shim |
+| HyperKit compares the guest linear address of an EPT violation with the one it decodes; AMD does not report that address | the "equal" branch of the comparison becomes unconditional, also in memory |
 | HyperKit insists on NMI-window exiting and virtual NMIs in the VMX capabilities | the shim offers both to HyperKit only and reports the NMI window as open (`rhv_vcpu_run`) |
 | the guest (Linux) trusts AMD-only CPUID bits HyperKit does not emulate: MWAITX (the delay loop takes a #UD), IBPB/IBRS (`wrmsr 0x49` is a #GP) | the shim clears them in the answers HyperKit writes (`cpuid_hyperkit_fixup`) |
 | HyperKit starts its vCPU threads concurrently and asserts that `hv_vcpu_create` returns the thread's own index | the shim reads the thread name (`vcpu:<n>`) and hands out that slot |
 | the backend (`com.docker.backend`) quits with "Hypervisor check failed" unless `hv_vm_create()` works | the backend runs with the shim loaded too |
 
-The patched HyperKit is a copy (`com.docker.hyperkit.real`), ad-hoc signed with the hypervisor entitlement only: the app sandbox of
+Both patches find their place by the bytes around it (`shim/rhv_patch.c`, tested by `tests/patch_test.c`), not by an address, and are applied only when the pattern occurs exactly once; if it does not fit, HyperKit is left alone and says so in `~/.ryzenhv/hyperkit.log`. HyperKit is a copy (`com.docker.hyperkit.real`) with its bytes unchanged, ad-hoc signed with the hypervisor entitlement only: the app sandbox of
 Docker's own signature would keep it away from the kext. Docker's original files stay next to it as `.orig` / `.real`.
 
 ## Install
@@ -50,7 +50,7 @@ Undo: `./rhv docker-desktop undo` (or `./scripts/docker-desktop-shim.sh uninstal
 
 ## Limits
 
-- Only the HyperKit in Docker Desktop **4.97.0 (build 244584)**: the patches are checked byte for byte and refused on any other build.
+- Tested on Docker Desktop **4.97.0 (build 244584)**. The patches are found by their surrounding bytes, so a build with the same code around those branches works too; any other build is left unpatched and reported in `~/.ryzenhv/hyperkit.log`.
   Docker Desktop updates replace the app, so run the install again afterwards (and use `get` to go back to 4.97.0 if a newer build
   ships a different HyperKit). Turn automatic updates off in Docker Desktop > Settings > Software updates.
 - The VM defaults to all cores and 8 GB (Docker Desktop > Settings > Resources). Idle it uses about 0.5% CPU and 370 MB.

@@ -8,8 +8,7 @@ replacement of `prl_vm_app` with a wrapper (reversible).
 > From the ready-made release, everything below is done by `./rhv kext` and `./rhv parallels` (steps 4–5 and installing the wrapper); this document describes
 > what exactly happens.
 
-> This is an experiment, not a product. It works on the **exact Parallels build 26.5.0 (57613)**: some of the patches are tied to its
-> addresses and on another build they silently do not apply (the VM then simply does not start). After a Parallels update
+> This is an experiment, not a product. It works on the **exact Parallels build 26.5.0 (57613)**: the patches are found by the bytes around them, not by address, but only this build is tested; on another build they may not apply (the VM then simply does not start). After a Parallels update
 > repeat steps 4–5. Patching a proprietary application on your own machine is your responsibility; the repository contains
 > nothing from Parallels, the copy is built from the application installed on your machine.
 
@@ -77,7 +76,7 @@ To remove: `sudo ./scripts/parallels-shim.sh uninstall`, then remove the kext fr
 |---|---|
 | `kern.hv_support` = 0, Parallels falls back to its own engine | `sysctlbyname` returns 1, `hv_*` are replaced with calls into the kext |
 | `prl_vm_app` is hardened, `DYLD_INSERT_LIBRARIES` does not work, the dispatcher checks the signature | a mirror of the application in `~/.ryzenhv/prl` in which `libPrlXmlModel.1.dylib` = the shim, imports rewritten by name (`shim/hijack.c`) |
-| the `GenuineIntel` vendor check (the CPUID instruction) | one branch patched in the memory of `prl_vm_app` and in the copy of `libMonitor.dylib` |
+| the `GenuineIntel` vendor check (the CPUID instruction) | one branch patched in memory, in `prl_vm_app` and in `libMonitor.dylib`, found by the bytes around it (`shim/rhv_patch.c`) |
 | the keyboard does not work | the Parallels monitor drops keys until the guest writes 0 to port 0x80: the shim calls its handler itself |
 | triple fault when the Windows kernel starts | the Hyper-V hypercall `VMCALL` is a #UD on AMD: the shim intercepts #UD and turns it into an ordinary VMX exit |
 | the guest "sleeps" after the kernel boots | the APIC page (0xFEE00000) is left unmapped, accesses go to the monitor; the hypervisor is hidden from the guest |

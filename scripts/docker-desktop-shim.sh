@@ -9,14 +9,14 @@
 #
 # What it does to /Applications/Docker.app/Contents (nothing needs sudo if you own the app, which is the default):
 #   Resources/bin/com.docker.hyperkit.orig   untouched copy of Docker's HyperKit (what uninstall restores)
-#   Resources/bin/com.docker.hyperkit.real   the patched copy, ad-hoc signed with only the hypervisor entitlement (the app sandbox
+#   Resources/bin/com.docker.hyperkit.real   a copy of it, ad-hoc signed with only the hypervisor entitlement (the app sandbox
 #                                            would keep it away from the RyzenHV kext)
 #   Resources/bin/com.docker.hyperkit        a wrapper that starts the .real one with the shim loaded (DYLD_INSERT_LIBRARIES)
 #   MacOS/com.docker.backend.real            Docker's backend, moved (its signature stays valid)
 #   MacOS/com.docker.backend                 a wrapper that starts it with the shim loaded: the backend refuses to start unless
 #                                            hv_vm_create() works
 #   ~/Library/Group Containers/group.com.docker/settings-store.json   UseVirtualizationFramework=false (use HyperKit)
-# Patches in HyperKit (v0.20210107-12-gadc4ea; each is checked byte for byte first, another build is refused):
+# Two checks in HyperKit (v0.20210107-12-gadc4ea) are patched in memory by the shim, found by the bytes around them:
 #   1. HyperKit refuses a CPU whose CPUID vendor is not "GenuineIntel": that conditional jump becomes nops.
 #   2. HyperKit compares the guest linear address of an EPT violation with the one it computes from the instruction; AMD does
 #      not report it. The comparison's "equal" branch becomes unconditional.
@@ -55,12 +55,9 @@ install)
     codesign -dv "$ORIG" 2>&1 | grep -q "TeamIdentifier=9BNSXJN65R" || { echo "$ORIG is not Docker's signed binary" >&2; exit 1; }
     cp "$ORIG" "$REAL"
     chmod u+w "$REAL"
-    # 1. vendor check: "jne error" (0f 85 d7 1a 00 00) at 0x227b56 -> six nops
-    [ "$(bytes_at "$REAL" $((0x227b56)) 6)" = "0f85d71a0000" ] || { echo "this HyperKit is not the build the patches were written for (Docker Desktop 4.97.0, build 244584)" >&2; rm -f "$REAL"; exit 1; }
-    printf '\x90\x90\x90\x90\x90\x90' | dd of="$REAL" bs=1 seek=$((0x227b56)) conv=notrunc 2>/dev/null
-    # 2. verify_gla: "je ok" (0f 84 db fe ff ff) at 0x20af38 -> "jmp ok" (e9 dc fe ff ff) + nop
-    [ "$(bytes_at "$REAL" $((0x20af38)) 6)" = "0f84dbfeffff" ] || { echo "this HyperKit is not the build the patches were written for (Docker Desktop 4.97.0, build 244584)" >&2; rm -f "$REAL"; exit 1; }
-    printf '\xe9\xdc\xfe\xff\xff\x90' | dd of="$REAL" bs=1 seek=$((0x20af38)) conv=notrunc 2>/dev/null
+    # The vendor check and verify_gla are patched in memory by the shim when HyperKit starts (found by their bytes, see
+    # shim/rhv_patch.c): this copy only differs from Docker's by its signature. A HyperKit build the patterns do not fit is
+    # reported in ~/.ryzenhv/hyperkit.log and left unpatched.
     ENT="$(mktemp)"
     cat > "$ENT" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

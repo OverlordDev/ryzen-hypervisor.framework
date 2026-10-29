@@ -5,6 +5,7 @@
 #   ./scripts/parallels-shim.sh prepare          # builds a private copy of the VM app with the shim built in (no sudo)
 #   sudo ./scripts/parallels-shim.sh install     # prl_vm_app in /Applications becomes a wrapper that starts that copy
 #   sudo ./scripts/parallels-shim.sh uninstall   # puts Parallels' own prl_vm_app back
+#   ./scripts/parallels-shim.sh fix-vms           # turns 3D acceleration off in every stopped VM (it crashes prl_vm_app here)
 #   ./scripts/parallels-shim.sh status
 #
 # Why this much: Parallels' dispatcher (a root daemon) starts the VM process, so an environment variable set in a shell
@@ -80,17 +81,8 @@ prepare)
         cp "$HERE/build/libPrlXmlModel.1.dylib" "$FARM/Contents/Frameworks/libPrlXmlModel.1.dylib"
     fi
     codesign --force --sign - "$FARM/Contents/Frameworks/libPrlXmlModel.1.dylib" 2>/dev/null
-    # libMonitor (Parallels' hypervisor backend) refuses a CPU whose CPUID vendor is not GenuineIntel. CPUID is an
-    # instruction, nothing can intercept it, so the library in the private copy gets that one branch changed.
-    rm -f "$FARM/Contents/MacOS/libMonitor.dylib"
-    cp -p "$APP/Contents/MacOS/libMonitor.dylib" "$FARM/Contents/MacOS/libMonitor.dylib"
-    # Parallels 26.5.0 build 57613: file offset 0x207b5 holds "je <Intel path>" (74 5d) after the "GenuineIntel" comparison
-    # (preceded by 48 09 c2); it becomes "jmp" (eb) so every vendor takes the Intel path. Plain od/dd, no interpreter needed.
-    LM="$FARM/Contents/MacOS/libMonitor.dylib"
-    [ "$(od -An -tx1 -j $((0x207b5 - 3)) -N 5 "$LM" | tr -d ' \n')" = "4809c2745d" ] || \
-        { echo "libMonitor.dylib is not the build this patch was written for (Parallels 26.5.0 build 57613); not patching" >&2; exit 1; }
-    printf '\xeb' | dd of="$LM" bs=1 seek=$((0x207b5)) conv=notrunc 2>/dev/null
-    codesign --force --sign - "$FARM/Contents/MacOS/libMonitor.dylib" 2>/dev/null
+    # libMonitor (Parallels' hypervisor backend) also refuses a CPU whose CPUID vendor is not GenuineIntel. The shim finds that
+    # branch by its bytes and patches it in memory when the library loads (shim/rhv_patch.c), so the library stays Parallels' own.
     echo "prepared: $FARM"
     ;;
 install)
@@ -128,12 +120,22 @@ uninstall)
         echo "nothing to restore"
     fi
     ;;
+fix-vms)
+    # Parallels turns 3D acceleration on for every new VM; on this machine it crashes prl_vm_app inside the Metal driver, and
+    # Windows in a VM does not need it here. Turns it off for every stopped VM (a running one cannot be changed).
+    command -v prlctl >/dev/null || { echo "prlctl not found" >&2; exit 1; }
+    prlctl list -a -o uuid,status 2>/dev/null | tail -n +2 | while read -r uuid status; do
+        [ "$status" = "stopped" ] || { echo "$uuid is $status, skipped"; continue; }
+        prlctl set "$uuid" --3d-accelerate off --high-resolution off --high-resolution-in-guest off --vertical-sync off >/dev/null \
+            && echo "$uuid: 3D acceleration off"
+    done
+    ;;
 status)
     if is_wrapper; then echo "wrapper installed (private copy: $([ -x "$FARM_BIN" ] && echo present || echo missing))"
     else echo "original prl_vm_app in place"; fi
     ;;
 *)
-    echo "usage: $0 prepare|install|uninstall|status" >&2
+    echo "usage: $0 prepare|install|uninstall|fix-vms|status" >&2
     exit 2
     ;;
 esac

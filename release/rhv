@@ -219,10 +219,12 @@ parallels() {
         "$ROOT/libexec/parallels-shim.sh" prepare || die "prepare failed"
         echo "Replacing prl_vm_app with a wrapper (needs your password; './rhv parallels undo' puts Parallels' own file back)..."
         sudo "$ROOT/libexec/parallels-shim.sh" install || die "install failed"
+        "$ROOT/libexec/parallels-shim.sh" fix-vms || true        # 3D acceleration off in the VMs that exist now
         cat <<EOF
 
-Done. In Parallels, for each VM:
-  prlctl set "<VM name>" --3d-accelerate off --high-resolution off --high-resolution-in-guest off --vertical-sync off
+Done. 3D acceleration was turned off in your existing VMs (it crashes here). Parallels turns it on again in every NEW VM:
+  ./rhv parallels fix-vms        # run it once after creating a VM, while the VM is stopped
+For each VM:
   prlctl set "<VM name>" --cpus 4          (1 to 16 work)
   prlctl list -i "<VM name>" | grep -i hypervisor     # must say apple; otherwise: prlctl set "<VM name>" --hypervisor-type apple
 Do not hard-stop a Windows VM during the installation or the first start: it may fall into a restart loop.
@@ -230,8 +232,9 @@ After a Parallels update run './rhv parallels' again.
 EOF
         ;;
     undo)   sudo "$ROOT/libexec/parallels-shim.sh" uninstall ;;
+    fix-vms) "$ROOT/libexec/parallels-shim.sh" fix-vms ;;
     status) "$ROOT/libexec/parallels-shim.sh" status ;;
-    *) die "usage: rhv parallels [setup|undo|status]" ;;
+    *) die "usage: rhv parallels [setup|undo|status|fix-vms]" ;;
     esac
 }
 
