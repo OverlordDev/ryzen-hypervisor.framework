@@ -31,7 +31,7 @@ tools/rhv-map-test/       приёмочный тест фазы 2: память
 tools/rhv-vmx-test/       фаза 3: гость ведётся через поля VMCS, как это делает клиент Hypervisor.framework
 tools/rhv-long-test/      фаза 3: 64-бит гость с paging, x87/SSE/AVX, прерывания хоста
 tools/hvf-smoke/          фаза 3: мини-VMM на ПУБЛИЧНОМ API Hypervisor.framework, работает через шим (scripts/run-with-shim.sh)
-scripts/                  collect-debug.sh (отчёт для разбора), install-to-efi.sh, parallels-shim.sh (Parallels), qemu-hvf-test.sh
+scripts/                  collect-debug.sh (отчёт для разбора), install-to-efi.sh, parallels-shim.sh (Parallels), qemu-hvf-test.sh, docker-hvf-test.sh
 tests/host_test.c         unit-тесты чистых функций, запускаются где угодно
 docs/                     архитектура, roadmap, Ryzentosh, отладка, реверс
 ```
@@ -71,6 +71,7 @@ Boot-args: `-rhv_off`, `rhv_enable_svm`, `rhv_selftest`, `rhv_loglevel`, `rhv_io
 - `docs/PHASE1.md`: как устроен первый гость, как запустить и как читать сбои
 - `docs/PHASE2.md`: отображение памяти процесса в гостя, NPF, как запустить и как читать сбои
 - `docs/PARALLELS.md`: **установка и использование с Parallels Desktop**, отладка, ограничения
+- `docs/DOCKER.md`: Docker через Linux-гостя в QEMU/HVF (`scripts/docker-hvf-test.sh`)
 - `docs/PHASE3.md`: слой совместимости с VMX API и ход работ по QEMU и Parallels
 - `docs/REVERSING.md`: как достать и изучить родной `Hypervisor.framework`
 
