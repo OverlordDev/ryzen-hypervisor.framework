@@ -68,27 +68,28 @@ prepare)
     cp -p "$SRC_BIN" "$FARM_BIN"
     # The real library, untouched (its signature stays Parallels'), next to the stand-in.
     cp -p "$APP/Contents/Frameworks/libPrlXmlModel.1.dylib" "$FARM/Contents/Frameworks/libPrlXmlModel.1.orig.dylib"
-    # For the linker only: a copy whose install name says where the real library will be.
-    mkdir -p "$HERE/build/hijack-link"
-    cp "$APP/Contents/Frameworks/libPrlXmlModel.1.dylib" "$HERE/build/hijack-link/libPrlXmlModel.1.dylib"
-    install_name_tool -id "@loader_path/libPrlXmlModel.1.orig.dylib" "$HERE/build/hijack-link/libPrlXmlModel.1.dylib" 2>/dev/null
-    make -C "$HERE" hijack >/dev/null
-    cp "$HERE/build/libPrlXmlModel.1.dylib" "$FARM/Contents/Frameworks/libPrlXmlModel.1.dylib"
+    if [ -f "$HERE/lib/libPrlXmlModel.1.dylib" ]; then
+        # Release bundle: the stand-in library comes prebuilt (it only re-exports ...orig.dylib next to it), no compiler needed.
+        cp "$HERE/lib/libPrlXmlModel.1.dylib" "$FARM/Contents/Frameworks/libPrlXmlModel.1.dylib"
+    else
+        # For the linker only: a copy whose install name says where the real library will be.
+        mkdir -p "$HERE/build/hijack-link"
+        cp "$APP/Contents/Frameworks/libPrlXmlModel.1.dylib" "$HERE/build/hijack-link/libPrlXmlModel.1.dylib"
+        install_name_tool -id "@loader_path/libPrlXmlModel.1.orig.dylib" "$HERE/build/hijack-link/libPrlXmlModel.1.dylib" 2>/dev/null
+        make -C "$HERE" hijack >/dev/null
+        cp "$HERE/build/libPrlXmlModel.1.dylib" "$FARM/Contents/Frameworks/libPrlXmlModel.1.dylib"
+    fi
     codesign --force --sign - "$FARM/Contents/Frameworks/libPrlXmlModel.1.dylib" 2>/dev/null
     # libMonitor (Parallels' hypervisor backend) refuses a CPU whose CPUID vendor is not GenuineIntel. CPUID is an
     # instruction, nothing can intercept it, so the library in the private copy gets that one branch changed.
     rm -f "$FARM/Contents/MacOS/libMonitor.dylib"
     cp -p "$APP/Contents/MacOS/libMonitor.dylib" "$FARM/Contents/MacOS/libMonitor.dylib"
-    python3 - "$FARM/Contents/MacOS/libMonitor.dylib" <<'PY'
-import sys
-p = sys.argv[1]
-d = bytearray(open(p, 'rb').read())
-off = 0x207b5                      # je <Intel path> after the "GenuineIntel" comparison (Parallels 26.5.0 build 57613)
-if bytes(d[off:off + 2]) != b'\x74\x5d' or bytes(d[off - 3:off]) != b'\x48\x09\xc2':
-    sys.exit("libMonitor.dylib is not the build this patch was written for; not patching")
-d[off] = 0xEB                      # je -> jmp: every vendor takes the Intel path
-open(p, 'wb').write(d)
-PY
+    # Parallels 26.5.0 build 57613: file offset 0x207b5 holds "je <Intel path>" (74 5d) after the "GenuineIntel" comparison
+    # (preceded by 48 09 c2); it becomes "jmp" (eb) so every vendor takes the Intel path. Plain od/dd, no interpreter needed.
+    LM="$FARM/Contents/MacOS/libMonitor.dylib"
+    [ "$(od -An -tx1 -j $((0x207b5 - 3)) -N 5 "$LM" | tr -d ' \n')" = "4809c2745d" ] || \
+        { echo "libMonitor.dylib is not the build this patch was written for (Parallels 26.5.0 build 57613); not patching" >&2; exit 1; }
+    printf '\xeb' | dd of="$LM" bs=1 seek=$((0x207b5)) conv=notrunc 2>/dev/null
     codesign --force --sign - "$FARM/Contents/MacOS/libMonitor.dylib" 2>/dev/null
     echo "prepared: $FARM"
     ;;

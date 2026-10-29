@@ -4,7 +4,22 @@ Docker Desktop не запускается: ему нужен настоящий
 через шим, внутри `dockerd`, снаружи обычный `docker` CLI». Проверено на Ryzen 7 5800H, macOS 15.8.1: образы тянутся, `hello-world`,
 `alpine` (с выходом в сеть) и `nginx` работают.
 
-## Что нужно
+## Готовая сборка (самый простой путь)
+
+В релизе (`ryzenhv-<версия>-macos-x86_64.tar.gz`) уже лежат кекст, шим и QEMU, ничего компилировать не нужно:
+
+```bash
+./rhv docker up                      # скачивает ядро Alpine и docker CLI, ставит dockerd в ВМ
+eval "$(./rhv docker env)"
+docker run --rm hello-world
+./rhv docker down
+```
+
+Порт контейнера на Mac: `./rhv docker up --port 8080`, затем `docker run -p 8080:80 nginx` и `http://127.0.0.1:8080`.
+Данные живут в `~/.ryzenhv/docker` (`RHV_DOCKER_MEM`, `RHV_DOCKER_CPUS`, `RHV_DOCKER_DISK_GB` меняют ресурсы ВМ).
+Остальное ниже нужно только тем, кто собирает всё сам.
+
+## Что нужно (сборка из исходников)
 
 - Загруженный `RyzenHV.kext` и собранный шим (`make shim`), см. `README.md`.
 - QEMU с `--enable-hvf` **и `--enable-slirp`** в `~/rhv-qemu` (как его собрать, см. `docs/PHASE3.md`, этап 6). Без slirp нет сети `-netdev user`:

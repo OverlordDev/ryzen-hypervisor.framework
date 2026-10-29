@@ -51,7 +51,7 @@ echo "guest started (pid $!), waiting for the login prompt..."
 $DRIVE login
 $DRIVE run 300 "apk add docker e2fsprogs >/dev/null 2>&1; echo apk=\$?" \
     "modprobe ext4; modprobe overlay; modprobe br_netfilter; modprobe veth; rc-service cgroups start >/dev/null 2>&1" \
-    "blkid /dev/vda >/dev/null || mkfs.ext4 -q /dev/vda; mkdir -p /var/lib/docker; mount -t ext4 /dev/vda /var/lib/docker" \
+    "[ -n \"\$(blkid /dev/vda)\" ] || mkfs.ext4 -q /dev/vda; mkdir -p /var/lib/docker; mount -t ext4 /dev/vda /var/lib/docker" \
     "(nohup dockerd -H unix:///var/run/docker.sock -H tcp://0.0.0.0:2375 >/var/log/dockerd.out 2>&1 &); sleep 25; docker info --format 'dockerd {{.ServerVersion}} {{.Driver}} cpus={{.NCPU}}'"
 
 export DOCKER_HOST=tcp://127.0.0.1:2375

@@ -1,0 +1,16 @@
+The qemu/ directory of this bundle is QEMU 11.1.2 (GNU GPL v2) with glib 2.82.5 (LGPL 2.1), pixman 0.44.2 (MIT),
+libslirp 4.8.0 (BSD) and libffi / proxy-libintl (MIT / LGPL) bundled as shared libraries. They are unmodified upstream
+releases, built for this bundle by release/bundle-qemu.sh in the RyzenHV repository.
+
+Source code:
+  QEMU     https://download.qemu.org/qemu-11.1.2.tar.xz
+  glib     https://download.gnome.org/sources/glib/2.82/glib-2.82.5.tar.xz
+  pixman   https://cairographics.org/releases/pixman-0.44.2.tar.gz
+  libslirp https://gitlab.freedesktop.org/slirp/libslirp/-/archive/v4.8.0/libslirp-v4.8.0.tar.gz
+
+QEMU configure line:
+  configure --prefix=/usr/local --target-list=x86_64-softmmu --enable-hvf --enable-slirp --disable-docs --disable-cocoa
+            --disable-gtk --disable-sdl --disable-curses --disable-vnc --disable-tools --disable-guest-agent --disable-rust
+            --disable-plugins --disable-capstone
+
+The libraries are separate .dylib files in qemu/lib, so they can be replaced with your own builds.

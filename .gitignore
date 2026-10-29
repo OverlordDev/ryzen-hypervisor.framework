@@ -7,3 +7,4 @@ xcuserdata/
 DerivedData/
 # extracted Apple binaries for reversing must never be committed
 reversing/
+dist/

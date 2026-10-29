@@ -1,0 +1,348 @@
+#!/bin/bash
+#
+# rhv: installer and launcher for RyzenHV (Hypervisor.framework on AMD-V). Part of the release bundle.
+#
+#   ./rhv                    menu
+#   ./rhv doctor             what works and what is missing on this Mac
+#   ./rhv kext               put RyzenHV.kext into your OpenCore EFI and set the boot-args
+#   ./rhv parallels          make Parallels Desktop run through RyzenHV (and ./rhv parallels undo)
+#   ./rhv docker up|down|status|env     Docker in a small Linux VM (docker CLI on this Mac talks to it)
+#
+# Nothing here needs Xcode or Homebrew: only tools that ship with macOS, plus the QEMU and the shim in this bundle.
+set -u
+
+SELF="$0"
+while [ -L "$SELF" ]; do
+    T="$(readlink "$SELF")"
+    case "$T" in /*) SELF="$T" ;; *) SELF="$(dirname "$SELF")/$T" ;; esac
+done
+ROOT="$(cd "$(dirname "$SELF")" && pwd)"
+DATA="${RHV_HOME:-$HOME/.ryzenhv}"
+KDIR="$DATA/docker"
+BOOTARGS_WANTED="rhv_enable_svm=1 rhv_allow_users=1 amfi_get_out_of_my_way=0x1"
+NVRAM_GUID="7C436110-AB2A-4BBB-A880-FE41995C9F82"
+PB=/usr/libexec/PlistBuddy
+SUPPORTED_PARALLELS_BUILD=57613
+
+# version info written by package.sh: version=, abi=
+rel() { sed -n "s/^$1=//p" "$ROOT/VERSION" 2>/dev/null | head -1; }
+VERSION="$(rel version)"; ABI="$(rel abi)"
+
+if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; N=$'\033[0m'; else B=; G=; R=; Y=; N=; fi
+ok()   { printf '  %s[ok]%s   %s\n' "$G" "$N" "$*"; }
+bad()  { printf '  %s[FAIL]%s %s\n' "$R" "$N" "$*"; }
+warn() { printf '  %s[warn]%s %s\n' "$Y" "$N" "$*"; }
+say()  { printf '%s%s%s\n' "$B" "$*" "$N"; }
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+confirm() { [ "${RHV_YES:-0}" = 1 ] && return 0; local a; read -r -p "$1 [y/N] " a; case "$a" in y|Y|yes|д|Д) return 0 ;; *) return 1 ;; esac; }
+
+# Files downloaded in a browser carry the quarantine flag; Gatekeeper refuses unsigned libraries and binaries with it.
+if xattr -p com.apple.quarantine "$ROOT/qemu/bin/qemu-system-x86_64" >/dev/null 2>&1; then
+    xattr -dr com.apple.quarantine "$ROOT" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------- doctor
+doctor() {
+    local fails=0 v b
+    say "RyzenHV ${VERSION:-?} (ABI ${ABI:-?}): system check"
+    v="$(sysctl -n machdep.cpu.vendor 2>/dev/null)"
+    if [ "$v" = AuthenticAMD ]; then ok "CPU: $(sysctl -n machdep.cpu.brand_string)"; else warn "CPU vendor is $v; RyzenHV is for AMD CPUs (an Intel Mac has the real Hypervisor.framework)"; fi
+    v="$(sw_vers -productVersion 2>/dev/null)"
+    case "$v" in 15.*) ok "macOS $v" ;; *) warn "macOS $v: tested on 15.8.1 only" ;; esac
+    [ "$(uname -m)" = x86_64 ] && ok "x86_64" || { bad "this bundle is for x86_64 Macs"; fails=$((fails+1)); }
+
+    local args; args="$(nvram boot-args 2>/dev/null | sed 's/^boot-args[[:space:]]*//')"
+    local missing=""
+    for b in $BOOTARGS_WANTED; do case " $args " in *" $b "*) ;; *) missing="$missing $b" ;; esac; done
+    if [ -z "$missing" ]; then ok "boot-args contain: $BOOTARGS_WANTED"
+    else bad "boot-args are missing:$missing   (fix: ./rhv kext)"; fails=$((fails+1)); fi
+
+    local info rc
+    info="$("$ROOT/bin/rhv-info" 2>&1)"; rc=$?
+    if [ $rc -eq 0 ] && echo "$info" | grep -q "RyzenHV kext (ABI"; then
+        local kabi; kabi="$(echo "$info" | sed -n 's/.*(ABI \([0-9]*\)).*/\1/p' | head -1)"
+        if [ "$kabi" = "$ABI" ]; then ok "kext is loaded, ABI $kabi matches this bundle"
+        else bad "kext ABI is $kabi but this bundle needs $ABI: install the kext from this bundle (./rhv kext) and reboot"; fails=$((fails+1)); fi
+        echo "$info" | grep -q "SVM  *: supported" && ok "SVM supported" || { bad "SVM is not usable (enable SVM Mode in the BIOS)"; fails=$((fails+1)); }
+        echo "$info" | grep -q "\[x\] NPT" && ok "nested paging (NPT) available" || { bad "no NPT"; fails=$((fails+1)); }
+    else
+        bad "the kext does not answer (not installed, not loaded, or rhv_allow_users=1 missing). Run: ./rhv kext, then reboot"
+        fails=$((fails+1))
+    fi
+
+    if [ -x "$ROOT/qemu/bin/qemu-system-x86_64" ] && "$ROOT/qemu/bin/qemu-system-x86_64" --version >/dev/null 2>&1; then
+        ok "bundled QEMU runs"
+    else bad "the bundled QEMU does not start (damaged download?)"; fails=$((fails+1)); fi
+
+    local app="/Applications/Parallels Desktop.app"
+    if [ -d "$app" ]; then
+        local build; build="$(defaults read "$app/Contents/Info" CFBundleVersion 2>/dev/null)"
+        if [ "$build" = "$SUPPORTED_PARALLELS_BUILD" ]; then ok "Parallels Desktop build $build (supported)"
+        else warn "Parallels Desktop build $build: only build $SUPPORTED_PARALLELS_BUILD (26.5.0) is supported; ./rhv parallels will refuse"; fi
+    else
+        echo "  [--]   Parallels Desktop is not installed (optional)"
+    fi
+    echo
+    if [ $fails -eq 0 ]; then say "All good."; else say "$fails problem(s) found."; fi
+    return $fails
+}
+
+# ---------------------------------------------------------------- kext into the OpenCore EFI
+pb() { "$PB" -c "$1" "$2" 2>/dev/null; }
+
+find_efi_volumes() {
+    local v
+    for v in /Volumes/*; do [ -d "$v/EFI/OC" ] && [ -f "$v/EFI/OC/config.plist" ] && echo "$v"; done
+}
+
+mount_efi_partitions() {
+    local s
+    for s in $(diskutil list 2>/dev/null | awk '$2 == "EFI" { print $NF }'); do
+        mount | grep -q "^/dev/$s " || sudo diskutil mount "/dev/$s" >/dev/null 2>&1
+    done
+}
+
+kext_install() {
+    local efi="${1:-}"
+    [ -d "$ROOT/RyzenHV.kext" ] || die "RyzenHV.kext is not in this bundle"
+    if [ -z "$efi" ]; then
+        local cands; cands="$(find_efi_volumes)"
+        if [ -z "$cands" ]; then
+            echo "Looking for the OpenCore EFI partition (your password is needed to mount EFI partitions)..."
+            mount_efi_partitions
+            cands="$(find_efi_volumes)"
+        fi
+        [ -n "$cands" ] || die "no OpenCore EFI found. Mount it yourself and run: ./rhv kext /Volumes/EFI"
+        if [ "$(echo "$cands" | wc -l)" -gt 1 ]; then
+            echo "Several OpenCore EFIs found:"
+            local i=1 c
+            while IFS= read -r c; do printf '  %d) %s   (config.plist: %s)\n' $i "$c" "$(stat -f %Sm "$c/EFI/OC/config.plist")"; i=$((i+1)); done <<<"$cands"
+            local n; read -r -p "Which one is the EFI you boot from (or the USB stick you test with)? " n
+            efi="$(echo "$cands" | sed -n "${n}p")"
+            [ -n "$efi" ] || die "no such choice"
+        else efi="$cands"; fi
+    fi
+    local cfg="$efi/EFI/OC/config.plist" kdir="$efi/EFI/OC/Kexts"
+    [ -f "$cfg" ] || die "$cfg not found"
+    plutil -lint "$cfg" >/dev/null || die "$cfg is not a valid plist already; not touching it"
+    [ -d "$kdir" ] || die "$kdir not found"
+
+    say "Plan (EFI: $efi)"
+    echo "  1. copy RyzenHV.kext (ABI $ABI) to EFI/OC/Kexts (an older copy is kept as RyzenHV.kext.bak-<time>)"
+    echo "  2. config.plist: add a Kernel -> Add entry for it if there is none (backup: config.plist.rhv-backup-<time>)"
+    echo "  3. config.plist: make sure boot-args contain: $BOOTARGS_WANTED (existing ones stay)"
+    echo
+    warn "Keep a working EFI without this kext (for example on a USB stick). A kext that panics at boot needs a way back."
+    confirm "Go ahead?" || { echo "cancelled"; return 1; }
+
+    local ts; ts="$(date +%Y%m%d-%H%M%S)"
+    if [ -d "$kdir/RyzenHV.kext" ]; then mv "$kdir/RyzenHV.kext" "$kdir/RyzenHV.kext.bak-$ts"; fi
+    cp -R "$ROOT/RyzenHV.kext" "$kdir/RyzenHV.kext" || die "copying the kext failed"
+    ok "kext copied"
+
+    cp "$cfg" "$cfg.rhv-backup-$ts" || die "cannot back up config.plist"
+    local n=0 found=0
+    while pb "Print :Kernel:Add:$n:BundlePath" "$cfg" >/tmp/rhv-bp.$$; do
+        [ "$(cat /tmp/rhv-bp.$$)" = "RyzenHV.kext" ] && found=1
+        n=$((n+1))
+    done
+    rm -f /tmp/rhv-bp.$$
+    local P="$PB -c"
+    if [ $found = 1 ]; then ok "config.plist already lists RyzenHV.kext"
+    else
+        {
+            $PB -c "Add :Kernel:Add:$n dict" "$cfg" &&
+            $PB -c "Add :Kernel:Add:$n:Arch string Any" "$cfg" &&
+            $PB -c "Add :Kernel:Add:$n:BundlePath string RyzenHV.kext" "$cfg" &&
+            $PB -c "Add :Kernel:Add:$n:Comment string RyzenHV (Hypervisor.framework on AMD-V)" "$cfg" &&
+            $PB -c "Add :Kernel:Add:$n:Enabled bool true" "$cfg" &&
+            $PB -c "Add :Kernel:Add:$n:ExecutablePath string Contents/MacOS/RyzenHV" "$cfg" &&
+            $PB -c "Add :Kernel:Add:$n:MaxKernel string" "$cfg" &&
+            $PB -c "Add :Kernel:Add:$n:MinKernel string" "$cfg" &&
+            $PB -c "Add :Kernel:Add:$n:PlistPath string Contents/Info.plist" "$cfg"
+        } >/dev/null 2>&1 || { cp "$cfg.rhv-backup-$ts" "$cfg"; die "editing config.plist failed; the original is restored"; }
+        ok "Kernel -> Add entry added"
+    fi
+
+    local key=":NVRAM:Add:$NVRAM_GUID:boot-args" cur new="" t
+    cur="$($PB -c "Print $key" "$cfg" 2>/dev/null || true)"
+    new="$cur"
+    for t in $BOOTARGS_WANTED; do case " $new " in *" $t "*) ;; *) new="${new:+$new }$t" ;; esac; done
+    if [ "$new" != "$cur" ]; then
+        if [ -n "$cur" ]; then $PB -c "Set $key \"$new\"" "$cfg" >/dev/null 2>&1
+        else $PB -c "Add $key string \"$new\"" "$cfg" >/dev/null 2>&1; fi || { cp "$cfg.rhv-backup-$ts" "$cfg"; die "editing boot-args failed; the original is restored"; }
+        ok "boot-args in config.plist: $new"
+    else ok "boot-args in config.plist already contain what is needed"; fi
+
+    if ! plutil -lint "$cfg" >/dev/null; then cp "$cfg.rhv-backup-$ts" "$cfg"; die "config.plist came out invalid; the original is restored"; fi
+    ok "config.plist is valid"
+
+    # OpenCore does not overwrite a boot-args value that macOS already has in NVRAM unless boot-args is in NVRAM -> Delete.
+    local del=0 j=0
+    while v="$($PB -c "Print :NVRAM:Delete:$NVRAM_GUID:$j" "$cfg" 2>/dev/null)"; do [ "$v" = boot-args ] && del=1; j=$((j+1)); done
+    if [ $del = 0 ]; then
+        local live; live="$(nvram boot-args 2>/dev/null | sed 's/^boot-args[[:space:]]*//')"
+        local want="$live"
+        for t in $BOOTARGS_WANTED; do case " $want " in *" $t "*) ;; *) want="${want:+$want }$t" ;; esac; done
+        if [ "$want" != "$live" ]; then
+            warn "OpenCore keeps the boot-args macOS already stores in NVRAM, so the new ones would not apply on the next boot."
+            if confirm "Add them to the stored boot-args now (sudo nvram boot-args=\"$want\")?"; then
+                sudo nvram boot-args="$want" && ok "stored boot-args updated" || bad "nvram failed; set them with: sudo nvram boot-args=\"$want\""
+            else echo "  later: sudo nvram boot-args=\"$want\""; fi
+        fi
+    fi
+    echo
+    say "Done. Reboot into this EFI, then run ./rhv doctor."
+}
+
+# ---------------------------------------------------------------- Parallels
+parallels() {
+    local sub="${1:-setup}" app="/Applications/Parallels Desktop.app" build
+    case "$sub" in
+    setup)
+        [ -d "$app" ] || die "Parallels Desktop is not installed"
+        build="$(defaults read "$app/Contents/Info" CFBundleVersion 2>/dev/null)"
+        [ "$build" = "$SUPPORTED_PARALLELS_BUILD" ] || die "Parallels build $build is not supported; RyzenHV needs 26.5.0 (build $SUPPORTED_PARALLELS_BUILD)"
+        doctor >/dev/null 2>&1 || { doctor; die "fix the problems above first"; }
+        say "Preparing a private copy of Parallels' VM process with the shim built in..."
+        "$ROOT/libexec/parallels-shim.sh" prepare || die "prepare failed"
+        echo "Replacing prl_vm_app with a wrapper (needs your password; './rhv parallels undo' puts Parallels' own file back)..."
+        sudo "$ROOT/libexec/parallels-shim.sh" install || die "install failed"
+        cat <<EOF
+
+Done. In Parallels, for each VM:
+  prlctl set "<VM name>" --3d-accelerate off --high-resolution off --high-resolution-in-guest off --vertical-sync off
+  prlctl set "<VM name>" --cpus 4          (1 to 16 work)
+  prlctl list -i "<VM name>" | grep -i hypervisor     # must say apple; otherwise: prlctl set "<VM name>" --hypervisor-type apple
+Do not hard-stop a Windows VM during the installation or the first start: it may fall into a restart loop.
+After a Parallels update run './rhv parallels' again.
+EOF
+        ;;
+    undo)   sudo "$ROOT/libexec/parallels-shim.sh" uninstall ;;
+    status) "$ROOT/libexec/parallels-shim.sh" status ;;
+    *) die "usage: rhv parallels [setup|undo|status]" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- Docker (Alpine guest in the bundled QEMU, through the shim)
+ALPINE=v3.20
+ABASE="http://dl-cdn.alpinelinux.org/alpine/$ALPINE"
+DOCKER_CLI_VERSION=29.9.2
+CONSOLE_PORT=4555
+API_PORT="${RHV_DOCKER_PORT:-2375}"
+DOCKER="$KDIR/docker/docker"
+PIDFILE="$KDIR/qemu.pid"
+
+docker_running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+docker_ready() { docker_running && DOCKER_HOST="tcp://127.0.0.1:$API_PORT" "$DOCKER" version >/dev/null 2>&1; }
+
+docker_up() {
+    local mem="${RHV_DOCKER_MEM:-2048}" cpus="${RHV_DOCKER_CPUS:-2}" size="${RHV_DOCKER_DISK_GB:-20}" fwd="" p
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --port) shift; p="${1:?--port needs a port, e.g. 8080}"; fwd="$fwd,hostfwd=tcp:127.0.0.1:${p%%:*}-:${p##*:}" ;;
+        *) die "unknown option $1 (use: docker up [--port 8080]...)" ;;
+        esac; shift
+    done
+    docker_running && { ok "the Docker VM is already running; use: eval \"\$(./rhv docker env)\""; return 0; }
+    "$ROOT/bin/rhv-info" >/dev/null 2>&1 || die "the RyzenHV kext does not answer. Run ./rhv doctor"
+    mkdir -p "$KDIR"
+    local f
+    for f in vmlinuz-virt initramfs-virt modloop-virt; do
+        [ -f "$KDIR/$f" ] || { echo "downloading $f..."; curl -fSL --progress-bar -o "$KDIR/$f.part" "https://dl-cdn.alpinelinux.org/alpine/$ALPINE/releases/x86_64/netboot/$f" && mv "$KDIR/$f.part" "$KDIR/$f" || die "download of $f failed"; }
+    done
+    if [ ! -x "$DOCKER" ]; then
+        echo "downloading the docker command line client..."
+        curl -fSL --progress-bar -o "$KDIR/docker-cli.tgz" "https://download.docker.com/mac/static/stable/x86_64/docker-$DOCKER_CLI_VERSION.tgz" || die "download of the docker client failed"
+        tar xzf "$KDIR/docker-cli.tgz" -C "$KDIR" docker/docker || die "unpacking the docker client failed"
+        rm -f "$KDIR/docker-cli.tgz"
+    fi
+    [ -f "$KDIR/disk.raw" ] || truncate -s "${size}G" "$KDIR/disk.raw"      # sparse: takes only what images use
+
+    rm -f "$KDIR/serial.log"
+    DYLD_INSERT_LIBRARIES="$ROOT/lib/libryzenhv.dylib" nohup "$ROOT/qemu/bin/qemu-system-x86_64" -L "$ROOT/qemu/share/qemu" \
+        -accel hvf -m "$mem" -smp "$cpus" -display none -monitor none -no-reboot \
+        -serial "tcp:127.0.0.1:$CONSOLE_PORT,server=on,wait=off" \
+        -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$API_PORT-:2375$fwd" -device virtio-net-pci,netdev=n0,romfile= \
+        -drive "file=$KDIR/disk.raw,if=virtio,format=raw" -device virtio-rng-pci \
+        -kernel "$KDIR/vmlinuz-virt" -initrd "$KDIR/initramfs-virt" \
+        -append "console=ttyS0 ip=dhcp alpine_repo=$ABASE/main,$ABASE/community modloop=$ABASE/releases/x86_64/netboot/modloop-virt" \
+        >"$KDIR/qemu.out" 2>&1 &
+    echo $! >"$PIDFILE"
+    sleep 2
+    docker_running || { cat "$KDIR/qemu.out" >&2; die "QEMU did not start"; }
+    echo "VM started, installing docker inside (first start downloads about 100 MB, takes a few minutes)..."
+
+    export RHV_SERIAL_LOG="$KDIR/serial.log"
+    local D="/usr/bin/perl $ROOT/libexec/serial-drive.pl $CONSOLE_PORT"
+    $D login || { docker_down; die "the VM did not reach a login prompt (see $KDIR/serial.log)"; }
+    local out
+    out="$($D run 600 \
+        "apk add docker e2fsprogs >/dev/null 2>&1; echo apk=\$?" \
+        "modprobe ext4; modprobe overlay; modprobe br_netfilter; modprobe veth; rc-service cgroups start >/dev/null 2>&1" \
+        "[ -n \"\$(blkid /dev/vda)\" ] || mkfs.ext4 -q /dev/vda; mkdir -p /var/lib/docker; mount -t ext4 /dev/vda /var/lib/docker" \
+        "grep -q ' /var/lib/docker ext4 ' /proc/mounts && echo mounted-ok" \
+        "(nohup dockerd -H unix:///var/run/docker.sock -H tcp://0.0.0.0:2375 >/var/log/dockerd.out 2>&1 &); sleep 20")" \
+        || { docker_down; die "setting up docker inside the VM failed (see $KDIR/serial.log)"; }
+    echo "$out" | grep -q "apk=0" || { docker_down; die "installing docker inside the VM failed: no network? (see $KDIR/serial.log)"; }
+    echo "$out" | grep -q "mounted-ok" || { docker_down; die "the VM disk could not be mounted (see $KDIR/serial.log)"; }
+    local i
+    for i in $(seq 1 30); do docker_ready && break; sleep 2; done
+    docker_ready || die "docker does not answer on 127.0.0.1:$API_PORT (see $KDIR/serial.log)"
+    ok "Docker is up: $(DOCKER_HOST=tcp://127.0.0.1:$API_PORT "$DOCKER" version --format 'server {{.Server.Version}}')"
+    echo
+    echo "Use it in this terminal:   eval \"\$(./rhv docker env)\""
+    echo "Then:                      docker run --rm hello-world"
+    echo "A container port reachable from this Mac needs ./rhv docker up --port 8080 once, then: docker run -p 8080:80 ..." 
+    echo "Stop it:                   ./rhv docker down"
+}
+
+docker_down() {
+    if docker_running; then kill "$(cat "$PIDFILE")" 2>/dev/null; sleep 1; ok "Docker VM stopped (images stay in $KDIR/disk.raw)"
+    else echo "the Docker VM is not running"; fi
+    rm -f "$PIDFILE"
+}
+
+docker_cmd() {
+    case "${1:-}" in
+    up) shift; docker_up "$@" ;;
+    down) docker_down ;;
+    status) if docker_ready; then ok "running; $(DOCKER_HOST=tcp://127.0.0.1:$API_PORT "$DOCKER" version --format 'server {{.Server.Version}}')"; elif docker_running; then warn "VM is running but docker does not answer yet"; else echo "not running"; fi ;;
+    env) echo "export DOCKER_HOST=tcp://127.0.0.1:$API_PORT; export PATH=\"$KDIR/docker:\$PATH\"" ;;
+    *) die "usage: rhv docker up [--port N]... | down | status | env" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- menu
+menu() {
+    while true; do
+        echo
+        say "RyzenHV ${VERSION:-} installer"
+        echo "  1) Check this Mac (doctor)"
+        echo "  2) Install the kext into the OpenCore EFI"
+        echo "  3) Set up Parallels Desktop"
+        echo "  4) Start Docker"
+        echo "  5) Stop Docker"
+        echo "  q) Quit"
+        local c; read -r -p "> " c
+        case "$c" in
+        1) doctor ;;
+        2) kext_install ;;
+        3) parallels setup ;;
+        4) docker_up ;;
+        5) docker_down ;;
+        q|Q|"") return 0 ;;
+        esac
+    done
+}
+
+case "${1:-menu}" in
+menu) menu ;;
+doctor) doctor ;;
+kext) shift; kext_install "$@" ;;
+parallels) shift; parallels "$@" ;;
+docker) shift; docker_cmd "$@" ;;
+-y|--yes) shift; RHV_YES=1 exec "$SELF" "$@" ;;
+version|--version) echo "RyzenHV ${VERSION:-} (ABI ${ABI:-?})" ;;
+*) sed -n '3,12p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
