@@ -22,6 +22,18 @@
 #include <mach/mach.h>
 #include <stdlib.h>
 #include <string.h>
+
+static int g_hyperkit;          /* the client is HyperKit: its CPUID answers are cleaned of AMD-only features */
+
+/* HyperKit names every vCPU thread "vcpu:<n>" before it calls hv_vcpu_create, and asserts that it gets id <n> back. */
+static int hyperkit_vcpu_hint(void)
+{
+    char name[64];
+    int n;
+    if (pthread_getname_np(pthread_self(), name, sizeof(name)) == 0 && sscanf(name, "vcpu:%d", &n) == 1)
+        return n;
+    return -1;
+}
 #include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
@@ -118,6 +130,11 @@ __attribute__((constructor)) static void rhv_shim_init(void)
 #ifdef RHV_HIJACK
     rhv_core_offer_tpr_shadow = access("/tmp/rhv-no-vtpr", F_OK) != 0;     /* Parallels: its monitor uses the TPR shadow */
 #endif
+    if (strstr(getprogname(), "hyperkit")) {                                 /* Docker Desktop's VMM */
+        rhv_core_offer_nmi_window = 1;
+        rhv_core_vcpu_hint = hyperkit_vcpu_hint;
+        g_hyperkit = 1;
+    }
     rhv_trace("shim loaded (ABI %d)", RHV_ABI_VERSION);
 }
 
@@ -648,6 +665,31 @@ __attribute__((unused)) static void cpuid_note(hv_vcpuid_t vcpu)
 #undef g_cpuid
 }
 
+/*
+ * HyperKit answers CPUID from the host's values, which on a Ryzen are AMD's. A Linux guest then trusts features HyperKit
+ * does not emulate: MWAITX (the guest's delay loop executes it and takes a #UD), SVM, the extended topology leaf and the
+ * AMD performance counters. Like the Windows fix-ups above, the clean-up is applied to the registers HyperKit wrote, on the
+ * way back into the guest.
+ */
+__attribute__((unused)) static void cpuid_hyperkit_fixup(hv_vcpuid_t vcpu)
+{
+    if (vcpu >= RHV_MAX_VCPUS_PER_VM || !g_cpuid_all[vcpu].pending)
+        return;
+    g_cpuid_all[vcpu].pending = 0;
+    uint32_t leaf = g_cpuid_all[vcpu].leaf;
+    if (leaf == 0x80000001u) {
+        uint64_t rcx = 0;
+        rhv_vcpu_read_register(vcpu, 3, &rcx);
+        const uint64_t amdOnly = (1u << 2) /* SVM */ | (1u << 22) /* TopologyExtensions */ | (1u << 23) | (1u << 24) /* PerfCtr */ |
+                                 (1u << 26) /* DataBreakpointExtension */ | (1u << 27) /* PerfTsc */ | (1u << 29) /* MWAITX */;
+        rhv_vcpu_write_register(vcpu, 3, rcx & ~amdOnly);
+    } else if (leaf == 0x80000008u) {
+        /* EBX: IBPB, IBRS, STIBP, SSBD and friends. The guest would write MSR 0x49 (PRED_CMD) and the like, which HyperKit
+         * does not emulate (#GP). Report none of them. */
+        rhv_vcpu_write_register(vcpu, 5, 0);
+    }
+}
+
 __attribute__((unused)) static void cpuid_hide_hypervisor(hv_vcpuid_t vcpu)
 {
     static int disabled = -1;
@@ -879,7 +921,11 @@ static hv_return_t rhv_hv_vcpu_run(hv_vcpuid_t vcpu)
         madt_dump();
     }
 #else
+    if (g_hyperkit)
+        cpuid_hyperkit_fixup(vcpu);
     r = (hv_return_t)rhv_vcpu_run(vcpu);
+    if (g_hyperkit)
+        cpuid_note(vcpu);
 #endif
     if (g_stats > 0) {
         g_st.inKernel += seconds() - t0;

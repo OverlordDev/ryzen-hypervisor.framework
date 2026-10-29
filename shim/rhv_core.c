@@ -535,10 +535,14 @@ int32_t rhv_vcpu_create(uint32_t *vcpu, uint64_t flags)
         return r;
     if (!vcpu || flags > 3)       /* HV_VCPU_DEFAULT, ACCEL_RDPMC, TSC_RELATIVE */
         return RHV_HV_BAD_ARGUMENT;
+    int want = rhv_core_vcpu_hint ? rhv_core_vcpu_hint() : -1;
     pthread_mutex_lock(&gSlotLock);
     unsigned i = 0;
-    while (i < RHV_MAX_VCPUS_PER_VM && (gV[i].used || gV[i].creating))
-        i++;
+    if (want >= 0 && want < RHV_MAX_VCPUS_PER_VM && !gV[want].used && !gV[want].creating)
+        i = (unsigned)want;
+    else
+        while (i < RHV_MAX_VCPUS_PER_VM && (gV[i].used || gV[i].creating))
+            i++;
     if (i == RHV_MAX_VCPUS_PER_VM) {
         pthread_mutex_unlock(&gSlotLock);
         return RHV_HV_NO_RESOURCES;
@@ -587,6 +591,18 @@ int32_t rhv_vcpu_run(uint32_t vcpu)
     if (r)
         return r;
     NEED(run);
+
+    /*
+     * NMI-window exiting is done here, not in the kernel: NMI blocking is not tracked, so the window is reported as open
+     * at once. A client that sets the control wants to inject an NMI and clears the control when the exit arrives.
+     */
+    if (rhv_core_offer_nmi_window) {
+        uint64_t cpu = 0;
+        if (vmcsGet(0x4002, &cpu) == 0 && (cpu & (1u << 22))) {      /* CPU_BASED, NMI-window exiting */
+            rhv_vcpu_override_exit(vcpu, 8, 0);
+            return RHV_HV_SUCCESS;
+        }
+    }
 
     if (B.run_ex) {
         /* One call: send what is buffered, run, get the registers and the exit information back. */
@@ -1030,10 +1046,10 @@ static uint64_t cap(uint32_t must1, uint32_t may1)
 }
 
 enum {
-    PIN_EXTINT = 1u << 0, PIN_NMI = 1u << 3,
+    PIN_EXTINT = 1u << 0, PIN_NMI = 1u << 3, PIN_VIRTUAL_NMI = 1u << 5,
     CPU_INTR_WINDOW = 1u << 2, CPU_TSC_OFFSETING = 1u << 3, CPU_HLT = 1u << 7, CPU_INVLPG = 1u << 9,
     CPU_MWAIT = 1u << 10, CPU_RDPMC = 1u << 11, CPU_RDTSC = 1u << 12, CPU_CR3_LOAD = 1u << 15, CPU_CR3_STORE = 1u << 16,
-    CPU_CR8_LOAD = 1u << 19, CPU_CR8_STORE = 1u << 20, CPU_TPR_SHADOW = 1u << 21, CPU_MOV_DR = 1u << 23, CPU_IO = 1u << 24,
+    CPU_CR8_LOAD = 1u << 19, CPU_CR8_STORE = 1u << 20, CPU_TPR_SHADOW = 1u << 21, CPU_NMI_WINDOW = 1u << 22, CPU_MOV_DR = 1u << 23, CPU_IO = 1u << 24,
     CPU_IO_BITMAPS = 1u << 25, CPU_MSR_BITMAPS = 1u << 28, CPU_MONITOR = 1u << 29, CPU_PAUSE = 1u << 30,
     CPU_SECONDARY = 1u << 31,
     CPU2_EPT = 1u << 1, CPU2_RDTSCP = 1u << 3, CPU2_VPID = 1u << 5, CPU2_WBINVD = 1u << 6,
@@ -1046,17 +1062,26 @@ enum {
 /* Set by the shim for a client that knows what to do with the TPR shadow (Parallels); QEMU keeps CR8 exiting. */
 int rhv_core_offer_tpr_shadow;
 
+/* Set by the shim for HyperKit (Docker Desktop), which insists on NMI-window exiting; see rhv_vcpu_run. */
+int rhv_core_offer_nmi_window;
+
+/*
+ * A client that starts its vCPU threads concurrently and expects hv_vcpu_create to return the thread's own index (HyperKit
+ * asserts it) says which slot it wants here; -1 means "the lowest free one", which is what the real framework does.
+ */
+int (*rhv_core_vcpu_hint)(void);
+
 int32_t rhv_vmx_read_capability(uint32_t c, uint64_t *value)
 {
     if (!value)
         return RHV_HV_BAD_ARGUMENT;
     const uint32_t proc = CPU_INTR_WINDOW | CPU_TSC_OFFSETING | CPU_HLT | CPU_INVLPG | CPU_MWAIT | CPU_RDPMC | CPU_RDTSC |
-                          CPU_CR3_LOAD | CPU_CR3_STORE | CPU_CR8_LOAD | CPU_CR8_STORE | (rhv_core_offer_tpr_shadow ? CPU_TPR_SHADOW : 0) | CPU_MOV_DR | CPU_IO |
+                          CPU_CR3_LOAD | CPU_CR3_STORE | CPU_CR8_LOAD | CPU_CR8_STORE | (rhv_core_offer_tpr_shadow ? CPU_TPR_SHADOW : 0) | (rhv_core_offer_nmi_window ? CPU_NMI_WINDOW : 0) | CPU_MOV_DR | CPU_IO |
                           CPU_IO_BITMAPS | CPU_MSR_BITMAPS | CPU_MONITOR | CPU_PAUSE | CPU_SECONDARY;
     switch (c) {
     case RHV_VMX_CAP_PINBASED:
     case RHV_VMX_CAP_TRUE_PINBASED:
-        *value = cap(0x16, PIN_EXTINT | PIN_NMI);
+        *value = cap(0x16, PIN_EXTINT | PIN_NMI | (rhv_core_offer_nmi_window ? PIN_VIRTUAL_NMI : 0));
         break;
     case RHV_VMX_CAP_PROCBASED:
     case RHV_VMX_CAP_TRUE_PROCBASED:

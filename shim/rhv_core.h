@@ -97,6 +97,8 @@ void rhv_core_init(const RhvBackend *backend);
 
 /* Whether hv_vmx_read_capability offers the TPR shadow (CPU-based control bit 21); default no. */
 extern int rhv_core_offer_tpr_shadow;
+extern int rhv_core_offer_nmi_window;
+extern int (*rhv_core_vcpu_hint)(void);
 
 /* Optional trace sink, printf style; NULL (the default) disables tracing. */
 extern void (*rhv_core_trace)(const char *fmt, ...);

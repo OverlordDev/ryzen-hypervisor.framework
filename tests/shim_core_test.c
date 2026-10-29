@@ -680,6 +680,42 @@ static void testMultiVcpu(void)
     CHECK(rhv_vcpu_destroy(a) == RHV_HV_SUCCESS && rhv_vm_destroy() == RHV_HV_SUCCESS);
 }
 
+static int hintSlot = -1;
+static int hintFn(void) { return hintSlot; }
+
+/* HyperKit: a vCPU thread names the slot it wants, whatever the order of arrival; NMI-window exiting is offered to it. */
+static void testHyperkitHooks(void)
+{
+    memset(&K, 0, sizeof(K));
+    memset(MV, 0, sizeof(MV));
+    K.thread = 1;
+    RhvBackend b = { NULL, f_vm_create, f_vm_destroy, f_vm_map, f_vm_unmap, f_vm_protect, m_vmcs_read, f_vmcs_write,
+                     m_get_regs, m_set_regs, f_get_fpu, f_set_fpu, f_msr, f_run, m_kick, f_now, f_tsc, f_thread,
+                     NULL, NULL, m_vcpu_open, m_vcpu_close };
+    rhv_core_init(&b);
+    rhv_core_vcpu_hint = hintFn;
+    CHECK(rhv_vm_create(0) == RHV_HV_SUCCESS);
+    uint32_t a = 99, c = 99, d = 99;
+    hintSlot = 2;
+    CHECK(rhv_vcpu_create(&c, 0) == RHV_HV_SUCCESS && c == 2);          /* asked for 2, got 2 although it came first */
+    hintSlot = 0;
+    CHECK(rhv_vcpu_create(&a, 0) == RHV_HV_SUCCESS && a == 0);
+    hintSlot = 2;
+    CHECK(rhv_vcpu_create(&d, 0) == RHV_HV_SUCCESS && d == 1);          /* 2 is taken: the lowest free slot */
+    hintSlot = -1;
+    rhv_core_vcpu_hint = NULL;
+
+    uint64_t cap = 0;
+    rhv_core_offer_nmi_window = 0;
+    CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_PROCBASED, &cap) == RHV_HV_SUCCESS && !((cap >> 32) & (1u << 22)));
+    rhv_core_offer_nmi_window = 1;
+    CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_PROCBASED, &cap) == RHV_HV_SUCCESS && ((cap >> 32) & (1u << 22)));
+    CHECK(rhv_vmx_read_capability(RHV_VMX_CAP_PINBASED, &cap) == RHV_HV_SUCCESS && ((cap >> 32) & (1u << 5)));
+    rhv_core_offer_nmi_window = 0;
+    CHECK(rhv_vcpu_destroy(a) == RHV_HV_SUCCESS && rhv_vcpu_destroy(c) == RHV_HV_SUCCESS && rhv_vcpu_destroy(d) == RHV_HV_SUCCESS);
+    CHECK(rhv_vm_destroy() == RHV_HV_SUCCESS);
+}
+
 int main(void)
 {
     testLifecycle();
@@ -689,6 +725,7 @@ int main(void)
     testParallelsApi();
     testFpuWhole();
     testMultiVcpu();
+    testHyperkitHooks();
     testFastPath();
     testFpuMsrVmcs();
     testRunAndThreads();

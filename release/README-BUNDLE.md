@@ -19,7 +19,10 @@ xattr -dr com.apple.quarantine .      # if the archive was downloaded with a bro
    SVM Mode must be enabled in the BIOS.
 2. **`./rhv doctor`** checks that everything is in place: CPU, boot-args, the kext (its ABI must match this build), QEMU, Parallels.
 3. Then whatever you need:
-   - **Docker:** `./rhv docker up`, then `eval "$(./rhv docker env)"` and `docker run --rm hello-world`.
+   - **Docker Desktop (the real one):** `./rhv docker-desktop get` (downloads Docker Desktop 4.97.0 from docker.com and installs it;
+     skip if you already have exactly that build), then `./rhv docker-desktop`, then start Docker as usual (`open -a Docker`).
+     Details: `docs/DOCKER-DESKTOP.md`. Quit Docker Desktop before running it.
+   - **A small Docker VM instead (no Docker Desktop):** `./rhv docker up`, then `eval "$(./rhv docker env)"` and `docker run --rm hello-world`.
      It is a small Linux VM (Alpine, 2 vCPUs, 2 GiB) running `dockerd`; images live in `~/.ryzenhv/docker/disk.raw`.
      To reach a container port from the Mac: `./rhv docker up --port 8080`, then `docker run -p 8080:80 nginx` and `http://127.0.0.1:8080`. Stop it with `./rhv docker down`.
      The first start downloads about 150 MB (the Alpine kernel, packages, the docker CLI) and takes a few minutes.
@@ -35,7 +38,7 @@ xattr -dr com.apple.quarantine .      # if the archive was downloaded with a bro
 | `lib/libPrlXmlModel.1.dylib` | stand-in for a Parallels library (build 57613 only) |
 | `qemu/` | QEMU 11.1.2 with HVF and user networking (GPL, sources: `LICENSES/SOURCES.txt`) |
 | `bin/rhv-info` | kext diagnostics (`rhv-info`, `rhv-info log`) |
-| `docs/` | details: Parallels, Docker, installing on a Ryzentosh |
+| `docs/` | details: Parallels, Docker Desktop, the small Docker VM, installing on a Ryzentosh |
 
 ## If something is wrong
 

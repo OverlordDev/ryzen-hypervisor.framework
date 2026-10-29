@@ -6,7 +6,8 @@
 #   ./rhv doctor             what works and what is missing on this Mac
 #   ./rhv kext               put RyzenHV.kext into your OpenCore EFI and set the boot-args
 #   ./rhv parallels          make Parallels Desktop run through RyzenHV (and ./rhv parallels undo)
-#   ./rhv docker up|down|status|env     Docker in a small Linux VM (docker CLI on this Mac talks to it)
+#   ./rhv docker-desktop     Docker Desktop (the real one) running on your AMD CPU, see docs/DOCKER-DESKTOP.md
+#   ./rhv docker up|down|status|env     or a small Linux VM with just dockerd (docker CLI on this Mac talks to it)
 #
 # Nothing here needs Xcode or Homebrew: only tools that ship with macOS, plus the QEMU and the shim in this bundle.
 set -u
@@ -23,6 +24,9 @@ BOOTARGS_WANTED="rhv_enable_svm=1 rhv_allow_users=1 amfi_get_out_of_my_way=0x1"
 NVRAM_GUID="7C436110-AB2A-4BBB-A880-FE41995C9F82"
 PB=/usr/libexec/PlistBuddy
 SUPPORTED_PARALLELS_BUILD=57613
+DD_APP="/Applications/Docker.app"
+DD_BUILD=244584
+DD_VERSION=4.97.0
 
 # version info written by package.sh: version=, abi=
 rel() { sed -n "s/^$1=//p" "$ROOT/VERSION" 2>/dev/null | head -1; }
@@ -81,6 +85,13 @@ doctor() {
         else warn "Parallels Desktop build $build: only build $SUPPORTED_PARALLELS_BUILD (26.5.0) is supported; ./rhv parallels will refuse"; fi
     else
         echo "  [--]   Parallels Desktop is not installed (optional)"
+    fi
+    if [ -d "$DD_APP" ]; then
+        local ddb; ddb="$(defaults read "$DD_APP/Contents/Info" CFBundleVersion 2>/dev/null)"
+        if [ "$ddb" = "$DD_BUILD" ]; then ok "Docker Desktop $DD_VERSION (build $ddb, supported): $("$ROOT/libexec/docker-desktop-shim.sh" status)"
+        else warn "Docker Desktop build $ddb: only $DD_VERSION (build $DD_BUILD) is supported; ./rhv docker-desktop get installs it"; fi
+    else
+        echo "  [--]   Docker Desktop is not installed (optional: ./rhv docker-desktop get)"
     fi
     echo
     if [ $fails -eq 0 ]; then say "All good."; else say "$fails problem(s) found."; fi
@@ -313,6 +324,54 @@ docker_cmd() {
     esac
 }
 
+# ---------------------------------------------------------------- Docker Desktop
+docker_desktop() {
+    local sub="${1:-setup}"
+    case "$sub" in
+    get)
+        local dmg="$DATA/dl/Docker-$DD_BUILD.dmg" mnt="$DATA/dl/mnt"
+        if [ -d "$DD_APP" ]; then
+            local have; have="$(defaults read "$DD_APP/Contents/Info" CFBundleVersion 2>/dev/null)"
+            [ "$have" = "$DD_BUILD" ] && { ok "Docker Desktop $DD_VERSION is already installed"; return 0; }
+            warn "$DD_APP is build $have; this would replace it with $DD_VERSION (build $DD_BUILD). Your containers and images stay."
+        fi
+        echo "Docker Desktop $DD_VERSION (Intel, about 630 MB) will be downloaded from desktop.docker.com and copied to $DD_APP (2.1 GB)."
+        confirm "Go ahead?" || { echo "cancelled"; return 1; }
+        mkdir -p "$DATA/dl" "$mnt"
+        if [ ! -f "$dmg" ]; then
+            curl -fSL --progress-bar -o "$dmg.part" "https://desktop.docker.com/mac/main/amd64/$DD_BUILD/Docker.dmg" || die "the download failed"
+            mv "$dmg.part" "$dmg"
+        fi
+        hdiutil attach -readonly -nobrowse -noverify -mountpoint "$mnt" "$dmg" >/dev/null || die "cannot mount the disk image"
+        if [ -d "$DD_APP" ]; then rm -rf "$DD_APP" || { hdiutil detach "$mnt" >/dev/null; die "cannot remove the old $DD_APP (quit Docker Desktop first)"; }; fi
+        cp -R "$mnt/Docker.app" "$DD_APP"; local rc=$?
+        hdiutil detach "$mnt" >/dev/null 2>&1
+        [ $rc -eq 0 ] || die "copying Docker.app failed"
+        codesign -dv "$DD_APP/Contents/MacOS/com.docker.backend" 2>&1 | grep -q "TeamIdentifier=9BNSXJN65R" || die "the copied app is not signed by Docker"
+        ok "Docker Desktop $DD_VERSION installed. Now: ./rhv docker-desktop"
+        ;;
+    setup)
+        [ -d "$DD_APP" ] || die "Docker Desktop is not installed. Run: ./rhv docker-desktop get"
+        local b; b="$(defaults read "$DD_APP/Contents/Info" CFBundleVersion 2>/dev/null)"
+        [ "$b" = "$DD_BUILD" ] || die "Docker Desktop build $b is not supported (need $DD_VERSION, build $DD_BUILD). Run: ./rhv docker-desktop get"
+        "$ROOT/bin/rhv-info" >/dev/null 2>&1 || die "the RyzenHV kext does not answer. Run ./rhv doctor"
+        pgrep -f "$DD_APP/Contents/MacOS/com.docker.backend" >/dev/null && die "quit Docker Desktop first (menu bar whale > Quit)"
+        say "Patching Docker Desktop's HyperKit and starting it through the shim..."
+        "$ROOT/libexec/docker-desktop-shim.sh" install || die "install failed"
+        cat <<EOF
+
+Done. Start Docker Desktop as usual (Launchpad, Dock or: open -a Docker). On the first start it may ask for your
+password to install its network helper. Then:  docker run --rm hello-world
+It runs HyperKit on all your cores with 8 GB; change that in Docker Desktop > Settings > Resources.
+After a Docker Desktop update run './rhv docker-desktop' again (Docker restores its own files). Undo: './rhv docker-desktop undo'.
+EOF
+        ;;
+    undo)   "$ROOT/libexec/docker-desktop-shim.sh" uninstall ;;
+    status) "$ROOT/libexec/docker-desktop-shim.sh" status ;;
+    *) die "usage: rhv docker-desktop [get|setup|undo|status]" ;;
+    esac
+}
+
 # ---------------------------------------------------------------- menu
 menu() {
     while true; do
@@ -321,16 +380,16 @@ menu() {
         echo "  1) Check this Mac (doctor)"
         echo "  2) Install the kext into the OpenCore EFI"
         echo "  3) Set up Parallels Desktop"
-        echo "  4) Start Docker"
-        echo "  5) Stop Docker"
+        echo "  4) Set up Docker Desktop"
+        echo "  5) Start / stop the small Docker VM (dockerd only)"
         echo "  q) Quit"
         local c; read -r -p "> " c
         case "$c" in
         1) doctor ;;
         2) kext_install ;;
         3) parallels setup ;;
-        4) docker_up ;;
-        5) docker_down ;;
+        4) docker_desktop setup ;;
+        5) if docker_running; then docker_down; else docker_up; fi ;;
         q|Q|"") return 0 ;;
         esac
     done
@@ -341,8 +400,9 @@ menu) menu ;;
 doctor) doctor ;;
 kext) shift; kext_install "$@" ;;
 parallels) shift; parallels "$@" ;;
+docker-desktop) shift; docker_desktop "$@" ;;
 docker) shift; docker_cmd "$@" ;;
 -y|--yes) shift; RHV_YES=1 exec "$SELF" "$@" ;;
 version|--version) echo "RyzenHV ${VERSION:-} (ABI ${ABI:-?})" ;;
-*) sed -n '3,12p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) sed -n '3,13p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

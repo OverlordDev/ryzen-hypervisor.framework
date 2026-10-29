@@ -7,9 +7,10 @@ The native `Hypervisor.framework` on Intel Macs is built on Intel VT-x (VMX), so
 emulators, current VMware/Parallels) does not start. This project builds a layer on **AMD-V (SVM)**
 that provides the same API.
 
-> **Status: Windows 11 runs in Parallels Desktop on a Ryzen** (Ryzen 7 5800H, Sequoia 15.8.1, OpenCore, up to 4 vCPUs,
+> **Status: Docker Desktop and Windows 11 in Parallels Desktop run on a Ryzen** (Ryzen 7 5800H, Sequoia 15.8.1, OpenCore, up to 4 vCPUs,
 > guest installation and use, keyboard, network). Phases 0–2 are done (SVM on all cores, a guest executes code, process memory
 > as guest memory, NPT) and so is phase 3 (the VMX API compatibility layer: QEMU/HVF boots Linux, Parallels boots Windows).
+> **Docker Desktop (Intel build 4.97.0) runs through HyperKit: `docs/DOCKER-DESKTOP.md`.**
 > **How to install Parallels with this kext: `docs/PARALLELS.md`.** It works on the exact Parallels build 26.5.0 (57613).
 > **A ready-made build without compiling: the archive from Releases and the `./rhv` installer** (kext into the EFI, Parallels, Docker, `./rhv doctor`),
 > see `START-HERE.md` inside the archive.
@@ -33,7 +34,7 @@ tools/rhv-map-test/       phase 2 acceptance test: guest memory = process memory
 tools/rhv-vmx-test/       phase 3: a guest driven through VMCS fields, the way a Hypervisor.framework client does it
 tools/rhv-long-test/      phase 3: a 64-bit guest with paging, x87/SSE/AVX, host interrupts
 tools/hvf-smoke/          phase 3: a mini-VMM on the PUBLIC Hypervisor.framework API, runs through the shim (scripts/run-with-shim.sh)
-scripts/                  collect-debug.sh (report for analysis), install-to-efi.sh, parallels-shim.sh (Parallels), qemu-hvf-test.sh, docker-hvf-test.sh
+scripts/                  collect-debug.sh (report for analysis), install-to-efi.sh, parallels-shim.sh (Parallels), docker-desktop-shim.sh (Docker Desktop), qemu-hvf-test.sh, docker-hvf-test.sh
 tests/host_test.c         unit tests of the pure functions, run anywhere
 docs/                     architecture, roadmap, Ryzentosh, debugging, reverse engineering
 ```
@@ -73,7 +74,8 @@ and you can write a VMCB and `VMRUN` (see `docs/ROADMAP.md`).
 - `docs/PHASE1.md`: how the first guest works, how to run it and how to read failures
 - `docs/PHASE2.md`: mapping process memory into the guest, NPF, how to run it and how to read failures
 - `docs/PARALLELS.md`: **installation and use with Parallels Desktop**, debugging, limits
-- `docs/DOCKER.md`: Docker through a Linux guest in QEMU/HVF (`scripts/docker-hvf-test.sh`)
+- `docs/DOCKER-DESKTOP.md`: **Docker Desktop** on an AMD CPU (HyperKit through the shim)
+- `docs/DOCKER.md`: a small Linux guest with dockerd in QEMU/HVF (`scripts/docker-hvf-test.sh`)
 - `docs/PHASE3.md`: the VMX API compatibility layer and the progress on QEMU and Parallels
 - `docs/REVERSING.md`: how to extract and study the native `Hypervisor.framework`
 
