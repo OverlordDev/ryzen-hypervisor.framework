@@ -1,12 +1,13 @@
 import SwiftUI
 
 enum Page: String, CaseIterable, Identifiable {
-    case status, kext, parallels, docker, log
+    case status, kext, autostart, parallels, docker, log
     var id: String { rawValue }
     var title: String {
         switch self {
         case .status: return "Status"
         case .kext: return "Install the kext"
+        case .autostart: return "Automatic start"
         case .parallels: return "Parallels Desktop"
         case .docker: return "Docker Desktop"
         case .log: return "Log"
@@ -16,6 +17,7 @@ enum Page: String, CaseIterable, Identifiable {
         switch self {
         case .status: return "checkmark.shield"
         case .kext: return "cpu"
+        case .autostart: return "bolt"
         case .parallels: return "display"
         case .docker: return "shippingbox"
         case .log: return "text.alignleft"
@@ -39,6 +41,7 @@ struct ContentView: View {
                     switch page ?? .status {
                     case .status: StatusView()
                     case .kext: KextView()
+                    case .autostart: AutostartView()
                     case .parallels: ParallelsView()
                     case .docker: DockerView()
                     case .log: LogView()

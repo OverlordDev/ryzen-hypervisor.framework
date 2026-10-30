@@ -67,6 +67,31 @@ Details and instructions: `docs/PHASE2.md`.
 - [ ] Access model (who may create VMs), resource limits
 - [ ] Compatibility with new AMD Vanilla patches
 
+## Phase 5: everything native (0.7.x, Parallels and Docker on the kext as the hypervisor provider)
+
+Where it stands: Docker Desktop runs natively; Parallels runs natively with Windows 10 (1 and 4 vCPUs), but through a small stand-in library that
+patches the CPU-vendor check. What is missing, in the order it is worth doing:
+
+1. [x] **Keyboard in a native Parallels VM** (done, `shim/hijack_patchonly.c`; the monitor calls `hv_vcpu_run_until`, so both run functions are replaced). The monitor drops keys until the guest writes 0 to port `0x80`; the shim arranges that, the native path does
+   not. Plan: the stand-in library (already inside `prl_vm_app`) replaces only `hv_vcpu_run` in libMonitor's imports and, on the first guest access
+   to ports `0x60`/`0x64` (and after a reset), calls the monitor's port handler with 0, as `parallels_arm_keyboard` in `shim/hv_shim.c` does.
+   User space only: no kext change, no reboot. Verified: keys sent with `prlctl send-key-event` open the Start menu after a cold boot and after a resume
+   (the first-access trigger fires 2 s after the VM starts; for a restored VM a once-a-second check does it). Still to verify: typing from the VM window, other layouts.
+2. [~] `kern.hv_support` at every boot without a command (installed and run on the author's machine; a real boot with it is not yet observed): `./rhv autostart install` (launchd daemon, `scripts/hv-sysctl-daemon.sh`), a button in the app.
+   Still to do there: remove a stale `hyperkit.pid` of Docker when the daemon runs (a leftover from the previous boot stops HyperKit).
+3. [ ] **TPR shadow in native mode** (speed: about half of the exits of a Windows boot are `CR8`). The framework does not strip the bit from the
+   primary controls word (`fixup_capability` only touches the entry/exit/secondary words), so the kext can offer it per VM for Parallels (caps are filled in
+   `vmCreate`, which knows `vm->parallels`) and make thread trap 9 (`hv_vmx_vcpu_set_apic_address`) succeed. The core already has the TPR shadow
+   (exit 43). Needs a kext build and a reboot. Done when: a Windows 10 boot reaches the desktop in about the time the shim needs (~60 s) with no `CR8` exits.
+4. [ ] The Parallels window: opened by the owner from the Parallels app, the mouse and shared folders (Mac drives in the guest) work; to check: resizing, clipboard, typing from the window.
+5. [ ] Sleep/wake of the Mac with a running native VM, snapshots, `kextunload`. Done: suspend and resume of a native VM (several cycles, and the library can be replaced between them).
+6. [ ] Docker Desktop and Parallels at the same time under load; Windows 11 (TPM/Secure Boot) and a Linux guest in Parallels; the other Parallels builds.
+7. [ ] **No wrapper in `/Applications`.** Today the vendor check is patched by a stand-in library that needs `prl_vm_app` replaced by a wrapper. Options: (a) the
+   kext patches `prl_vm_app` at `exec` (a kauth listener) and watches for `libMonitor.dylib` being mapped; the callback context and the race with the
+   check have to be proven first; (b) a Lilu plugin (UserPatcher) with the same patterns; (c) leave the wrapper. This is a design decision, not just work.
+8. [ ] Release 0.7.2: the boot service and the native Parallels button in the app (the app zip is built by `app/build-app.sh`), `rhv` menu entries, docs.
+9. [ ] Issue 1 (Tahoe): wait for the reporter's `selftest` and `rhv-info log`; if SVM turns out to be cleared by the macOS 26 kernel, find out where.
+
 ## Risks
 
 - The first kernel crashes are unavoidable. Debugging: serial/netdump from a second machine, or at least a fallback OpenCore entry.

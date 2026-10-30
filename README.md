@@ -14,8 +14,10 @@ that provides the same API.
 > **New in 0.7 (experimental, opt-in): native mode.** With the boot-arg `rhv_hv=1` the kext is the hypervisor provider itself and
 > Docker Desktop runs with Docker's own unmodified files: no shim, no wrappers, nothing re-signed. See `docs/NATIVE.md`.
 > **New in 0.7.1 (experimental): Parallels in native mode** (`./rhv parallels native`): Windows 10 boots on Apple's own Hypervisor.framework with 1 and
-> 4 vCPUs; keyboard input is not verified there. Also: the kext checks `EFER.SVME` on the CPU before every `VMRUN` (a panic report on macOS 26,
+> 4 vCPUs (no keyboard yet in 0.7.1). Also: the kext checks `EFER.SVME` on the CPU before every `VMRUN` (a panic report on macOS 26,
 > issue 1), and `./rhv doctor` says when it is not run from the unpacked archive. See `docs/NATIVE.md`.
+> **New in 0.7.2: the keyboard works in a native Parallels VM** (the kext is unchanged), **`./rhv autostart install`** turns `kern.hv_support` on at every
+> boot (a launchd service), and the RyzenHV app has an "Automatic start" page and a native-mode button for Parallels.
 > **How to install Parallels with this kext: `docs/PARALLELS.md`.** It works on the exact Parallels build 26.5.0 (57613).
 > **A ready-made build without compiling: the archive from Releases and the `./rhv` installer** (kext into the EFI, Parallels, Docker, `./rhv doctor`),
 > see `START-HERE.md` inside the archive.

@@ -3,7 +3,7 @@
 # Runs Parallels' VM process (prl_vm_app) with the Hypervisor.framework shim loaded.
 #
 #   ./scripts/parallels-shim.sh prepare          # builds a private copy of the VM app with the shim built in (no sudo)
-#   PATCHONLY=1 ./scripts/parallels-shim.sh prepare   # the same for native mode (kext booted with rhv_hv=1): only the vendor check is patched
+#   PATCHONLY=1 ./scripts/parallels-shim.sh prepare   # the same for native mode (kext booted with rhv_hv=1): the vendor check is patched and the keyboard armed
 #   sudo ./scripts/parallels-shim.sh install     # prl_vm_app in /Applications becomes a wrapper that starts that copy
 #   sudo ./scripts/parallels-shim.sh uninstall   # puts Parallels' own prl_vm_app back
 #   ./scripts/parallels-shim.sh fix-vms           # turns 3D acceleration off in every stopped VM (it crashes prl_vm_app here)
@@ -72,7 +72,7 @@ prepare)
     cp -p "$APP/Contents/Frameworks/libPrlXmlModel.1.dylib" "$FARM/Contents/Frameworks/libPrlXmlModel.1.orig.dylib"
     if [ -f "$HERE/lib/libPrlXmlModel.1.dylib" ]; then
         # Release bundle: the stand-in library comes prebuilt (it only re-exports ...orig.dylib next to it), no compiler needed.
-        # PATCHONLY=1 (native mode, the kext booted with rhv_hv=1): the variant that only patches Parallels' vendor check.
+        # PATCHONLY=1 (native mode, the kext booted with rhv_hv=1): the variant that patches Parallels' vendor check and arms its keyboard.
         LIB="$HERE/lib/libPrlXmlModel.1.dylib"
         if [ -n "${PATCHONLY:-}" ]; then
             LIB="$HERE/lib/libPrlXmlModel.1.native.dylib"
@@ -84,7 +84,7 @@ prepare)
         mkdir -p "$HERE/build/hijack-link"
         cp "$APP/Contents/Frameworks/libPrlXmlModel.1.dylib" "$HERE/build/hijack-link/libPrlXmlModel.1.dylib"
         install_name_tool -id "@loader_path/libPrlXmlModel.1.orig.dylib" "$HERE/build/hijack-link/libPrlXmlModel.1.dylib" 2>/dev/null
-        # PATCHONLY=1: for native mode (kext booted with rhv_hv=1). The library only patches the vendor check, hv_* stay Apple's.
+        # PATCHONLY=1: for native mode (kext booted with rhv_hv=1). The library patches the vendor check and arms the keyboard, the hv_* calls stay Apple's.
         if [ -n "${PATCHONLY:-}" ]; then make -C "$HERE" hijack-patchonly >/dev/null; else make -C "$HERE" hijack >/dev/null; fi
         cp "$HERE/build/libPrlXmlModel.1.dylib" "$FARM/Contents/Frameworks/libPrlXmlModel.1.dylib"
     fi

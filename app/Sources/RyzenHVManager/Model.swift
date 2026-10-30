@@ -20,6 +20,9 @@ final class Model: ObservableObject {
 
     @Published var parallelsWrapper = ""
     @Published var dockerWrapper = ""
+    @Published var nativeMode = false          // the kext is the hypervisor provider (booted with rhv_hv=1)
+    @Published var hvSupport = ""              // sysctl kern.hv_support
+    @Published var autostartStatus = ""        // output of libexec/hv-sysctl-daemon.sh status
 
     private let user = NSUserName()
 
@@ -67,12 +70,19 @@ final class Model: ObservableObject {
             kextLoaded = false
             parallelsWrapper = ""
             dockerWrapper = ""
+            nativeMode = false
+            hvSupport = ""
+            autostartStatus = ""
             return
         }
         let doctor = await Shell.run(dir.appendingPathComponent("rhv").path, ["doctor"])
         checks = Check.parse(doctor.output)
         let info = await Shell.run(dir.appendingPathComponent("bin/rhv-info").path)
         kextLoaded = info.status == 0 && info.output.contains("RyzenHV kext")
+        let hv = await Shell.run(dir.appendingPathComponent("bin/rhv-info").path, ["hv"])
+        nativeMode = hv.output.contains("front end: registered")
+        hvSupport = (await Shell.run("/usr/sbin/sysctl", ["-n", "kern.hv_support"])).output.trimmingCharacters(in: .whitespacesAndNewlines)
+        autostartStatus = await Shell.run(dir.appendingPathComponent("libexec/hv-sysctl-daemon.sh").path, ["status"]).output
         parallelsWrapper = await Shell.run(dir.appendingPathComponent("libexec/parallels-shim.sh").path, ["status"]).output
         dockerWrapper = await Shell.run(dir.appendingPathComponent("libexec/docker-desktop-shim.sh").path, ["status"]).output
     }
@@ -183,6 +193,7 @@ final class Model: ObservableObject {
     var parallelsSupportedBuild: String { bundleDir.flatMap { Store.value("parallels_build", in: $0) } ?? "57613" }
     var parallelsSupported: Bool { parallelsBuild == parallelsSupportedBuild }
     var parallelsEnabled: Bool { parallelsWrapper.contains("wrapper installed") }
+    var parallelsNative: Bool { parallelsWrapper.contains("mode: native") }
 
     func enableParallels() {
         guard let dir = bundleDir else { return }
@@ -197,6 +208,55 @@ final class Model: ObservableObject {
             say("3/3 Turning 3D acceleration off in existing VMs…")
             await turnOff3D()
             say("Parallels is ready. For each new VM press “Turn off 3D”.")
+        }
+    }
+
+    /// Native mode (docs/NATIVE.md): Parallels runs on Apple's own Hypervisor.framework and the kext; its CPU-vendor check is patched and its keyboard armed by a small stand-in library.
+    func enableParallelsNative() {
+        guard let dir = bundleDir else { return }
+        task("Enabling Parallels Desktop (native mode)") { [self] in
+            guard nativeMode else { say("The kext is not in native mode: install it with “Native mode” on the Install page, restart, then try again."); return }
+            guard hvSupport == "1" else { say("kern.hv_support is \(hvSupport.isEmpty ? "unknown" : hvSupport): Parallels would use its own engine. Open “Automatic start” first."); return }
+            let script = dir.appendingPathComponent("libexec/parallels-shim.sh").path
+            say("1/3 Preparing the private copy of Parallels (native mode)…")
+            let prepare = await Shell.run(script, ["prepare"], env: ["PATCHONLY": "1"], onLine: line(""))
+            guard prepare.status == 0 else { say("Preparation failed."); return }
+            say("2/3 Installing the wrapper in place of prl_vm_app (your password is needed)…")
+            let install = await Shell.admin("SUDO_USER=\(Shell.quote(user)) \(Shell.quote(script)) install", onLine: line(""))
+            guard install.status == 0 else { say("Installing the wrapper failed."); return }
+            say("3/3 Turning 3D acceleration off in existing VMs…")
+            await turnOff3D()
+            say("Parallels is ready (native mode). Set the VM's hypervisor type to Apple.")
+        }
+    }
+
+    // MARK: automatic start of kern.hv_support
+
+    var autostartAvailable: Bool {
+        guard let dir = bundleDir else { return false }
+        return FileManager.default.isExecutableFile(atPath: dir.appendingPathComponent("libexec/hv-sysctl-daemon.sh").path)
+    }
+    var autostartInstalled: Bool { autostartStatus.contains("daemon file: /Library") }
+
+    func installAutostart() {
+        guard let rhv else { return }
+        task("Installing the boot service") { [self] in
+            let result = await Shell.admin("\(Shell.quote(rhv)) autostart install", onLine: line(""))
+            say(result.status == 0 ? "Done. kern.hv_support is turned on at every boot." : "The boot service was not installed.")
+        }
+    }
+
+    func removeAutostart() {
+        guard let rhv else { return }
+        task("Removing the boot service") { [self] in
+            _ = await Shell.admin("\(Shell.quote(rhv)) autostart remove", onLine: line(""))
+        }
+    }
+
+    func turnOnHvSupportNow() {
+        guard let dir = bundleDir else { return }
+        task("Turning kern.hv_support on") { [self] in
+            _ = await Shell.run(dir.appendingPathComponent("bin/rhv-info").path, ["hv", "sysctl", "1"], onLine: line(""))
         }
     }
 

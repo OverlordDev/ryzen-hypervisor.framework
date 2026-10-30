@@ -7,7 +7,8 @@
 #   ./rhv kext [--native]    put RyzenHV.kext into your OpenCore EFI and set the boot-args (--native: the kext itself is the hypervisor
 #                            provider, no shim and no patched app files for Docker Desktop, see docs/NATIVE.md)
 #   ./rhv parallels          make Parallels Desktop run through RyzenHV (and ./rhv parallels undo)
-#   ./rhv parallels native   the same for native mode (kext booted with --native): Apple's own Hypervisor.framework, only the vendor check patched
+#   ./rhv autostart [install|remove|status]   turn kern.hv_support on at every boot (native mode; a launchd service, needs your password once)
+#   ./rhv parallels native   the same for native mode (kext booted with --native): Apple's own Hypervisor.framework, the vendor check patched and the keyboard armed
 #   ./rhv docker-desktop     Docker Desktop (the real one) running on your AMD CPU (native when the kext runs with --native, else the shim)
 #   ./rhv docker up|down|status|env     or a small Linux VM with just dockerd (docker CLI on this Mac talks to it)
 #
@@ -227,6 +228,21 @@ kext_install() {
 }
 
 # ---------------------------------------------------------------- Parallels
+# Boot service that turns kern.hv_support on at every boot (native mode): see libexec/hv-sysctl-daemon.sh.
+autostart() {
+    local sub="${1:-status}" d="$ROOT/libexec/hv-sysctl-daemon.sh"
+    [ -x "$d" ] || die "this bundle has no libexec/hv-sysctl-daemon.sh"
+    case "$sub" in
+    install)
+        "$ROOT/bin/rhv-info" hv 2>/dev/null | grep -q "front end: registered" || die "the kext is not in native mode (./rhv kext --native, then reboot): there would be nothing to turn on"
+        if [ "$(id -u)" = 0 ]; then "$d" install; else sudo "$d" install; fi ;;
+    remove)
+        if [ "$(id -u)" = 0 ]; then "$d" remove; else sudo "$d" remove; fi ;;
+    status) "$d" status ;;
+    *) die "usage: rhv autostart [install|remove|status]" ;;
+    esac
+}
+
 parallels() {
     local sub="${1:-setup}" app="/Applications/Parallels Desktop.app" build
     case "$sub" in
@@ -253,14 +269,14 @@ EOF
         ;;
     native)
         # Native mode (docs/NATIVE.md): the kext is the hypervisor provider, so Parallels uses Apple's own Hypervisor.framework. Only its
-        # CPU-vendor check is patched, in memory, by a small stand-in library; no hv_* call is replaced.
+        # CPU-vendor check is patched in memory and its keyboard armed by a small stand-in library; the hv_* calls are Apple's own (hv_vcpu_run* only get a wrapper).
         [ -d "$app" ] || die "Parallels Desktop is not installed"
         build="$(defaults read "$app/Contents/Info" CFBundleVersion 2>/dev/null)"
         [ "$build" = "$SUPPORTED_PARALLELS_BUILD" ] || die "Parallels build $build is not supported; RyzenHV needs 26.5.0 (build $SUPPORTED_PARALLELS_BUILD)"
         doctor >/dev/null 2>&1 || { doctor; die "fix the problems above first"; }
         "$ROOT/bin/rhv-info" hv 2>/dev/null | grep -q "front end: registered" || die "the kext is not in native mode. Run ./rhv kext --native, reboot, then try again"
         if [ "$(sysctl -n kern.hv_support 2>/dev/null)" != 1 ]; then
-            die "kern.hv_support is 0 (Parallels would use its own engine). Run: $ROOT/bin/rhv-info hv sysctl 1   (it is reset by every reboot)"
+            die "kern.hv_support is 0 (Parallels would use its own engine). Run: ./rhv autostart install (turns it on at every boot), or just now: $ROOT/bin/rhv-info hv sysctl 1"
         fi
         say "Preparing a private copy of Parallels' VM process (native mode)..."
         PATCHONLY=1 "$ROOT/libexec/parallels-shim.sh" prepare || die "prepare failed"
@@ -269,8 +285,8 @@ EOF
         "$ROOT/libexec/parallels-shim.sh" fix-vms || true
         cat <<EOT
 
-Done (native mode). Experimental: tested with Windows 10 (1 and 4 vCPUs) on one machine. Keys to know:
-  - after every reboot run  $ROOT/bin/rhv-info hv sysctl 1  before starting a VM
+Done (native mode). Experimental: tested with Windows 10 (1 and 4 vCPUs, keyboard included) on one machine. Keys to know:
+  - kern.hv_support is 0 after every reboot: ./rhv autostart install turns it on at every boot (or run $ROOT/bin/rhv-info hv sysctl 1 before starting a VM)
   - the hypervisor type of the VM must be apple: prlctl set "<VM name>" --hypervisor-type apple
   - the log of the vendor patch is ~/.ryzenhv/prl-patch.log; ./rhv parallels undo removes the wrapper
 EOT
@@ -458,6 +474,7 @@ menu) menu ;;
 doctor) doctor ;;
 kext) shift; kext_install "$@" ;;
 parallels) shift; parallels "$@" ;;
+autostart) shift; autostart "$@" ;;
 docker-desktop) shift; docker_desktop "$@" ;;
 docker) shift; docker_cmd "$@" ;;
 -y|--yes) shift; RHV_YES=1 exec "$SELF" "$@" ;;

@@ -71,7 +71,7 @@ hijack: | $(BUILD)
 		-install_name @rpath/$(HIJACK_NAME) -Wl,-reexport_library,$(HIJACK_ORIG) \
 		-o $(BUILD)/$(HIJACK_NAME) $(SHIM_SRC) shim/hijack.c -framework Hypervisor -framework IOKit -framework CoreFoundation
 
-# Native mode (rhv_hv=1): the same stand-in library, but it only patches Parallels' vendor check and replaces no hv_* call
+# Native mode (rhv_hv=1): the same stand-in library, but it patches Parallels' vendor check and arms its keyboard (it wraps only hv_vcpu_run and hv_vcpu_run_until)
 # (shim/hijack_patchonly.c). Needs the same build/hijack-link copy of the real library.
 hijack-patchonly: | $(BUILD)
 	@test -f "$(HIJACK_ORIG)" || { echo "run scripts/parallels-shim.sh prepare first (it makes $(HIJACK_ORIG))"; exit 1; }
