@@ -55,8 +55,8 @@ and after a resume. The offsets belong to Parallels 26.5.0 (57613); another buil
 
 Limits: only Windows 10 was tried. Since 0.7.3 the kext offers the TPR shadow (see below), which cut the Windows boot from about 90 s to about 20 s on the author's
 machine (the guest's tools answer after ~19 s; before, every `CR8` access of Windows was an exit). Suspending and resuming the VM works **when the Parallels Desktop app is running**;
-with only its background service (`prl_client_app --start-services`, what runs after a restart until you open the app) `prlctl suspend` hung twice in the author's tests (the
-state files were written, the VM stayed "suspending" and its process could not exit until a reboot); keep the app open, or shut the VM down instead. Sleep/wake of the Mac, 3D
+with only its background service (`prl_client_app --start-services`, what runs after a restart until you open the app) a suspend hung three times in the author's tests (the
+state files were written, the VM stayed "suspending", one thread stuck in `close()` inside macOS without any kext frame in its stack, and the process could not exit until a reboot; ROADMAP item 11); keep the app open, or shut the VM down instead. Sleep/wake of the Mac, 3D
 acceleration, snapshots and long runs are untested. `kern.hv_support` is 0 after every reboot: `./rhv autostart install` (0.7.2, a launchd service that turns it on once
 the kext is up; also a button in the app) does it for you (seen working on two real boots), otherwise run `rhv-info hv sysctl 1` before starting a VM.
 
@@ -74,8 +74,8 @@ whether it is on). For VMX control words the kext also tells a client the real l
 
 VirtualBox 7 has no kernel driver on macOS: it runs its VMs through Hypervisor.framework (its "NEM" back end), so it uses the native front end like Docker and Parallels. Tested
 with 7.2.22: an EFI VM with 2 vCPUs boots the Windows 10 installer from an ISO and reaches the disk page in about a minute. It needs `rhv_hv=1`, `kern.hv_support` = 1 and the
-TPR shadow (on by default). Its log says `NEM: Failed to create ASID` and `Turtle execution mode`: `hv_vm_space_*` are not implemented yet, so it runs below its full speed
-and makes about six kernel calls per exit. No full installation to a disk has been run yet. **VirtualBox 6.x is a different story**: it loads its own driver, which wants to switch AMD-V
+TPR shadow (on by default). Its log says `NEM: Failed to create ASID` (`hv_vm_space_*` are not implemented, VirtualBox goes on without) and `Turtle execution mode` (VirtualBox prints that for its NEM engine
+in general, it is not a consequence of the missing spaces). It makes about six kernel calls per exit. A Windows 10 installation onto a disk was run to the end by a user (reported, not reproduced by the author). **VirtualBox 6.x is a different story**: it loads its own driver, which wants to switch AMD-V
 on itself and stops with `VERR_SVM_IN_USE` while RyzenHV keeps `EFER.SVME` on every core (issue 2). 7.x has the override `VBOX_HWVIRTEX_IGNORE_SVM_IN_USE`; it has not been tried on 6.x.
 
 ## kern.hv_support

@@ -95,16 +95,18 @@ patches the CPU-vendor check. What is missing, in the order it is worth doing:
 10. [~] **VirtualBox 7.x** (0.7.3 offers the TPR shadow by default, so the first point below is done) (no kernel driver on macOS, runs through Hypervisor.framework, so through the native front end): 7.2.22 starts, its BIOS/EFI and Windows
     Setup run, no panic. Needs `rhv-info hv tpr 1` (the TPR shadow is off by default): without it the guest does ~70k `CR8` exits a second per vCPU and Setup
     stays on its first screen for minutes; with it Setup reaches the disk page in about a minute and the `CR8` exits are gone from the sample. To do: decide the
-    default (a per-client policy or a boot-service call), `hv_vm_space_*` (VirtualBox says "Turtle execution mode"), fewer kernel calls per exit (about six now),
+    default (a per-client policy or a boot-service call), `hv_vm_space_*` (not for speed: VirtualBox prints "Turtle execution mode" for the NEM engine in general, the disassembly of VBoxVMM 7.2.22 shows the message does not depend on the ASID; with ASIDs it would only map memory through `hv_vm_map_space` and call `hv_vcpu_set_space`, so it is a compatibility item), fewer kernel calls per exit (about six now),
     a run with a real disk. VirtualBox 6.1.x has its own driver that wants to switch AMD-V on itself and stops with `VERR_SVM_IN_USE` while RyzenHV holds SVME
     (issue 2); 7.x has the override `VBOX_HWVIRTEX_IGNORE_SVM_IN_USE`, not tried on 6.1.
-11. [ ] **`prlctl suspend` of a native Parallels VM hung twice** (2026-10-30, 12:03 and 12:20, both on kext 4081E1B4 with only `prl_client_app --start-services`
-    running, not the Parallels Desktop app): the state files and `suspended.png` are written, the log ends at `Waiting the screenshot file to be written`, the VM
-    stays `suspending`, the process is in `U` and after `kill -9` a zombie (`?E`) with one thread in the kernel; the 8 GB stay pinned until a reboot. The spindump
-    of the whole system has no RyzenHV, NVIDIA or IOGPU image in any stack, so the cause is not known. Suspends that worked: 11:08 (window closed), three
-    `prlctl suspend` cycles around 11:20 and one at 11:31, all on kext C6CEE846 with the Parallels Desktop app open. Two things differ (kext version, app
-    open) and the test that separates them: open the app, cold-boot, `prlctl suspend` on 4081E1B4; if it hangs, repeat on C6CEE846 (the `.bak` on the EFI stick).
-    The kext now logs `vm_destroy done` and `vcpuN destroy done`, to see whether the teardown traps return. Until this is settled: shut the VM down, do not suspend it.
+11. [x] **A native Parallels VM hangs on suspend when the Parallels Desktop app is not open** (three times by 2026-10-30; the third on 0.7.4, caused on purpose by ending the app's
+    `prl_client_app` while the VM ran: the dispatcher then logs "Stopping VMs in progress" and suspends the VM). With the app open, suspend (23 s) and resume (4 s) work on 0.7.4 and the
+    kext logs `vcpuN destroy done` and `vm_destroy done`. Without the app the VM's own log ends at `Waiting the screenshot file to be written` (suspended.png and the .mem file are on disk), the
+    process stays in `U` with one `vm.state-machine` thread inside `close()`, all vCPU threads are parked in a condition wait and **no kext trap is in progress** (the kext log has no
+    `vm_destroy`). The kernel stack of that thread (`spindump`, symbolized with the kernel's symbols after taking the KASLR slide 0xe8000 off) is only xnu frames: syscall, close, vnode_put /
+    vnode release, `vm_object_sleep`, `lck_rw_sleep`, thread_block; no frame of RyzenHV or of any other kext. So it is a file close inside macOS that waits for a busy page object, started by a Parallels that
+    has no GUI client; which file (config.sav, suspended.png or the .mem file are not in `lsof` any more) is not known. Not proven to be independent of the kext (an Intel Mac with Parallels' own hypervisor
+    cannot be compared here), but nothing points at it. After the hang `prlctl` answers "Parallels Desktop is shutting down" and only a reboot clears it. Rule in the README: keep the app open while a VM runs.
+    An open point: a warning in `rhv doctor` / the wrapper when the VM starts without the app.
 
 ## Risks
 

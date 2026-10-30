@@ -15,7 +15,7 @@ so the unmodified apps run.
 |---|---|
 | **Docker Desktop 4.97.0** (the Intel build) | works with Docker's own, unmodified files: engine, `docker run`, builds, 16 vCPUs |
 | **Parallels Desktop 26.5.0** (build 57613 only) | **Windows 10 works**: 1–4 vCPUs, keyboard, network, shared folders, Parallels Tools, suspend and resume. A boot takes about 20 seconds. Windows 11 worked in the older (shim) mode |
-| **VirtualBox 7.x** | experimental: version 7.2.22 boots the Windows 10 installer. VirtualBox 6.x does **not** work (see below) |
+| **VirtualBox 7.x** | experimental: version 7.2.22 runs a Windows 10 installation onto a disk (reported by a user, a second report would help). VirtualBox 6.x does **not** work (see below) |
 | **QEMU** with `-accel hvf` | boots Linux |
 
 Tested on one machine: **Ryzen 7 5800H, macOS Sequoia 15.8.1, OpenCore**. macOS 26 (Tahoe) has not been tried by the author; someone reported a failure to start VMs there
@@ -23,7 +23,7 @@ Tested on one machine: **Ryzen 7 5800H, macOS Sequoia 15.8.1, OpenCore**. macOS 
 when a VM starts. It is tested here by simulating the same state, but not on Tahoe itself.
 
 **Not verified:** sleep and wake of the Mac, runs of many hours, 3D acceleration in Parallels (it crashes in NVIDIA's Metal driver on the author's machine, keep it
-off), Windows 11 or Linux guests in Parallels' native mode, other Parallels builds, a full Windows installation onto a disk in VirtualBox.
+off), Windows 11 or Linux guests in Parallels' native mode, other Parallels builds.
 
 ## Install (the ready-made build)
 
