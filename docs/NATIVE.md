@@ -88,7 +88,12 @@ path has not been tested**, use the command.
 ## Known limits, please read
 
 - Only tested on macOS 15.8.1, Ryzen 7 5800H, OpenCore, Docker Desktop 4.97.0 and Parallels 26.5.0 with a Windows 10 guest. macOS 26 (Tahoe) has not been tried
-  by the author; a report of a panic on 26.7.1 is what 0.7.1's check of `EFER.SVME` before every `VMRUN` is for (issue 1; not tested on Tahoe).
+  by the author; issue 1 (26.7.1) is what the check of `EFER.SVME` before every `VMRUN` (0.7.1) and the rescan above (0.7.4) are for; neither is tested on Tahoe.
+- **CPUs that are not online when the kext starts** (0.7.4; issue 1, a Ryzen 9 5900X on macOS 26.7.1 logged `cpus=1`): the CPU count is taken once, in `start()`. `svm::rescan()` runs a
+  rendezvous again, probes the cores it has not seen, gives them a host save area and turns SVM on, if `enableAll()` ran before. It is called at VM and vCPU creation and, once per run, in `VmRun`
+  when `ensureThisCpu()` says the core was never seen (-2) or SVM is not on everywhere. `rhv-info hv svmlimit N` makes the SVM code forget the cores from N up (the reporter's state) and
+  `rhv-info hv rescan` brings them back; the log line `rescan: the rendezvous reached N CPUs` says whether the late cores answer at all. Tested on the 5800H with `svmlimit 1`:
+  `rescan`, `hvf-smoke`, Docker Desktop, a Parallels Windows 10 cold boot (21 s), a VirtualBox VM, and `svmlimit 1` while the Parallels VM ran (the guest went on). Not tested on Tahoe.
 - Some gaps in the kernel code are known and not closed: a race between `hv_vm_map` and `hv_vm_destroy` from two threads of one process, a
   stale vCPU target after `exec()` with a live VM, no entitlement check (any local process can create a VM; with `rhv_allow_users=1`
   every user can). Do not use it on a machine where untrusted local code runs.

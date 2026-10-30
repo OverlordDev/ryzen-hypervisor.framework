@@ -10,6 +10,7 @@
 #include <libkern/OSAtomic.h>
 
 #include "HvFrontend.hpp"
+#include "SVM.hpp"
 #include "HvPatch.hpp"
 #include "HvMsrs.hpp"
 #include "HvSlots.hpp"
@@ -375,6 +376,7 @@ kern_return_t tVcpuCreate(void *target, uint64_t arg)
     if (!v)
         return kHvNoRes;
     {
+        rhv::svm::rescan();       /* CPUs that came online after the kext started */
         RHVInfo info;
         gSvc->getInfo(&info);
         IOReturn err = kIOReturnSuccess;

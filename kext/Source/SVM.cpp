@@ -31,6 +31,12 @@ CpuProbe                  gProbe[RHV_MAX_CPUS];
 CpuVerify                 gVerify[RHV_MAX_CPUS];
 IOBufferMemoryDescriptor *gHostSave[RHV_MAX_CPUS];
 uint64_t                  gHostSavePa[RHV_MAX_CPUS];
+uint8_t                   gSeenCpu[RHV_MAX_CPUS];     /* this CPU has been probed */
+uint8_t                   gOn[RHV_MAX_CPUS];          /* SVM is on here (counted in gActive) */
+IOLock                   *gRescanLock;
+volatile SInt32           gNewCpus;                   /* CPUs a rescan found */
+volatile SInt32           gRescanSeen;                /* CPUs a rescan's rendezvous reached */
+bool                      gWantEnabled;               /* enableAll() succeeded: CPUs that show up later get SVM too */
 uint32_t                  gNCpus;
 volatile SInt32           gActive;
 volatile SInt32           gHealed;    /* times ensureThisCpu() restored EFER.SVME or VM_HSAVE_PA */
@@ -44,19 +50,22 @@ bool cpuUsable(const CpuProbe &p)
     return p.vendorAmd && p.svmSupported && !p.svmDisabled;
 }
 
+/* gMaxIndex is raised by several CPUs at once, so a plain compare-and-store could lose the highest one. */
+void noteIndex(int cpu)
+{
+    for (;;) {
+        SInt32 m = gMaxIndex;
+        if (cpu <= m || OSCompareAndSwap((UInt32)m, (UInt32)cpu, (volatile UInt32 *)&gMaxIndex))
+            return;
+    }
+}
+
 /*
  * The *Action functions run on every CPU with interrupts disabled:
  * no allocation, no logging (not even RHV_*), no locks.
  */
-void probeAction(void *)
+void probeThisCpu(int cpu)
 {
-    int cpu = cpu_number();
-    OSIncrementAtomic(&gSeen);
-    if (cpu > gMaxIndex)
-        gMaxIndex = cpu;      /* every CPU runs this with interrupts off, so a plain store is enough */
-    if (cpu < 0 || cpu >= RHV_MAX_CPUS)
-        return;
-
     CpuProbe &p = gProbe[cpu];
     uint32_t r[4];
 
@@ -97,11 +106,37 @@ void probeAction(void *)
     p.eferSvme = (rhv_rdmsr(RHV_MSR_EFER) & RHV_EFER_SVME) ? 1 : 0;
 }
 
+void probeAction(void *)
+{
+    int cpu = cpu_number();
+    OSIncrementAtomic(&gSeen);
+    noteIndex(cpu);
+    if (cpu < 0 || cpu >= RHV_MAX_CPUS)
+        return;
+    gSeenCpu[cpu] = 1;
+    probeThisCpu(cpu);
+}
+
+/* A later look at the CPUs: only the ones that were not probed yet. */
+void rescanProbeAction(void *)
+{
+    int cpu = cpu_number();
+    OSIncrementAtomic(&gRescanSeen);
+    if (cpu < 0 || cpu >= RHV_MAX_CPUS || gSeenCpu[cpu])
+        return;
+    noteIndex(cpu);
+    OSIncrementAtomic(&gNewCpus);
+    gSeenCpu[cpu] = 1;
+    probeThisCpu(cpu);
+}
+
 void enableAction(void *)
 {
     int cpu = cpu_number();
     if (cpu < 0 || cpu >= RHV_MAX_CPUS)
         return;
+    if (gOn[cpu])
+        return;               /* counted already (a rescan runs this on every CPU again) */
     if (!cpuUsable(gProbe[cpu]) || !gHostSavePa[cpu])
         return;
 
@@ -111,6 +146,7 @@ void enableAction(void *)
         rhv_wrmsr(RHV_MSR_EFER, efer | RHV_EFER_SVME);
     rhv_wrmsr(RHV_MSR_VM_HSAVE_PA, gHostSavePa[cpu]);
 
+    gOn[cpu] = 1;
     OSIncrementAtomic(&gActive);
 }
 
@@ -127,6 +163,26 @@ void disableAction(void *)
         rhv_wrmsr(RHV_MSR_VM_HSAVE_PA, 0);
         rhv_wrmsr(RHV_MSR_EFER, efer & ~RHV_EFER_SVME);
     }
+    gOn[cpu] = 0;
+}
+
+/* debugLimit(): the CPUs from index arg up are forgotten, as if they had not been online when the kext started. */
+void dropAction(void *arg)
+{
+    int cpu = cpu_number();
+    if (cpu < 0 || cpu >= RHV_MAX_CPUS || (uintptr_t)cpu < (uintptr_t)arg)
+        return;
+    if (gOn[cpu]) {
+        uint64_t efer = rhv_rdmsr(RHV_MSR_EFER);
+        if (efer & RHV_EFER_SVME) {
+            rhv_wrmsr(RHV_MSR_VM_HSAVE_PA, 0);
+            rhv_wrmsr(RHV_MSR_EFER, efer & ~RHV_EFER_SVME);
+        }
+        gOn[cpu] = 0;
+        OSDecrementAtomic(&gActive);
+    }
+    gSeenCpu[cpu] = 0;
+    bzero(&gProbe[cpu], sizeof(gProbe[cpu]));
 }
 
 void verifyAction(void *)
@@ -199,7 +255,10 @@ namespace svm {
 
 void probe(RHVInfo *out, bool readMsrs)
 {
+    if (!gRescanLock)
+        gRescanLock = IOLockAlloc();
     bzero(gProbe, sizeof(gProbe));
+    bzero(gSeenCpu, sizeof(gSeenCpu));
     gReadMsrs = readMsrs;
 
     /*
@@ -218,6 +277,7 @@ void probe(RHVInfo *out, bool readMsrs)
         RHV_WARN("machine reports %u CPUs, only the first %u are handled", gNCpus, RHV_MAX_CPUS);
         gNCpus = RHV_MAX_CPUS;
     }
+    RHV_INFO("probe: %u CPUs online now; more may come up later, rescan() picks them up", gNCpus);
 
     bzero(out, sizeof(*out));
     out->abiVersion = RHV_ABI_VERSION;
@@ -278,6 +338,7 @@ uint32_t enableAll()
     } else {
         RHV_INFO("SVM enabled on %u CPUs", active);
     }
+    gWantEnabled = active > 0;
     return active;
 }
 
@@ -290,7 +351,9 @@ void disableAll()
         mp_rendezvous_no_intrs(disableAction, nullptr);
         gActive = 0;
     }
-    gSuspended = false;
+    bzero(gOn, sizeof(gOn));
+    gWantEnabled = false;
+    gSuspended   = false;
     freeHostSave();
 }
 
@@ -302,6 +365,7 @@ void suspend()
     RHV_SYNC("sleep: turning SVM off, host save areas are kept");
     mp_rendezvous_no_intrs(disableAction, nullptr);
     gActive    = 0;
+    bzero(gOn, sizeof(gOn));
     gSuspended = true;
 }
 
@@ -313,6 +377,7 @@ uint32_t resume()
     RHV_SYNC("wake: turning SVM back on");
     gSuspended = false;
     gActive    = 0;
+    bzero(gOn, sizeof(gOn));
     mp_rendezvous_no_intrs(enableAction, nullptr);
 
     uint32_t active = (uint32_t)gActive;
@@ -373,7 +438,11 @@ bool activeOnAllUsable()
 int ensureThisCpu()
 {
     int cpu = cpu_number();
-    if (cpu < 0 || cpu >= RHV_MAX_CPUS || !cpuUsable(gProbe[cpu]) || !gHostSavePa[cpu])
+    if (cpu < 0 || cpu >= RHV_MAX_CPUS)
+        return -1;
+    if (!gSeenCpu[cpu])
+        return -2;
+    if (!cpuUsable(gProbe[cpu]) || !gHostSavePa[cpu])
         return -1;
     uint64_t efer = rhv_rdmsr(RHV_MSR_EFER);
     uint64_t hsave = rhv_rdmsr(RHV_MSR_VM_HSAVE_PA);
@@ -390,6 +459,85 @@ int ensureThisCpu()
 uint32_t healedCount()
 {
     return (uint32_t)gHealed;
+}
+
+uint32_t cpuCount()
+{
+    return gNCpus;
+}
+
+uint32_t usableCpuCount()
+{
+    return usableCount();
+}
+
+uint32_t rescan()
+{
+    if (!gRescanLock)
+        return 0;
+
+    uint32_t enabled = 0;
+    IOLockLock(gRescanLock);
+
+    gNewCpus = 0;
+    gRescanSeen = 0;
+    mp_rendezvous_no_intrs(rescanProbeAction, nullptr);
+    /* Logged the first time even when nothing is new: it tells whether the rendezvous reaches the late CPUs at all. */
+    static bool sLoggedOnce;
+    if (gNewCpus || !sLoggedOnce) {
+        sLoggedOnce = true;
+        RHV_INFO("rescan: the rendezvous reached %d CPUs (highest index %d), %d of them new", (int)gRescanSeen, (int)gMaxIndex, (int)gNewCpus);
+    }
+    if (gNewCpus) {
+        uint32_t n = (uint32_t)gMaxIndex + 1;
+        gNCpus = n > RHV_MAX_CPUS ? RHV_MAX_CPUS : n;
+        RHV_INFO("rescan: %d CPUs came online after the start, %u known now, %u can use SVM",
+                 (int)gNewCpus, gNCpus, usableCount());
+    }
+
+    if (gWantEnabled && !gSuspended) {
+        bool need = false;
+        for (uint32_t i = 0; i < gNCpus; i++) {
+            if (!cpuUsable(gProbe[i]) || gOn[i])
+                continue;
+            if (!gHostSavePa[i] && !allocHostSave(i))
+                continue;
+            need = true;
+        }
+        if (need) {
+            int before = (int)gActive;
+            RHV_SYNC("rescan: enabling SVM on the CPUs that came up late");
+            mp_rendezvous_no_intrs(enableAction, nullptr);
+            enabled = (uint32_t)((int)gActive - before);
+            RHV_INFO("rescan: SVM now on %d of %u CPUs", (int)gActive, usableCount());
+        }
+    }
+
+    IOLockUnlock(gRescanLock);
+    return enabled;
+}
+
+bool debugLimit(uint32_t n)
+{
+    if (!gRescanLock || n < 1 || n > RHV_MAX_CPUS)
+        return false;
+
+    IOLockLock(gRescanLock);
+    RHV_SYNC("debug: forgetting the CPUs from index %u up", n);
+    mp_rendezvous_no_intrs(dropAction, (void *)(uintptr_t)n);
+    for (uint32_t i = n; i < RHV_MAX_CPUS; i++) {
+        if (gHostSave[i]) {
+            gHostSave[i]->release();
+            gHostSave[i] = nullptr;
+        }
+        gHostSavePa[i] = 0;
+    }
+    if (gNCpus > n)
+        gNCpus = n;
+    gMaxIndex = (SInt32)n - 1;
+    IOLockUnlock(gRescanLock);
+    RHV_INFO("debug: %u CPUs known, SVM on %d", gNCpus, (int)gActive);
+    return true;
 }
 
 } // namespace svm

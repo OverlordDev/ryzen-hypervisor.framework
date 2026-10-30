@@ -834,7 +834,14 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
     unsigned deferrals = 0;
     auto injectionWaiting = [&]() { return (v->control.eventInj & (1u << 31)) != 0 && deferrals < 16; };
 
+    bool rescanned  = false;          /* CPUs that came online after the kext started: look for them once per run */
+    bool needRescan = false;
+
     for (;;) {
+        if (needRescan) {             /* outside the page-table lock and with interrupts on: it runs a rendezvous and may allocate */
+            needRescan = false;
+            svm::rescan();
+        }
         if (fKick) {                  /* hv_vcpu_interrupt from another thread */
             if (injectionWaiting()) {
                 deferrals++;          /* enter first; the flag stays set and ends the run right after the delivery */
@@ -877,6 +884,13 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             ml_set_interrupts_enabled(ints);
             continue;
         }
+        if (!svm::activeOnAllUsable() && !rescanned) {
+            fRunCpu = -1;
+            ml_set_interrupts_enabled(ints);
+            rescanned  = true;
+            needRescan = true;
+            continue;
+        }
         if (!svm::activeOnAllUsable()) {
             fRunCpu = -1;
             ml_set_interrupts_enabled(ints);
@@ -888,6 +902,14 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         /* activeOnAllUsable() counts what enableAll() did; this looks at THIS cpu's EFER, because CLGI without SVME is a #UD panic. */
         const int runCpu = (int)fRunCpu;
         const int svmFix = svm::ensureThisCpu();
+        if (svmFix == -2 && !rescanned) {     /* this CPU was not online when SVM was switched on */
+            fRunCpu = -1;
+            ml_set_interrupts_enabled(ints);
+            rescanned  = true;
+            needRescan = true;
+            RHV_INFO("VmRun: cpu %d was not known to the SVM code, rescanning", runCpu);
+            continue;
+        }
         if (svmFix < 0) {
             fRunCpu = -1;
             ml_set_interrupts_enabled(ints);

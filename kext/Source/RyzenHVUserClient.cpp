@@ -5,6 +5,7 @@
 #include "Log.hpp"
 #include "RyzenHV.hpp"
 #include "RyzenHVUserClient.hpp"
+#include "SVM.hpp"
 #include "Vm.hpp"
 
 #define super IOUserClient
@@ -248,6 +249,15 @@ IOReturn com_overlorddev_RyzenHVUserClient::sHvControl(OSObject *target, void *,
 {
     RHV_ME();
     uint32_t cmd = (uint32_t)args->scalarInput[0], value = (uint32_t)args->scalarInput[1];
+    if (cmd == kRHVHvSvmLimit || cmd == kRHVHvSvmRescan) {
+        RHV_ADMIN();
+        uint32_t enabled = 0;
+        if (cmd == kRHVHvSvmLimit ? !rhv::svm::debugLimit(value) : (enabled = rhv::svm::rescan(), false))
+            return kIOReturnBadArgument;
+        args->scalarOutput[0] = (rhv::hv::registered() ? kRHVHvStateRegistered : 0) | (rhv::hv::sysctlTaken() ? kRHVHvStateSysctl : 0) | (rhv::hv::tprShadow() ? kRHVHvStateTpr : 0);
+        args->scalarOutput[1] = enabled;
+        return kIOReturnSuccess;
+    }
     if (cmd != kRHVHvGet) {
         RHV_ADMIN();
         bool ok = cmd == kRHVHvMode ? rhv::hv::setMode(value)
@@ -289,6 +299,7 @@ IOReturn com_overlorddev_RyzenHVUserClient::sVmCreate(OSObject *target, void *,
     RHV_ME();
     RHV_ADMIN();
 
+    rhv::svm::rescan();       /* CPUs that came online after the kext started */
     RHVInfo info;
     me->fOwner->getInfo(&info);
 
@@ -321,6 +332,7 @@ IOReturn com_overlorddev_RyzenHVUserClient::sVmJoin(OSObject *target, void *, IO
     RHV_ME();
     RHV_ADMIN();
 
+    rhv::svm::rescan();
     RHVInfo info;
     me->fOwner->getInfo(&info);
     if (args->scalarInput[0] > 0xFFFFFFFFull)

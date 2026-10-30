@@ -18,8 +18,9 @@ so the unmodified apps run.
 | **VirtualBox 7.x** | experimental: version 7.2.22 boots the Windows 10 installer. VirtualBox 6.x does **not** work (see below) |
 | **QEMU** with `-accel hvf` | boots Linux |
 
-Tested on one machine: **Ryzen 7 5800H, macOS Sequoia 15.8.1, OpenCore**. macOS 26 (Tahoe) has not been tried by the author; someone reported a kernel panic there
-(issue 1, still open).
+Tested on one machine: **Ryzen 7 5800H, macOS Sequoia 15.8.1, OpenCore**. macOS 26 (Tahoe) has not been tried by the author; someone reported a failure to start VMs there
+(issue 1): on that system only one CPU core was online when the kext started, so SVM was switched on for that core only. Version 0.7.4 looks for the late cores again
+when a VM starts. It is tested here by simulating the same state, but not on Tahoe itself.
 
 **Not verified:** sleep and wake of the Mac, runs of many hours, 3D acceleration in Parallels (it crashes in NVIDIA's Metal driver on the author's machine, keep it
 off), Windows 11 or Linux guests in Parallels' native mode, other Parallels builds, a full Windows installation onto a disk in VirtualBox.

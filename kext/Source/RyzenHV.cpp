@@ -9,7 +9,7 @@
 
 #define super IOService
 
-#define RHV_VERSION "0.7.3"
+#define RHV_VERSION "0.7.4"
 
 OSDefineMetaClassAndStructors(com_overlorddev_RyzenHV, IOService)
 
@@ -184,7 +184,10 @@ IOReturn com_overlorddev_RyzenHV::sleepWakeHandler(void *target, void *, UInt32 
 
 void com_overlorddev_RyzenHV::getInfo(RHVInfo *out)
 {
-    fInfo.nCpusSvmActive = rhv::svm::activeCpuCount();
+    /* The CPUs are counted at start-up, and on some systems (macOS 26) only one is online then: keep the numbers live. */
+    fInfo.nCpus           = rhv::svm::cpuCount();
+    fInfo.nCpusSvmUsable  = rhv::svm::usableCpuCount();
+    fInfo.nCpusSvmActive  = rhv::svm::activeCpuCount();
     *out = fInfo;
 }
 

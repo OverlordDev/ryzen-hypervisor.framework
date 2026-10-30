@@ -197,8 +197,14 @@ static int cmd_hv(io_connect_t conn, int argc, char **argv)
     } else if (argc > 2 && !strcmp(argv[2], "tpr") && argc > 3) {
         in[0] = kRHVHvTpr;
         in[1] = strtoul(argv[3], NULL, 10);
+    } else if (argc > 3 && !strcmp(argv[2], "svmlimit")) {
+        /* debugging: the SVM code forgets the CPUs from index N up, like a kext that started before they were online */
+        in[0] = kRHVHvSvmLimit;
+        in[1] = strtoul(argv[3], NULL, 10);
+    } else if (argc > 2 && !strcmp(argv[2], "rescan")) {
+        in[0] = kRHVHvSvmRescan;
     } else if (argc > 2 && strcmp(argv[2], "status")) {
-        fprintf(stderr, "usage: rhv-info hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1]\n");
+        fprintf(stderr, "usage: rhv-info hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1 | svmlimit N | rescan]\n");
         return 2;
     }
     kern_return_t kr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, in, 2, out, &(uint32_t){ 2 });
@@ -206,6 +212,11 @@ static int cmd_hv(io_connect_t conn, int argc, char **argv)
         fprintf(stderr, "HvControl failed: 0x%x%s\n", kr, getuid() ? " (run with sudo)" : "");
         return 1;
     }
+    if (in[0] == kRHVHvSvmRescan)
+        printf("rescan: SVM turned on for %llu more CPUs (see `rhv-info` for the totals)\n", (unsigned long long)out[1]);
+    else if (in[0] == kRHVHvSvmLimit)
+        printf("the SVM code now knows %llu CPUs (see `rhv-info`); a VM start or `rhv-info hv rescan` brings the others back\n", (unsigned long long)in[1]);
+    else
     printf("hv front end: %s, mode %llu, kern.hv_support %s, TPR shadow %s\n", (out[0] & kRHVHvStateRegistered) ? "registered" : "not registered",
            (unsigned long long)out[1], (out[0] & kRHVHvStateSysctl) ? "replaced (shows 1)" : "untouched",
            (out[0] & kRHVHvStateTpr) ? "offered" : "not offered");
