@@ -67,8 +67,12 @@ To remove: `sudo ./scripts/parallels-shim.sh uninstall`, then remove the kext fr
 - Windows 11 **Home** runs one physical processor. The shim itself gives the guest the right topology (4 cores in one
   package, cache), so all vCPUs work.
 - `prlctl exec "Windows 11" cmd /c ...` works when Parallels Tools are installed (you can read the event log, the registry).
-- 3D acceleration (`--3d-accelerate`) crashes `prl_vm_app` on the author's machine inside NVIDIA's Metal driver (NVMTL on top of NVK
-  for an RTX 3070, not Apple's own driver): keep it off. With another GPU the result may differ.
+- 3D acceleration (`--3d-accelerate`) crashes `prl_vm_app` within seconds on the author's machine (RTX 3070 with the third-party NVIDIA Metal driver NVMTL, nullmoth/nvidia-macos-driver,
+  issue 376 there; not Apple's own driver and not RyzenHV): keep it off with that driver. Cause found (2026-10-30): Parallels draws through its own `AsyncDrawable` class (an `MTLDrawable`).
+  Apple's `-[_MTLCommandBuffer presentDrawable:]` (and the `atTime:`, `afterMinimumDuration:` and `options:` variants) first gives the drawable a block through the private
+  `addPresentScheduledHandler:`, and `AsyncDrawable.present` calls that block without a nil check. NVMTL's `presentDrawable:` never sets it, so the first `present` reads a NULL block (fault at
+  address 0x10, in `nvmtlFinishExecution`). With a stand-in library that calls `addPresentScheduledHandler:` with an empty block before the driver's `present`, a Windows 10 VM with `--3d-accelerate highest`
+  ran with the display adapter "Parallels Display Adapter (WDDM)" for minutes with 1600+ presents and no crash. The fix belongs in the NVIDIA driver, not in RyzenHV. On an AMD GPU (a user's RX 6800) 3D works.
 
 ## What the shim does inside Parallels
 

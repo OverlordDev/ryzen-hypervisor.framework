@@ -22,8 +22,8 @@ Tested on one machine: **Ryzen 7 5800H, macOS Sequoia 15.8.1, OpenCore**. macOS 
 when the kext started, so SVM was switched on for that core only and VMs did not run. Version 0.7.4 looks for the late cores again when a VM starts; that user confirmed that
 Parallels (the older shim mode) then runs a fresh Windows 11 LTSC installation, also with 3D acceleration on an RX 6800.
 
-**Not verified:** sleep and wake of the Mac, runs of many hours, 3D acceleration in Parallels (it crashes in NVIDIA's Metal driver on the author's machine, keep it
-off), Windows 11 or Linux guests in Parallels' native mode, other Parallels builds.
+**Not verified:** sleep and wake of the Mac, runs of many hours, 3D acceleration in Parallels (it crashes with the third-party NVIDIA Metal driver on the author's machine, keep it
+off there; it works on an AMD GPU according to a user), Windows 11 or Linux guests in Parallels' native mode, other Parallels builds.
 
 ## Install (the ready-made build)
 
