@@ -116,7 +116,8 @@ patches the CPU-vendor check. What is missing, in the order it is worth doing:
     the BIOS finishes, VMware's PCI enumeration and A20 handling go through (it unmaps and maps the RAM above 1 MB each time A20 changes) and **Windows starts: the boot logo appears and stays**.
     Open: the guest then sits in a loop in the Windows kernel (64-bit, IF=0, rip fffff802f5375100/101, rflags 0x46, only timeslice exits, vmx at 100% CPU). Not known what it waits for
     (a timer or the TSC are the first suspects: `hv_vm_sync_tsc` is only answered, VMware's TSC offset and `RDTSC` exiting toggling have not been checked). To look at the guest's code the kext
-    needs to read guest memory by virtual address. The debug build (exit log with CS/RIP and the traps in between, flight recorder, `rhv-info hv flightdump`) is kept as a patch outside the repository.
+    needs to read guest memory by virtual address. The debug build used for this (a ring of the last 400 exits with CS:RIP and registers, a ring of the last 128 traps, a probe of the guest CS at
+    every entry point, `rhv-info hv flightdump`) was not kept: it has to be written again, and it should be a runtime switch so that a question does not cost a reboot.
 
 ## Risks
 
