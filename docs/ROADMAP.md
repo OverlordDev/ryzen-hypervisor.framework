@@ -90,8 +90,9 @@ patches the CPU-vendor check. What is missing, in the order it is worth doing:
    kext patches `prl_vm_app` at `exec` (a kauth listener) and watches for `libMonitor.dylib` being mapped; the callback context and the race with the
    check have to be proven first; (b) a Lilu plugin (UserPatcher) with the same patterns; (c) leave the wrapper. This is a design decision, not just work.
 8. [ ] Release 0.7.2: the boot service and the native Parallels button in the app (the app zip is built by `app/build-app.sh`), `rhv` menu entries, docs.
-9. [~] Issue 1 (Tahoe): the reporter's log shows `cpus=1` at start: the other cores were not online yet, so SVM was on for one core. 0.7.4 rescans (see NATIVE.md); wait for the
-   reporter's `rhv-info log` with 0.7.4 (the line `rescan: the rendezvous reached N CPUs`) to see whether the late cores are reached.
+9. [x] Issue 1 (Tahoe): the reporter's log showed `cpus=1` at start: the other cores were not online yet, so SVM was on for one core. 0.7.4 rescans (see NATIVE.md). Confirmed by the
+   reporter on macOS 26.7.1, Ryzen 9 5900X: `rescan: the rendezvous reached 24 CPUs (highest index 23), 23 of them new`, SVM on 24 of 24, a Windows 11 LTSC VM in Parallels (shim mode) runs,
+   also with 3D acceleration on an RX 6800. Still open there: Docker in native mode (the reporter asked whether the native boot-args can be mixed with the Parallels shim).
 10. [~] **VirtualBox 7.x** (0.7.3 offers the TPR shadow by default, so the first point below is done) (no kernel driver on macOS, runs through Hypervisor.framework, so through the native front end): 7.2.22 starts, its BIOS/EFI and Windows
     Setup run, no panic. Needs `rhv-info hv tpr 1` (the TPR shadow is off by default): without it the guest does ~70k `CR8` exits a second per vCPU and Setup
     stays on its first screen for minutes; with it Setup reaches the disk page in about a minute and the `CR8` exits are gone from the sample. To do: decide the
