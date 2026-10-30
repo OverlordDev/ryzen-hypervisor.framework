@@ -902,6 +902,10 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
                 *slotWord(v, slotQual) = 0;
                 markValid(v, slotQual);
             }
+            /* The VMCS fields of this batch were applied above; the registers (RIP, RSP, RFLAGS, the GPRs) are applied by runEx, which this path skips,
+             * and the dirty bits are already cleared. VMware's SMM entry arrives like this (NMI window first, then CS, RIP... in one batch): the guest
+             * got the new CS and kept the old RIP and ran off into zeros (a black screen). */
+            cpu->setRegs(&regs);
             return kHvOk;
         }
     }

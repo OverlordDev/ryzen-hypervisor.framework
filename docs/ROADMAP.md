@@ -109,6 +109,15 @@ patches the CPU-vendor check. What is missing, in the order it is worth doing:
     cannot be compared here), but nothing points at it. After the hang `prlctl` answers "Parallels Desktop is shutting down" and only a reboot clears it. Rule in the README: keep the app open while a VM runs.
     An open point: a warning in `rhv doctor` / the wrapper when the VM starts without the app.
 
+12. [~] **VMware Fusion 26.0.0** (Intel build, "Monitor Mode: ULM", it imports `hv_vm_space_*`, shadow VMCS and `hv_vm_sync_tsc`; it uses none of the spaces): the VM used to show a black
+    screen. Cause found and fixed in 0.7.5: the BIOS sends itself an SMI through the LAPIC ICR (write of 0x200 to 0xFEE00300); VMware enters SMM by setting the NMI-window control and then writing
+    CS=0x3000 (SMBASE 0x30000, 4 GB limit), RIP and the rest in one batch. `tVcpuRun` answered the NMI-window request early and returned before `runEx`, so the registers of that batch
+    (RIP, RSP, RFLAGS, GPRs) were dropped while the VMCS fields were kept: the guest ran with the new CS and the old RIP into zeros (#UD loop in the BIOS). Now `setRegs` is applied first. With it
+    the BIOS finishes, VMware's PCI enumeration and A20 handling go through (it unmaps and maps the RAM above 1 MB each time A20 changes) and **Windows starts: the boot logo appears and stays**.
+    Open: the guest then sits in a loop in the Windows kernel (64-bit, IF=0, rip fffff802f5375100/101, rflags 0x46, only timeslice exits, vmx at 100% CPU). Not known what it waits for
+    (a timer or the TSC are the first suspects: `hv_vm_sync_tsc` is only answered, VMware's TSC offset and `RDTSC` exiting toggling have not been checked). To look at the guest's code the kext
+    needs to read guest memory by virtual address. The debug build (exit log with CS/RIP and the traps in between, flight recorder, `rhv-info hv flightdump`) is kept as a patch outside the repository.
+
 ## Risks
 
 - The first kernel crashes are unavoidable. Debugging: serial/netdump from a second machine, or at least a fallback OpenCore entry.
