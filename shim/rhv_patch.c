@@ -8,6 +8,7 @@
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach-o/loader.h>
+#include <pthread.h>
 #endif
 
 /*
@@ -144,6 +145,71 @@ int rhv_patch_apply(uint8_t *at, const struct rhv_patch *p)
     return 0;
 }
 
+/*
+ * Parallels 26.5.0 (57613), libMonitor.dylib: the POST code handler. Its start (up to the read of the value) and, within a short distance after,
+ * the part that tests the library's own flag and sets the saved-state flag; the bytes between differ from build to build.
+ *     push rbp ; mov rbp,rsp ; push r14 ; push rbx ; mov ebx,2 ; cmp rdx,1 ; jne ... ; cmp esi,2 ; je ... ; mov ebx,1 ; cmp esi,1 ; jne ...
+ *     movzx r14d, byte [rcx] ; jmp ... ; movzx r14d, word [rcx]
+ *   ...  xor ebx,ebx ; test r14b,r14b ; jne ... ; cmp byte [rip+SECOND],0 ; jne ... ; call ... ; lea rax,[rip+X] ; mov byte [rax+OFF],1
+ */
+static const char kbd_head[] =
+    "55 48 89 e5 41 56 53 bb 02 00 00 00 48 83 fa 01  0f 85 ?? ?? ?? ??  83 fe 02 74 ??  bb 01 00 00 00  83 fe 01 75 ??  44 0f b6 31  eb ??  44 0f b7 31";
+static const char kbd_tail[] =
+    "31 db 45 84 f6 75 ??  80 3d ?? ?? ?? ?? 00  75 ??  e8 ?? ?? ?? ??  48 8d 05 ?? ?? ?? ??  c6 80 ?? ?? ?? ?? 01";
+#define KBD_TAIL_WITHIN 0xc0
+/* where the operands sit in kbd_tail */
+#define KBD_TAIL_CMP_DISP 9        /* the cmp byte [rip+d],0 starts at 7, is 7 bytes long */
+#define KBD_TAIL_CMP_END 14
+#define KBD_TAIL_LEA_DISP 24       /* the lea rax,[rip+d] starts at 21, is 7 bytes long */
+#define KBD_TAIL_LEA_END 28
+#define KBD_TAIL_MOV_OFF 30        /* mov byte [rax+off],1 */
+
+static int32_t rd32(const uint8_t *p)
+{
+    return (int32_t)((uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24);
+}
+
+/* The pattern must occur exactly once. */
+static rhv_patch_result find_once(const uint8_t *buf, size_t len, const char *pattern, size_t *offset)
+{
+    uint8_t v[MAXPAT], w[MAXPAT];
+    int n = parse(pattern, v, w);
+    if (n <= 0)
+        return RHV_PATCH_BAD_PATTERN;
+    size_t first = 0;
+    size_t found = count_matches(buf, len, v, w, n, &first);
+    if (found > 1)
+        return RHV_PATCH_AMBIGUOUS;
+    if (found == 0)
+        return RHV_PATCH_NOT_FOUND;
+    *offset = first;
+    return RHV_PATCH_APPLIED;       /* "found once" */
+}
+
+rhv_patch_result rhv_find_monitor_kbd(const uint8_t *code, size_t len, struct rhv_monitor_kbd *out)
+{
+    size_t head = 0, tail = 0;
+    rhv_patch_result r = find_once(code, len, kbd_head, &head);
+    if (r != RHV_PATCH_APPLIED)
+        return r;
+    const size_t span = len - head < KBD_TAIL_WITHIN ? len - head : KBD_TAIL_WITHIN;
+    r = find_once(code + head, span, kbd_tail, &tail);
+    if (r != RHV_PATCH_APPLIED)
+        return r;
+    tail += head;
+
+    /* rip-relative operands count from the end of their instruction */
+    const uint8_t *t = code + tail;
+    const int64_t second = (int64_t)(tail + KBD_TAIL_CMP_END) + rd32(t + KBD_TAIL_CMP_DISP);
+    const int64_t armed = (int64_t)(tail + KBD_TAIL_LEA_END) + rd32(t + KBD_TAIL_LEA_DISP) + rd32(t + KBD_TAIL_MOV_OFF);
+    if (second < 0 || armed < 0)
+        return RHV_PATCH_NOT_FOUND;
+    out->handler = head;
+    out->second = (size_t)second;
+    out->armed = (size_t)armed;
+    return RHV_PATCH_APPLIED;
+}
+
 #ifdef __APPLE__
 rhv_patch_result rhv_patch_image(const struct mach_header *mh, const struct rhv_patch *p)
 {
@@ -173,5 +239,40 @@ rhv_patch_result rhv_patch_image(const struct mach_header *mh, const struct rhv_
     rhv_patch_apply(base + offset, p);
     vm_protect(mach_task_self(), page, span, 0, VM_PROT_READ | VM_PROT_EXECUTE);
     return RHV_PATCH_APPLIED;
+}
+
+rhv_patch_result rhv_find_monitor_kbd_image(const struct mach_header *mh, struct rhv_monitor_kbd *out)
+{
+    if (!mh || mh->magic != MH_MAGIC_64)
+        return RHV_PATCH_NOT_FOUND;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+    const struct segment_command_64 *text = NULL;
+    const struct load_command *lc = (const struct load_command *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize))
+        if (lc->cmd == LC_SEGMENT_64 && strcmp(((const struct segment_command_64 *)lc)->segname, SEG_TEXT) == 0)
+            text = (const struct segment_command_64 *)lc;
+    if (!text)
+        return RHV_PATCH_NOT_FOUND;
+    return rhv_find_monitor_kbd((const uint8_t *)mh, (size_t)text->vmsize, out);
+}
+
+rhv_patch_result rhv_find_monitor_kbd_cached(const struct mach_header *mh, struct rhv_monitor_kbd *out, int *fresh)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static const struct mach_header *last;
+    static rhv_patch_result last_result;
+    static struct rhv_monitor_kbd last_kbd;
+    pthread_mutex_lock(&lock);
+    *fresh = 0;
+    if (mh != last) {
+        last_result = rhv_find_monitor_kbd_image(mh, &last_kbd);
+        last = mh;
+        *fresh = 1;
+    }
+    rhv_patch_result r = last_result;
+    if (r == RHV_PATCH_APPLIED)
+        *out = last_kbd;
+    pthread_mutex_unlock(&lock);
+    return r;
 }
 #endif

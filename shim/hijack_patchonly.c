@@ -79,9 +79,10 @@ static void patch_vendor_check(const struct mach_header *mh, const char *what)
 }
 
 /*
- * The monitor drops keys until the flag at image offset 0x16b8c0 + 0x4a550 is set, which only its port-0x80 handler (image offset 0x47b30, the POST
- * code value 0) does. Run that handler ourselves, with 0, the first time the guest touches the keyboard controller (and again after a VM reset, which
- * clears the flag). The monitor is looked up on every use, not remembered: after a reset it is unloaded and loaded again at another address.
+ * The monitor drops keys until a flag in its saved state is set, which only its port-0x80 handler (the POST code value 0) does. Run that handler
+ * ourselves, with 0, the first time the guest touches the keyboard controller (and again after a VM reset, which clears the flag). The handler and
+ * the two flags are found in the monitor's code by their bytes (rhv_find_monitor_kbd in shim/rhv_patch.c), not by address, and only if the code
+ * looks as expected. The monitor is looked up on every use, not remembered: after a reset it is unloaded and loaded again at another address.
  */
 static unsigned long g_runs;                     /* hv_vcpu_run returns since libMonitor was loaded (again), for the log only */
 static uint64_t g_load_ns, g_last_check_ns;      /* when libMonitor was loaded (again), and when the safety net last looked */
@@ -91,6 +92,22 @@ static uint64_t g_load_ns, g_last_check_ns;      /* when libMonitor was loaded (
  * again, because the guest initialised it in its first life, while the monitor's flag starts at 0; so every few thousand runs, once the guest has
  * had time to start, the flag is looked at and set if it is clear.
  */
+/* Where the handler and the flags are in the monitor loaded at `base`; the result of the search is logged once per load. */
+static int monitor_kbd(const uint8_t *base, struct rhv_monitor_kbd *kbd)
+{
+    int fresh = 0;
+    rhv_patch_result r = rhv_find_monitor_kbd_cached((const struct mach_header *)base, kbd, &fresh);
+    if (fresh) {
+        char msg[160];
+        if (r == RHV_PATCH_APPLIED)
+            snprintf(msg, sizeof(msg), "keyboard: handler at +%#zx, flags at +%#zx and +%#zx (found by their bytes)", kbd->handler, kbd->armed, kbd->second);
+        else
+            snprintf(msg, sizeof(msg), "keyboard: POST code handler: %s", rhv_patch_result_name(r));
+        plog(msg);
+    }
+    return r == RHV_PATCH_APPLIED;
+}
+
 static void arm_keyboard(unsigned vcpu, int periodic)
 {
     static int disabled = -1;
@@ -117,28 +134,29 @@ static void arm_keyboard(unsigned vcpu, int periodic)
         if (n && strstr(n, "libMonitor.dylib"))
             base = (const uint8_t *)_dyld_get_image_header(i);
     }
-    static const uint8_t prologue[] = { 0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0xBB, 0x02, 0x00, 0x00, 0x00 };
-    if (!base || memcmp(base + 0x47b30, prologue, sizeof(prologue)) != 0)
-        return;                                        /* not the Parallels 26.5.0 libMonitor: leave it alone */
-    volatile uint8_t *armed = (volatile uint8_t *)base + 0x16b8c0 + 0x4a550;
+    struct rhv_monitor_kbd kbd;
+    if (!base || !monitor_kbd(base, &kbd))
+        return;                                        /* not a monitor this was written for: leave it alone */
+    volatile uint8_t *armed = (volatile uint8_t *)base + kbd.armed;
+    volatile uint8_t *second = (volatile uint8_t *)base + kbd.second;
     if (periodic) {
         static int shown;
         if (shown++ < 3) {
             char msg[160];
-            snprintf(msg, sizeof(msg), "keyboard: periodic check after %lu runs: armed flag %d, second flag %d", g_runs, *armed, base[0x8686a0]);
+            snprintf(msg, sizeof(msg), "keyboard: periodic check after %lu runs: armed flag %d, second flag %d", g_runs, *armed, *second);
             plog(msg);
         }
     }
     /* Both flags: the first is part of the monitor's saved state, so a restored VM has it set while this process's second one (a global of the library) is
      * still clear, and the keys stay dropped until the handler has run in this process. */
-    if (*armed && base[0x8686a0])
+    if (*armed && *second)
         return;
     static volatile int busy;                    /* several vCPU threads may get here at once: one calls the handler */
     if (__sync_lock_test_and_set(&busy, 1))
         return;
     uint8_t zero = 0;
     int (*post_code)(uint32_t port, uint32_t size, uint64_t count, void *data) =
-        (int (*)(uint32_t, uint32_t, uint64_t, void *))(base + 0x47b30);
+        (int (*)(uint32_t, uint32_t, uint64_t, void *))(base + kbd.handler);
     int rc = post_code(0x80, 1, 1, &zero);
     __sync_lock_release(&busy);
 

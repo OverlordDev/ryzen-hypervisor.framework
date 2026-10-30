@@ -51,7 +51,7 @@ The keyboard (0.7.2; in 0.7.1 it did not work): the monitor drops keys until the
 here). The stand-in library therefore replaces `hv_vcpu_run` and `hv_vcpu_run_until` (the monitor uses the second) in libMonitor's imports only; after each run it
 calls the monitor's own port handler with 0, on the first guest access to the keyboard controller (ports `0x60`/`0x64`) and, as a safety net for a VM restored from
 a saved state, once a second while the monitor's flag is still clear. Tested on Windows 10: keys sent with `prlctl send-key-event` reach the guest after a cold boot
-and after a resume. The offsets belong to Parallels 26.5.0 (57613); another build is left alone (the function prologue is checked). `RYZENHV_NO_KBD_ARM=1` switches it off.
+and after a resume. The handler and its two flags are found in `libMonitor.dylib` by their bytes (`rhv_find_monitor_kbd` in `shim/rhv_patch.c`: the start of the handler, then the instructions that test and set the flags, whose addresses are read from their rip-relative operands), not by address, and only if the code is there exactly once; otherwise the monitor is left alone and `~/.ryzenhv/prl-patch.log` says `POST code handler: pattern not found`. Tested only on 26.5.0 (57613); a build with different code in that function needs a new pattern. `RYZENHV_NO_KBD_ARM=1` switches it off.
 
 Limits: only Windows 10 was tried. Since 0.7.3 the kext offers the TPR shadow (see below), which cut the Windows boot from about 90 s to about 20 s on the author's
 machine (the guest's tools answer after ~19 s; before, every `CR8` access of Windows was an exit). Suspending and resuming the VM works **when the Parallels Desktop app is running**;

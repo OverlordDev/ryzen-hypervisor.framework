@@ -843,11 +843,11 @@ __attribute__((unused)) static void ud_intercept(hv_vcpuid_t vcpu)
 
 /*
  * Parallels' monitor (libMonitor) drops every key press until the guest has written 0 to the POST code port 0x80: that
- * write arms its PS/2 keyboard queue (the flag at image offset 0x16b8c0 + 0x4a550, set by the port handler at 0x47b30,
- * which also tells the app that the guest is up). Parallels' own firmware does that under Parallels' own hypervisor;
+ * write arms its PS/2 keyboard queue (a flag set by the port handler, which also tells the app that the guest is up; in
+ * build 57613 at image offsets 0x47b30 and 0x1b5e10, now found by their bytes). Parallels' own firmware does that under Parallels' own hypervisor;
  * under this one it never does (it only writes a stream of values to port 0xE4), so the keyboard stays dead in the
  * guest, from the firmware shell on. We run that handler ourselves, with the value 0, the first time the guest touches
- * the keyboard controller (and again after a VM reset, which clears the flag). Only for the build whose layout this is.
+ * the keyboard controller (and again after a VM reset, which clears the flag). Only where the handler is found exactly as expected.
  * RYZENHV_NO_KBD_ARM=1 turns it off.
  */
 static void parallels_arm_keyboard(hv_vcpuid_t vcpu)
@@ -877,15 +877,17 @@ static void parallels_arm_keyboard(hv_vcpuid_t vcpu)
         if (n && strstr(n, "libMonitor.dylib"))
             base = (const uint8_t *)_dyld_get_image_header(i);
     }
-    static const uint8_t prologue[] = { 0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0xBB, 0x02, 0x00, 0x00, 0x00 };
-    if (!base || memcmp(base + 0x47b30, prologue, sizeof(prologue)) != 0)
-        return;                                        /* not the Parallels 26.5.0 libMonitor: leave it alone */
-    volatile uint8_t *armed = (volatile uint8_t *)base + 0x16b8c0 + 0x4a550;
-    if (*armed || base[0x8686a0])
+    /* The handler and its two flags are found by their bytes (shim/rhv_patch.c), once per load of the monitor. */
+    struct rhv_monitor_kbd kbd;
+    int fresh = 0;
+    if (!base || rhv_find_monitor_kbd_cached((const struct mach_header *)base, &kbd, &fresh) != RHV_PATCH_APPLIED)
+        return;                                        /* not a libMonitor this was written for: leave it alone */
+    volatile uint8_t *armed = (volatile uint8_t *)base + kbd.armed;
+    if (*armed || base[kbd.second])
         return;
     uint8_t zero = 0;
     int (*post_code)(uint32_t port, uint32_t size, uint64_t count, void *data) =
-        (int (*)(uint32_t, uint32_t, uint64_t, void *))(base + 0x47b30);
+        (int (*)(uint32_t, uint32_t, uint64_t, void *))(base + kbd.handler);
     int rc = post_code(0x80, 1, 1, &zero);
     rhv_trace("keyboard arming: POST code 0 handed to the monitor at %p (rc %d, armed %d)", (const void *)base, rc, *armed);
 }

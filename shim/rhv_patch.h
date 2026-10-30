@@ -43,6 +43,25 @@ int rhv_patch_apply(uint8_t *at, const struct rhv_patch *p);
 struct mach_header;
 rhv_patch_result rhv_patch_image(const struct mach_header *mh, const struct rhv_patch *p);
 
+/*
+ * Parallels' monitor (libMonitor.dylib) drops key presses until its port-0x80 (POST code) handler has run with the value 0. To run that handler
+ * from outside, three things are needed: the handler itself and the two flags it sets. They are found in the code, not by address: the handler by
+ * the bytes of its start, the flags by decoding the rip-relative operands of the two instructions that touch them. All three are offsets from the
+ * start of the image (its __TEXT segment starts at the Mach-O header). Found only if the code looks exactly like this, once.
+ */
+struct rhv_monitor_kbd {
+    size_t handler;     /* int handler(uint32_t port, uint32_t size, uint64_t count, void *data) */
+    size_t armed;       /* the flag in the monitor's saved state (a byte) */
+    size_t second;      /* a global of the library (a byte): the handler does nothing while it is set */
+};
+rhv_patch_result rhv_find_monitor_kbd(const uint8_t *code, size_t len, struct rhv_monitor_kbd *out);
+#ifdef __APPLE__
+rhv_patch_result rhv_find_monitor_kbd_image(const struct mach_header *mh, struct rhv_monitor_kbd *out);
+/* The same, remembered for the last image asked about (the search reads about 1 MB of code, the callers ask on every keyboard access); thread-safe.
+ * *fresh is set to 1 when this call did the search, so the caller can log the result once per load of the monitor. */
+rhv_patch_result rhv_find_monitor_kbd_cached(const struct mach_header *mh, struct rhv_monitor_kbd *out, int *fresh);
+#endif
+
 /* The patches themselves. */
 extern const struct rhv_patch rhv_patch_prl_vendor;        /* prl_vm_app and libMonitor.dylib: CPUID vendor check */
 extern const struct rhv_patch rhv_patch_hyperkit_vendor;

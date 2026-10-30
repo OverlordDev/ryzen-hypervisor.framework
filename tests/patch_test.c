@@ -82,6 +82,58 @@ static void test_branches(void)
     CHECK(rhv_patch_locate(buf, sizeof(buf), &jmp32, &off) == RHV_PATCH_ALREADY);
 }
 
+/* The POST code handler of Parallels' monitor, as in build 57613 (image offset 0x47b30), placed at `at` in a buffer of zeros whose rip-relative operands
+ * are made to point at the flags `second` and `armed_base` (+ the 0x4a550 of the mov), so the test knows what the finder has to answer. */
+static const unsigned char kbd_fn[] = {
+    0x55,0x48,0x89,0xe5,0x41,0x56,0x53,0xbb,0x02,0x00,0x00,0x00,0x48,0x83,0xfa,0x01,0x0f,0x85,0x85,0x00,0x00,0x00,0x83,0xfe,0x02,0x74,0x10,0xbb,0x01,0x00,0x00,0x00,
+    0x83,0xfe,0x01,0x75,0x76,0x44,0x0f,0xb6,0x31,0xeb,0x04,0x44,0x0f,0xb7,0x31,0x48,0x8d,0x05,0xd2,0x28,0x12,0x00,0x83,0x38,0x03,0x7c,0x24,0x48,0x8d,0x3d,0x66,0x3a,
+    0x0c,0x00,0x48,0x8d,0x35,0xa2,0x70,0x0b,0x00,0x48,0x8d,0x0d,0x67,0xde,0x0c,0x00,0xba,0x03,0x00,0x00,0x00,0x45,0x89,0xf0,0x31,0xc0,0xe8,0x51,0x3b,0x0a,0x00,0x31,
+    0xdb,0x45,0x84,0xf6,0x75,0x35,0x80,0x3d,0x03,0x0b,0x82,0x00,0x00,0x75,0x2c,0xe8,0x4c,0x82,0x00,0x00,0x48,0x8d,0x05,0x15,0x3d,0x12,0x00,0xc6,0x80,0x50,0xa5,0x04,
+    0x00,0x01,0x31,0xdb,0xbf,0x84,0x03,0x00,0x00,0x31,0xf6,0x31,0xd2,0x31,0xc9,0xe8,0x5c,0xdb,0xfd,0xff,0xc6,0x05,0xd5,0x0a,0x82,0x00,0x01,0x89,0xd8,0x5b,0x41,0x5e,
+    0x5d,0xc3,
+};
+#define KBD_CMP 0x66          /* offset of the cmp byte [rip+d],0 inside kbd_fn */
+#define KBD_LEA 0x74          /* offset of the lea rax,[rip+d] */
+
+static void put32(unsigned char *p, int32_t v) { p[0] = (unsigned char)v; p[1] = (unsigned char)(v >> 8); p[2] = (unsigned char)(v >> 16); p[3] = (unsigned char)(v >> 24); }
+
+static void test_monitor_kbd(void)
+{
+    unsigned char buf[0x2000];
+    struct rhv_monitor_kbd k;
+    const size_t at = 0x300, second = 0x1800, armed_base = 0x1000, mov_off = 0x4a0;
+    memset(buf, 0x90, sizeof(buf));
+    memcpy(buf + at, kbd_fn, sizeof(kbd_fn));
+    /* the same code with other displacements: the finder follows them */
+    put32(buf + at + KBD_CMP + 2, (int32_t)(second - (at + KBD_CMP + 7)));
+    put32(buf + at + KBD_LEA + 3, (int32_t)(armed_base - (at + KBD_LEA + 7)));
+    put32(buf + at + KBD_LEA + 9, (int32_t)mov_off);
+    CHECK(rhv_find_monitor_kbd(buf, sizeof(buf), &k) == RHV_PATCH_APPLIED);
+    CHECK(k.handler == at && k.second == second && k.armed == armed_base + mov_off);
+
+    /* the branch distances and the call target may change */
+    buf[at + 36] = 0x7a;                   /* jne rel8 after cmp esi,1 */
+    buf[at + 0x70] = 0x11;                 /* the call's operand */
+    CHECK(rhv_find_monitor_kbd(buf, sizeof(buf), &k) == RHV_PATCH_APPLIED && k.handler == at);
+
+    /* another build: the code is different (cmp esi,2 became cmp esi,3) -> not found */
+    buf[at + 24] = 0x03;
+    CHECK(rhv_find_monitor_kbd(buf, sizeof(buf), &k) == RHV_PATCH_NOT_FOUND);
+    buf[at + 24] = 0x02;
+    CHECK(rhv_find_monitor_kbd(buf, sizeof(buf), &k) == RHV_PATCH_APPLIED);
+
+    /* the head is there but the flag part is not: the immediate of "mov byte [rax+off],1" is 0 */
+    buf[at + KBD_LEA + 13] = 0x00;
+    CHECK(rhv_find_monitor_kbd(buf, sizeof(buf), &k) == RHV_PATCH_NOT_FOUND);
+    buf[at + KBD_LEA + 13] = 0x01;
+    CHECK(rhv_find_monitor_kbd(buf, sizeof(buf), &k) == RHV_PATCH_APPLIED);
+
+    /* two copies of the head: ambiguous, nothing answered */
+    memcpy(buf + at, kbd_fn, sizeof(kbd_fn));
+    memcpy(buf + 0x900, kbd_fn, sizeof(kbd_fn));
+    CHECK(rhv_find_monitor_kbd(buf, sizeof(buf), &k) == RHV_PATCH_AMBIGUOUS);
+}
+
 static unsigned char *slurp(const char *path, size_t *len)
 {
     FILE *f = fopen(path, "rb");
@@ -121,6 +173,7 @@ int main(void)
     test_basic();
     test_ambiguous_and_edges();
     test_branches();
+    test_monitor_kbd();
 
     const char *prl = "/Applications/Parallels Desktop.app/Contents/MacOS";
     char path[1024];
@@ -128,6 +181,19 @@ int main(void)
     real(path, &rhv_patch_prl_vendor, 0x207b5);
     snprintf(path, sizeof(path), "%s/Parallels VM.app/Contents/MacOS/prl_vm_app.orig", prl);
     real(path, &rhv_patch_prl_vendor, 0xc1c61);
+    {
+        size_t len;
+        snprintf(path, sizeof(path), "%s/libMonitor.dylib", prl);
+        unsigned char *b = slurp(path, &len);
+        if (b) {
+            struct rhv_monitor_kbd k;
+            rhv_patch_result r = rhv_find_monitor_kbd(b, len, &k);
+            printf("  Parallels POST code handler: %s, handler %#zx armed %#zx second %#zx\n", r == RHV_PATCH_APPLIED ? "found once" : rhv_patch_result_name(r), k.handler, k.armed, k.second);
+            /* what the shim used before, as fixed offsets (build 57613) */
+            CHECK(r == RHV_PATCH_APPLIED && k.handler == 0x47b30 && k.armed == 0x16b8c0 + 0x4a550 && k.second == 0x8686a0);
+            free(b);
+        }
+    }
     const char *hk = "/Applications/Docker.app/Contents/Resources/bin/com.docker.hyperkit.orig";
     real(hk, &rhv_patch_hyperkit_vendor, 0x227b56);
     real(hk, &rhv_patch_hyperkit_gla, 0x20af38);
