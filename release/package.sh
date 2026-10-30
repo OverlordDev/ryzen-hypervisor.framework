@@ -38,7 +38,7 @@ cp build/libryzenhv.dylib build/libPrlXmlModel.1.dylib "$S/lib/"
 cp build/rhv-info "$S/bin/"
 cp -R "$QEMU_DIR" "$S/qemu"
 cp README.md "$S/"
-cp docs/PARALLELS.md docs/DOCKER.md docs/DOCKER-DESKTOP.md docs/RYZENTOSH.md "$S/docs/"
+cp docs/PARALLELS.md docs/DOCKER.md docs/DOCKER-DESKTOP.md docs/NATIVE.md docs/RYZENTOSH.md "$S/docs/"
 cp release/README-BUNDLE.md "$S/START-HERE.md"
 cp release/LICENSES/* "$S/LICENSES/"
 cp LICENSE "$S/LICENSES/RyzenHV-LICENSE" 2>/dev/null || true

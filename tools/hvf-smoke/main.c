@@ -198,7 +198,10 @@ int main(void)
     wreg(v, HV_X86_DR6, 0xFFFF0FF0);
     EXPECT(rreg(v, HV_X86_CR2) == 0xc2c2000 && rreg(v, HV_X86_DR6) == 0xFFFF0FF0, "CR2 and DR6 round trip");
     uint64_t bad;
-    EXPECT(hv_vcpu_read_register(v, HV_X86_CR1, &bad) != HV_SUCCESS, "CR1 does not exist");
+    /* the shim refuses CR1; Apple's own framework reads it straight from its shared page and answers 0 */
+    bad = 0xdead;
+    hv_return_t cr1 = hv_vcpu_read_register(v, HV_X86_CR1, &bad);
+    EXPECT(cr1 != HV_SUCCESS || bad == 0, "CR1 does not exist (an error, or 0 as Apple's framework answers)");
     EXPECT(rreg(v, HV_X86_XCR0) == 1, "XCR0 starts as 1");
 
     uint8_t fp[4096];
@@ -290,7 +293,10 @@ int main(void)
     EXPECT(hv_vm_map(ram, 0x200000, PAGE, 0x100) != HV_SUCCESS, "unknown memory flags are refused");
     uint64_t junk;
     EXPECT(hv_vmx_vcpu_read_vmcs(v, 0x12345, &junk) != HV_SUCCESS, "an unknown VMCS field is refused");
-    EXPECT(hv_vm_destroy() == HV_BUSY, "hv_vm_destroy with a live vCPU is refused");
+    {
+        hv_return_t dr = hv_vm_destroy();      /* HV_BUSY from the shim, HV_ERROR from Apple's own framework */
+        EXPECT(dr == HV_BUSY || dr == HV_ERROR, "hv_vm_destroy with a live vCPU is refused (0x%x)", (unsigned)dr);
+    }
 
     EXPECT(hv_vcpu_destroy(v) == HV_SUCCESS, "hv_vcpu_destroy");
     EXPECT(hv_vm_destroy() == HV_SUCCESS, "hv_vm_destroy");

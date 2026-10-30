@@ -118,7 +118,7 @@ int main(void)
     CHECK(sizeof(RHVRegs) == 18 * sizeof(uint64_t));
     CHECK(sizeof(RHVExit) == 48);
     CHECK(sizeof(RHVLogChunk) == RHV_LOG_CHUNK_SIZE);
-    CHECK(kRHVMethodCount == 23);
+    CHECK(kRHVMethodCount == 24);   /* 24th selector (HvControl) appended, ABI stays 11 */
     CHECK(kRHVMethodVmMsr == 18 && kRHVMethodVmKick == 19);
     CHECK(kRHVMethodVmRunEx == 20 && kRHVMethodVmcsReadMany == 21 && kRHVMethodVmJoin == 22);
     CHECK(sizeof(RHVRunIn) == 1688 && sizeof(RHVRunOut) == 8 + 48 + sizeof(RHVRegs) + 55 * 8 && sizeof(RHVReadMany) == 196 && sizeof(RHVReadManyOut) == 384);

@@ -1,6 +1,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 
+#include "HvFrontend.hpp"
 #include "Log.hpp"
 #include "RyzenHV.hpp"
 #include "RyzenHVUserClient.hpp"
@@ -142,6 +143,8 @@ IOReturn com_overlorddev_RyzenHVUserClient::externalMethod(uint32_t selector,
         { (IOExternalMethodAction)&C::sVmcsReadMany, 0, sizeof(RHVReadMany), 0, sizeof(RHVReadManyOut) },
         /* kRHVMethodVmJoin: 2 scalars in (flags, VM id), 1 scalar out (vCPU index) */
         { (IOExternalMethodAction)&C::sVmJoin, 2, 0, 1, 0 },
+        /* kRHVMethodHvControl: 2 scalars in (cmd, value), 2 scalars out (state bits, mode) */
+        { (IOExternalMethodAction)&C::sHvControl, 2, 0, 2, 0 },
     };
 
     static_assert(sizeof(kMethods) / sizeof(kMethods[0]) == kRHVMethodCount,
@@ -237,6 +240,23 @@ IOReturn com_overlorddev_RyzenHVUserClient::sSetLogLevel(OSObject *target, void 
 
     rhv::log::setLevel((uint32_t)args->scalarInput[0]);
     RHV_SYNC("log level set to %u by user client", (uint32_t)args->scalarInput[0]);
+    return kIOReturnSuccess;
+}
+
+IOReturn com_overlorddev_RyzenHVUserClient::sHvControl(OSObject *target, void *,
+                                                       IOExternalMethodArguments *args)
+{
+    RHV_ME();
+    uint32_t cmd = (uint32_t)args->scalarInput[0], value = (uint32_t)args->scalarInput[1];
+    if (cmd != kRHVHvGet) {
+        RHV_ADMIN();
+        bool ok = cmd == kRHVHvMode ? rhv::hv::setMode(value)
+                : cmd == kRHVHvSysctl ? rhv::hv::setSysctl(value != 0) : false;
+        if (!ok)
+            return cmd > kRHVHvSysctl ? kIOReturnBadArgument : (cmd == kRHVHvSysctl ? kIOReturnUnsupported : kIOReturnNotReady);
+    }
+    args->scalarOutput[0] = (rhv::hv::registered() ? kRHVHvStateRegistered : 0) | (rhv::hv::sysctlTaken() ? kRHVHvStateSysctl : 0);
+    args->scalarOutput[1] = rhv::hv::mode();
     return kIOReturnSuccess;
 }
 

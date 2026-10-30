@@ -20,6 +20,7 @@
 #include <mach-o/getsect.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -144,6 +145,42 @@ static void patch_vendor_check(const struct mach_header *mh, const char *what)
     rhv_hijack_log(msg);
 }
 
+/*
+ * ~/.ryzenhv/env: extra environment for the VM process, one KEY=VALUE per line. The wrapper in /Applications belongs to root,
+ * so this is how a user switches driver options on (for example NVMTL_CACHE_SYNC_IO=1) without sudo. Only NVMTL_* and
+ * RYZENHV_* names are taken, and a variable that is already set stays as it is.
+ */
+static void load_user_env(void)
+{
+    const char *home = getenv("HOME");
+    if (!home || !*home) {
+        struct passwd *pw = getpwuid(getuid());
+        home = pw ? pw->pw_dir : NULL;
+    }
+    if (!home)
+        return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/.ryzenhv/env", home);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *eq = strchr(line, '=');
+        if (!eq || line[0] == '#')
+            continue;
+        *eq = 0;
+        if (strncmp(line, "NVMTL_", 6) != 0 && strncmp(line, "RYZENHV_", 8) != 0)
+            continue;
+        setenv(line, eq + 1, 0);
+        char msg[600];
+        snprintf(msg, sizeof(msg), "env from %s: %s=%s", path, line, getenv(line));
+        rhv_hijack_log(msg);
+    }
+    fclose(f);
+}
+
 __attribute__((constructor)) static void rhv_hijack_init(void)
 {
     const char *prog = getprogname();
@@ -156,6 +193,7 @@ __attribute__((constructor)) static void rhv_hijack_init(void)
     if (!g_binds || !g_nbinds)
         return;
 
+    load_user_env();
     rhv_shim_init();
     patch_vendor_check(_dyld_get_image_header(0), "prl_vm_app");
     _dyld_register_func_for_add_image(on_image);     /* reports the images already loaded, then every new one */

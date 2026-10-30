@@ -11,6 +11,8 @@ that provides the same API.
 > guest installation and use, keyboard, network). Phases 0–2 are done (SVM on all cores, a guest executes code, process memory
 > as guest memory, NPT) and so is phase 3 (the VMX API compatibility layer: QEMU/HVF boots Linux, Parallels boots Windows).
 > **Docker Desktop (Intel build 4.97.0) runs through HyperKit: `docs/DOCKER-DESKTOP.md`.**
+> **New in 0.7 (experimental, opt-in): native mode.** With the boot-arg `rhv_hv=1` the kext is the hypervisor provider itself and
+> Docker Desktop runs with Docker's own unmodified files: no shim, no wrappers, nothing re-signed. See `docs/NATIVE.md`.
 > **How to install Parallels with this kext: `docs/PARALLELS.md`.** It works on the exact Parallels build 26.5.0 (57613).
 > **A ready-made build without compiling: the archive from Releases and the `./rhv` installer** (kext into the EFI, Parallels, Docker, `./rhv doctor`),
 > see `START-HERE.md` inside the archive.
@@ -60,7 +62,7 @@ sudo rhv-info level 0-5   log level on the fly
 sudo rhv-info selftest    check EFER/VM_HSAVE_PA on every core
 ```
 
-Boot-args: `-rhv_off`, `rhv_enable_svm`, `rhv_selftest`, `rhv_loglevel`, `rhv_iolog`, `rhv_stage`, `rhv_slow`. Details in `docs/DEBUGGING.md`.
+Boot-args: `-rhv_off`, `rhv_enable_svm`, `rhv_selftest`, `rhv_loglevel`, `rhv_iolog`, `rhv_stage`, `rhv_slow`, and for native mode `rhv_hv`, `rhv_hv_sysctl`, `rhv_clientpatch`. Details in `docs/DEBUGGING.md`.
 
 If step 5 says `SVM: supported`, `BIOS disable: no`, `NPT: [x]`, phase 0 is done
 and you can write a VMCB and `VMRUN` (see `docs/ROADMAP.md`).
@@ -74,6 +76,7 @@ and you can write a VMCB and `VMRUN` (see `docs/ROADMAP.md`).
 - `docs/PHASE1.md`: how the first guest works, how to run it and how to read failures
 - `docs/PHASE2.md`: mapping process memory into the guest, NPF, how to run it and how to read failures
 - `docs/PARALLELS.md`: **installation and use with Parallels Desktop**, debugging, limits
+- `docs/NATIVE.md`: **native mode** (0.7, experimental): the kext as the hypervisor provider, Docker Desktop without the shim, limits
 - `docs/DOCKER-DESKTOP.md`: **Docker Desktop** on an AMD CPU (HyperKit through the shim)
 - `docs/DOCKER.md`: a small Linux guest with dockerd in QEMU/HVF (`scripts/docker-hvf-test.sh`)
 - `docs/PHASE3.md`: the VMX API compatibility layer and the progress on QEMU and Parallels

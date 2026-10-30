@@ -123,11 +123,21 @@ enum {
     kRHVMethodVmRunEx,
     kRHVMethodVmcsReadMany,
     kRHVMethodVmJoin,
+    kRHVMethodHvControl,    /* appended without an ABI bump: nothing that exists uses it. 2 scalars in (cmd, value), 2 scalars out (state, mode) */
     kRHVMethodCount
 };
 
 /* clientMemoryForType() types. */
 enum { kRHVMemGuestRam = 0 };
+
+/* kRHVMethodHvControl, front end A (kext/Source/HvFrontend.cpp). */
+enum {
+    kRHVHvGet     = 0,   /* value ignored */
+    kRHVHvMode    = 1,   /* value 0: unregister the traps; 1: register, answer HV_UNSUPPORTED; 2: register, answer success */
+    kRHVHvSysctl  = 2    /* value 0/1: kern.hv_support shows 1 (needs the traps registered) */
+};
+/* state bits returned in scalarOutput[0] */
+enum { kRHVHvStateRegistered = 1u << 0, kRHVHvStateSysctl = 1u << 1 };
 
 #define RHV_GUEST_RAM_SIZE (1u << 20)   /* built-in RAM: 1 MiB at guest physical 0 */
 

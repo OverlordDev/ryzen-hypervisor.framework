@@ -2,13 +2,14 @@
 #include <IOKit/IOMessage.h>
 #include <pexpert/pexpert.h>
 
+#include "HvFrontend.hpp"
 #include "Log.hpp"
 #include "RyzenHV.hpp"
 #include "SVM.hpp"
 
 #define super IOService
 
-#define RHV_VERSION "0.3.0"
+#define RHV_VERSION "0.7.0"
 
 OSDefineMetaClassAndStructors(com_overlorddev_RyzenHV, IOService)
 
@@ -140,12 +141,14 @@ bool com_overlorddev_RyzenHV::start(IOService *provider)
             RHV_INFO("probe only; add boot-arg rhv_enable_svm=1 to enable SVM");
         }
     }
+    rhv::hv::start(this);        /* front end A, only with boot-arg rhv_hv=1 */
     return true;
 }
 
 void com_overlorddev_RyzenHV::stop(IOService *provider)
 {
     RHV_INFO("stopping");
+    rhv::hv::stop();
     if (fPMNotifier) {
         fPMNotifier->remove();
         fPMNotifier = nullptr;

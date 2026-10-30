@@ -4,9 +4,10 @@
 #
 #   ./rhv                    menu
 #   ./rhv doctor             what works and what is missing on this Mac
-#   ./rhv kext               put RyzenHV.kext into your OpenCore EFI and set the boot-args
+#   ./rhv kext [--native]    put RyzenHV.kext into your OpenCore EFI and set the boot-args (--native: the kext itself is the hypervisor
+#                            provider, no shim and no patched app files for Docker Desktop, see docs/NATIVE.md)
 #   ./rhv parallels          make Parallels Desktop run through RyzenHV (and ./rhv parallels undo)
-#   ./rhv docker-desktop     Docker Desktop (the real one) running on your AMD CPU, see docs/DOCKER-DESKTOP.md
+#   ./rhv docker-desktop     Docker Desktop (the real one) running on your AMD CPU (native when the kext runs with --native, else the shim)
 #   ./rhv docker up|down|status|env     or a small Linux VM with just dockerd (docker CLI on this Mac talks to it)
 #
 # Nothing here needs Xcode or Homebrew: only tools that ship with macOS, plus the QEMU and the shim in this bundle.
@@ -58,6 +59,7 @@ doctor() {
     local args; args="$(nvram boot-args 2>/dev/null | sed 's/^boot-args[[:space:]]*//')"
     local missing=""
     for b in $BOOTARGS_WANTED; do case " $args " in *" $b "*) ;; *) missing="$missing $b" ;; esac; done
+    if "$ROOT/bin/rhv-info" hv 2>/dev/null | grep -q "front end: registered"; then ok "native front end: $("$ROOT/bin/rhv-info" hv 2>/dev/null | head -1)"; fi
     if [ -z "$missing" ]; then ok "boot-args contain: $BOOTARGS_WANTED"
     else bad "boot-args are missing:$missing   (fix: ./rhv kext)"; fails=$((fails+1)); fi
 
@@ -114,7 +116,13 @@ mount_efi_partitions() {
 }
 
 kext_install() {
-    local efi="${1:-}"
+    local efi="" a
+    for a in "$@"; do
+        case "$a" in
+        --native) BOOTARGS_WANTED="$BOOTARGS_WANTED rhv_hv=1" ;;
+        *) efi="$a" ;;
+        esac
+    done
     [ -d "$ROOT/RyzenHV.kext" ] || die "RyzenHV.kext is not in this bundle"
     if [ -z "$efi" ]; then
         local cands; cands="$(find_efi_volumes)"
@@ -359,6 +367,17 @@ docker_desktop() {
         [ "$b" = "$DD_BUILD" ] || die "Docker Desktop build $b is not supported (need $DD_VERSION, build $DD_BUILD). Run: ./rhv docker-desktop get"
         "$ROOT/bin/rhv-info" >/dev/null 2>&1 || die "the RyzenHV kext does not answer. Run ./rhv doctor"
         pgrep -f "$DD_APP/Contents/MacOS/com.docker.backend" >/dev/null && die "quit Docker Desktop first (menu bar whale > Quit)"
+        if "$ROOT/bin/rhv-info" hv 2>/dev/null | grep -q "front end: registered"; then
+            say "The kext runs as the hypervisor provider (native): Docker Desktop is used as Docker ships it."
+            "$ROOT/libexec/docker-desktop-shim.sh" status 2>/dev/null | grep -q "^installed\|half" && "$ROOT/libexec/docker-desktop-shim.sh" uninstall
+            local st="$HOME/Library/Group Containers/group.com.docker/settings-store.json"
+            mkdir -p "$(dirname "$st")"; [ -f "$st" ] || echo '{}' > "$st"
+            plutil -replace UseVirtualizationFramework -bool NO "$st" || die "cannot edit $st"
+            ok "Docker Desktop is set to use HyperKit (UseVirtualizationFramework=false)"
+            echo "Start Docker Desktop as usual. The kext fixes HyperKit's two CPU checks in memory when it starts a VM; nothing in Docker.app changes."
+            echo "If something is off: rhv-info log | grep 'client fix-ups'"
+            return 0
+        fi
         say "Patching Docker Desktop's HyperKit and starting it through the shim..."
         "$ROOT/libexec/docker-desktop-shim.sh" install || die "install failed"
         cat <<EOF
@@ -407,5 +426,5 @@ docker-desktop) shift; docker_desktop "$@" ;;
 docker) shift; docker_cmd "$@" ;;
 -y|--yes) shift; RHV_YES=1 exec "$SELF" "$@" ;;
 version|--version) echo "RyzenHV ${VERSION:-} (ABI ${ABI:-?})" ;;
-*) sed -n '3,13p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) sed -n '3,14p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

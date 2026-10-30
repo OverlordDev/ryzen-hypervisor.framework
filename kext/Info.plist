@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.3.0</string>
+	<string>0.7.0</string>
 	<key>CFBundleVersion</key>
-	<string>0.3.0</string>
+	<string>0.7.0</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>RyzenHV</key>
@@ -45,6 +45,8 @@
 		<key>com.apple.kpi.libkern</key>
 		<string>12.0.0</string>
 		<key>com.apple.kpi.mach</key>
+		<string>12.0.0</string>
+		<key>com.apple.kpi.private</key>
 		<string>12.0.0</string>
 		<key>com.apple.kpi.unsupported</key>
 		<string>12.0.0</string>

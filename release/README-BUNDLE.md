@@ -18,6 +18,8 @@ xattr -dr com.apple.quarantine .      # if the archive was downloaded with a bro
    and appends the boot-args `rhv_enable_svm=1 rhv_allow_users=1 amfi_get_out_of_my_way=0x1`. Reboot from that EFI.
    SVM Mode must be enabled in the BIOS.
 2. **`./rhv doctor`** checks that everything is in place: CPU, boot-args, the kext (its ABI must match this build), QEMU, Parallels.
+   **Native mode (new in 0.7, experimental):** `./rhv kext --native` also adds `rhv_hv=1`. Then the kext itself is the hypervisor provider and
+   `./rhv docker-desktop` leaves Docker's own files alone (no shim, no wrappers). Read `docs/NATIVE.md` first: it lists what is tested and what is not.
 3. Then whatever you need:
    - **Docker Desktop (the real one):** `./rhv docker-desktop get` (downloads Docker Desktop 4.97.0 from docker.com and installs it;
      skip if you already have exactly that build), then `./rhv docker-desktop`, then start Docker as usual (`open -a Docker`).

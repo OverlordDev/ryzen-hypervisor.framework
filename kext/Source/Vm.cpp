@@ -1044,6 +1044,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
     }
 
     if (rc == kIOReturnSuccess) {
+        bool vmxTranslated = false;
         bzero(out, sizeof(*out));
         if (timeslice) {
             out->reason = RHV_EXIT_TIMESLICE;
@@ -1059,14 +1060,17 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             out->nextRip  = v->control.nextRip;
             fHaveNextRip  = v->control.nextRip != 0;
             if (fVmx) {
+                vmxTranslated = true;
                 uint32_t perm = 0;
                 if (code == EXIT_NPF) {
                     IORWLockRead(fShared->rw());
                     fShared->npt().lookup(v->control.exitInfo2 & ~(uint64_t)0xFFF, nullptr, &perm);
                     IORWLockUnlock(fShared->rw());
                 }
-                if (!fVmcs.recordExit(perm))
-                    out->reason = RHV_EXIT_UNHANDLED;      /* e.g. the guest executed an SVM instruction */
+                if (!fVmcs.recordExit(perm)) {
+                    vmxTranslated = false;
+                    out->reason = RHV_EXIT_UNHANDLED;
+                }      /* e.g. the guest executed an SVM instruction */
             }
             RHV_TRACE("VM exit: code=0x%llx info1=0x%llx info2=0x%llx rip=0x%llx",
                       (unsigned long long)code, (unsigned long long)out->info1,
@@ -1077,7 +1081,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         if (out->reason == RHV_EXIT_INVALID) {
             RHV_STAT_INC(vmInvalidExits);
             dumpVmcb("VMRUN rejected the VMCB (VMEXIT_INVALID)");
-        } else if (out->reason == RHV_EXIT_UNHANDLED) {
+        } else if (out->reason == RHV_EXIT_UNHANDLED && !vmxTranslated) {      /* CR/DR accesses, interrupt windows... are fine in VMX mode */
             RHV_WARN("VM exit with unhandled code 0x%llx at rip 0x%llx", (unsigned long long)code,
                      (unsigned long long)v->save.rip);
         }

@@ -26,6 +26,14 @@ EXE="$KEXT/Contents/MacOS/$(plutil -extract CFBundleExecutable raw -o - "$KEXT/C
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# kmutil does not accept a kext that declares com.apple.kpi.private (OpenCore injects such kexts fine, AMFIPass is one), and
+# it then reports "No extension at ...": check a copy without that dependency, kmutil resolves every kernel symbol anyway.
+if /usr/libexec/PlistBuddy -c "Print :OSBundleLibraries:com.apple.kpi.private" "$KEXT/Contents/Info.plist" >/dev/null 2>&1; then
+    ditto "$KEXT" "$TMP/check.kext"
+    /usr/libexec/PlistBuddy -c "Delete :OSBundleLibraries:com.apple.kpi.private" "$TMP/check.kext/Contents/Info.plist" >/dev/null
+    KEXT="$(cd "$TMP" && pwd -P)/check.kext"      # kmutil needs the real path, not the /var symlink
+fi
+
 nm -u "$EXE" | sort -u > "$TMP/undefined"
 kmutil libraries -p "$KEXT" --arch x86_64 --undef-symbols 2>/dev/null \
     | awk '/KernelCollections/ {print $1}' | sort -u > "$TMP/resolved"

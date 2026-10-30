@@ -185,6 +185,29 @@ static int cmd_level(io_connect_t conn, const char *arg)
     return 0;
 }
 
+static int cmd_hv(io_connect_t conn, int argc, char **argv)
+{
+    uint64_t in[2] = { kRHVHvGet, 0 }, out[2] = { 0, 0 };
+    if (argc > 2 && !strcmp(argv[2], "mode") && argc > 3) {
+        in[0] = kRHVHvMode;
+        in[1] = strtoul(argv[3], NULL, 10);
+    } else if (argc > 2 && !strcmp(argv[2], "sysctl") && argc > 3) {
+        in[0] = kRHVHvSysctl;
+        in[1] = strtoul(argv[3], NULL, 10);
+    } else if (argc > 2 && strcmp(argv[2], "status")) {
+        fprintf(stderr, "usage: rhv-info hv [status | mode 0|1|2 | sysctl 0|1]\n");
+        return 2;
+    }
+    kern_return_t kr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, in, 2, out, &(uint32_t){ 2 });
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "HvControl failed: 0x%x%s\n", kr, getuid() ? " (run with sudo)" : "");
+        return 1;
+    }
+    printf("hv front end: %s, mode %llu, kern.hv_support %s\n", (out[0] & kRHVHvStateRegistered) ? "registered" : "not registered",
+           (unsigned long long)out[1], (out[0] & kRHVHvStateSysctl) ? "replaced (shows 1)" : "untouched");
+    return 0;
+}
+
 static int cmd_selftest(io_connect_t conn)
 {
     uint64_t out[2] = { 0, 0 };
@@ -210,7 +233,7 @@ int main(int argc, char **argv)
     const char *cmd = argc > 1 ? argv[1] : "info";
 
     if (!strcmp(cmd, "-h") || !strcmp(cmd, "--help") || !strcmp(cmd, "help")) {
-        puts("usage: rhv-info [info | log [-f] | stats | level <0-5> | selftest]");
+        puts("usage: rhv-info [info | log [-f] | stats | level <0-5> | selftest | hv [status | mode 0|1|2 | sysctl 0|1]]");
         return 0;
     }
 
@@ -227,6 +250,8 @@ int main(int argc, char **argv)
         rc = cmd_level(conn, argv[2]);
     else if (!strcmp(cmd, "selftest"))
         rc = cmd_selftest(conn);
+    else if (!strcmp(cmd, "hv"))
+        rc = cmd_hv(conn, argc, argv);
     else {
         fprintf(stderr, "unknown command '%s', try: rhv-info help\n", cmd);
         rc = 2;

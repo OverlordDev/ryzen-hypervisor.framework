@@ -32,6 +32,7 @@ private:
                                  IOExternalMethodArguments *args);
     static IOReturn sGetStats(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sSelfTest(OSObject *target, void *reference, IOExternalMethodArguments *args);
+    static IOReturn sHvControl(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sVmCreate(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sVmDestroy(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sVmReset(OSObject *target, void *reference, IOExternalMethodArguments *args);
