@@ -7,6 +7,7 @@
 #   ./rhv kext [--native]    put RyzenHV.kext into your OpenCore EFI and set the boot-args (--native: the kext itself is the hypervisor
 #                            provider, no shim and no patched app files for Docker Desktop, see docs/NATIVE.md)
 #   ./rhv parallels          make Parallels Desktop run through RyzenHV (and ./rhv parallels undo)
+#   ./rhv parallels native   the same for native mode (kext booted with --native): Apple's own Hypervisor.framework, only the vendor check patched
 #   ./rhv docker-desktop     Docker Desktop (the real one) running on your AMD CPU (native when the kext runs with --native, else the shim)
 #   ./rhv docker up|down|status|env     or a small Linux VM with just dockerd (docker CLI on this Mac talks to it)
 #
@@ -48,8 +49,15 @@ fi
 
 # ---------------------------------------------------------------- doctor
 doctor() {
-    local fails=0 v b
+    local fails=0 v b bundle=1
     say "RyzenHV ${VERSION:-?} (ABI ${ABI:-?}): system check"
+    # Run from a git checkout (release/rhv) instead of the unpacked release archive there is no VERSION, no bin/rhv-info and no qemu/:
+    # every check that needs them would then blame the kext or the download, which is misleading. Say what is wrong instead.
+    if [ ! -f "$ROOT/VERSION" ] || [ ! -x "$ROOT/bin/rhv-info" ]; then
+        bundle=0
+        bad "this is not the unpacked release archive ($ROOT has no VERSION and/or bin/rhv-info; a git checkout?). Download the RyzenHV-*-macos-x86_64.tar.gz from the Releases page and run ./rhv from that folder"
+        fails=$((fails+1))
+    fi
     v="$(sysctl -n machdep.cpu.vendor 2>/dev/null)"
     if [ "$v" = AuthenticAMD ]; then ok "CPU: $(sysctl -n machdep.cpu.brand_string)"; else warn "CPU vendor is $v; RyzenHV is for AMD CPUs (an Intel Mac has the real Hypervisor.framework)"; fi
     v="$(sw_vers -productVersion 2>/dev/null)"
@@ -71,12 +79,16 @@ doctor() {
         else bad "kext ABI is $kabi but this bundle needs $ABI: install the kext from this bundle (./rhv kext) and reboot"; fails=$((fails+1)); fi
         echo "$info" | grep -q "SVM  *: supported" && ok "SVM supported" || { bad "SVM is not usable (enable SVM Mode in the BIOS)"; fails=$((fails+1)); }
         echo "$info" | grep -q "\[x\] NPT" && ok "nested paging (NPT) available" || { bad "no NPT"; fails=$((fails+1)); }
+    elif [ $bundle = 0 ]; then
+        warn "the kext was not checked: bin/rhv-info is missing (see the first problem above); 'kextstat | grep -i ryzen' shows whether it is loaded"
     else
         bad "the kext does not answer (not installed, not loaded, or rhv_allow_users=1 missing). Run: ./rhv kext, then reboot"
         fails=$((fails+1))
     fi
 
-    if [ -x "$ROOT/qemu/bin/qemu-system-x86_64" ] && "$ROOT/qemu/bin/qemu-system-x86_64" --version >/dev/null 2>&1; then
+    if [ $bundle = 0 ] && [ ! -d "$ROOT/qemu" ]; then
+        warn "the bundled QEMU was not checked: there is no qemu/ folder here (see the first problem above)"
+    elif [ -x "$ROOT/qemu/bin/qemu-system-x86_64" ] && "$ROOT/qemu/bin/qemu-system-x86_64" --version >/dev/null 2>&1; then
         ok "bundled QEMU runs"
     else bad "the bundled QEMU does not start (damaged download?)"; fails=$((fails+1)); fi
 
@@ -90,7 +102,7 @@ doctor() {
     fi
     if [ -d "$DD_APP" ]; then
         local ddb; ddb="$(defaults read "$DD_APP/Contents/Info" CFBundleVersion 2>/dev/null)"
-        if [ "$ddb" = "$DD_BUILD" ]; then ok "Docker Desktop $DD_VERSION (build $ddb, supported): $("$ROOT/libexec/docker-desktop-shim.sh" status)"
+        if [ "$ddb" = "$DD_BUILD" ]; then ok "Docker Desktop $DD_VERSION (build $ddb, supported)$([ -x "$ROOT/libexec/docker-desktop-shim.sh" ] && echo ": $("$ROOT/libexec/docker-desktop-shim.sh" status)")"
         else warn "Docker Desktop build $ddb: only $DD_VERSION (build $DD_BUILD) is supported; ./rhv docker-desktop get installs it"; fi
     else
         echo "  [--]   Docker Desktop is not installed (optional: ./rhv docker-desktop get)"
@@ -239,10 +251,34 @@ Do not hard-stop a Windows VM during the installation or the first start: it may
 After a Parallels update run './rhv parallels' again.
 EOF
         ;;
+    native)
+        # Native mode (docs/NATIVE.md): the kext is the hypervisor provider, so Parallels uses Apple's own Hypervisor.framework. Only its
+        # CPU-vendor check is patched, in memory, by a small stand-in library; no hv_* call is replaced.
+        [ -d "$app" ] || die "Parallels Desktop is not installed"
+        build="$(defaults read "$app/Contents/Info" CFBundleVersion 2>/dev/null)"
+        [ "$build" = "$SUPPORTED_PARALLELS_BUILD" ] || die "Parallels build $build is not supported; RyzenHV needs 26.5.0 (build $SUPPORTED_PARALLELS_BUILD)"
+        doctor >/dev/null 2>&1 || { doctor; die "fix the problems above first"; }
+        "$ROOT/bin/rhv-info" hv 2>/dev/null | grep -q "front end: registered" || die "the kext is not in native mode. Run ./rhv kext --native, reboot, then try again"
+        if [ "$(sysctl -n kern.hv_support 2>/dev/null)" != 1 ]; then
+            die "kern.hv_support is 0 (Parallels would use its own engine). Run: $ROOT/bin/rhv-info hv sysctl 1   (it is reset by every reboot)"
+        fi
+        say "Preparing a private copy of Parallels' VM process (native mode)..."
+        PATCHONLY=1 "$ROOT/libexec/parallels-shim.sh" prepare || die "prepare failed"
+        echo "Replacing prl_vm_app with a wrapper (needs your password; './rhv parallels undo' puts Parallels' own file back)..."
+        sudo "$ROOT/libexec/parallels-shim.sh" install || die "install failed"
+        "$ROOT/libexec/parallels-shim.sh" fix-vms || true
+        cat <<EOT
+
+Done (native mode). Experimental: tested with Windows 10 (1 and 4 vCPUs) on one machine. Keys to know:
+  - after every reboot run  $ROOT/bin/rhv-info hv sysctl 1  before starting a VM
+  - the hypervisor type of the VM must be apple: prlctl set "<VM name>" --hypervisor-type apple
+  - the log of the vendor patch is ~/.ryzenhv/prl-patch.log; ./rhv parallels undo removes the wrapper
+EOT
+        ;;
     undo)   sudo "$ROOT/libexec/parallels-shim.sh" uninstall ;;
     fix-vms) "$ROOT/libexec/parallels-shim.sh" fix-vms ;;
     status) "$ROOT/libexec/parallels-shim.sh" status ;;
-    *) die "usage: rhv parallels [setup|undo|status|fix-vms]" ;;
+    *) die "usage: rhv parallels [setup|native|undo|status|fix-vms]" ;;
     esac
 }
 

@@ -151,6 +151,8 @@ struct HvVcpu {
     uint32_t nManaged;
     bool     cpuidPending;     /* the last exit was a CPUID: its answer is cleaned on the way back in (HyperKit only) */
     uint32_t cpuidLeaf;
+    uint32_t cpuidSub;
+    uint64_t tprPage;          /* the TPR word of the page as this driver last left it (Parallels: the client's write is applied when it differs) */
     uint8_t  managedIdx[256];  /* position in the list -> MSR cache index, 0 = a hole */
     uint64_t applied[144];     /* the last value handed to the core for each MSR cache index */
     uint8_t  appliedKnown[144];
@@ -166,6 +168,7 @@ struct HvVm {
     uint64_t tscOffset;                        /* from hv_vm_sync_tsc, handed to vCPUs created later */
     bool     tscValid;
     bool     hyperkit;                         /* the creating process is Docker's HyperKit: its CPUID answers get the AMD-only features removed */
+    bool     parallels;                        /* the creating process is Parallels' VM process: its LAPIC page (GPA 0xFEE00000) is not mapped */
     HvVcpu *vcpu[kMaxVcpus];
     uint32_t nVcpus;
 };
@@ -217,6 +220,7 @@ HvVm *vmCreate(uint64_t *info)
         char pname[32] = {0};
         proc_selfname(pname, sizeof(pname));
         vm->hyperkit = strncmp(pname, "com.docker.hyper", 16) == 0 || strncmp(pname, "hyperkit", 8) == 0;
+        vm->parallels = strncmp(pname, "prl_vm_app", 10) == 0;
     }
     vm->lock = IOLockAlloc();
     if (!vm->lock) {
@@ -237,6 +241,12 @@ HvVm *vmCreate(uint64_t *info)
         }
         vm->kva[i] = (uint8_t *)vm->md[i]->getBytesNoCopy();
         bzero(vm->kva[i], sizes[i]);
+        if (i == 2) {
+            /* hv_vmx_tsc_clock (Hypervisor.framework, called by Parallels when it starts a vCPU) is a seqlock over this page: it spins
+             * until the 32-bit sequence at +0x10 is non-zero, then returns rdtsc + [+8] - [+0]. Zero in both is the host TSC itself,
+             * which is what the shim's hv_tsc_clock returned and Parallels worked with. HyperKit never calls it. */
+            *(volatile uint32_t *)(vm->kva[2] + 0x10) = 1;
+        }
         /* The ro area and the commpage are read-only for the client. */
         vm->map[i] = vm->md[i]->createMappingInTask(task, 0, kIOMapAnywhere | (i == 0 ? 0 : kIOMapReadOnly));
         if (!vm->map[i]) {
@@ -629,6 +639,60 @@ const uint32_t kRunFields[RHV_RUN_NFIELDS] = {
 #undef RHV_X
 };
 
+/* Parallels' monitor answers CPUID from the AMD host. The same post-processing the shim does (shim/hv_shim.c, cpuid_hide_hypervisor), applied to the
+ * registers the monitor wrote, on the way back into the guest:
+ *  - the hypervisor bit and the Hyper-V leaves are hidden: Windows then never sets up the hypercall page, which Parallels fills with the Intel
+ *    VMCALL (a #UD on AMD, and a triple fault at the very start of the Windows kernel);
+ *  - an Intel-style cache/core topology (leaf 4, AMD's 0x80000005/6/8 and CmpLegacy): the AMD host's own answer makes Windows see every vCPU as a
+ *    package of its own, and Windows Home runs only one package, so it would start one CPU. */
+void parallelsCpuidFixup(HvVcpu *v)
+{
+    const uint32_t leaf = v->cpuidLeaf, sub = v->cpuidSub;
+    unsigned n = v->vm->nVcpus;
+    if (n < 1)
+        n = 1;
+    uint64_t *rax = gprWord(v, R_RAX), *rcx = gprWord(v, R_RCX), *rdx = gprWord(v, R_RDX), *rbx = gprWord(v, R_RBX);
+    if (leaf == 4) {
+        const uint32_t cores = (uint32_t)(n - 1) << 26;
+        uint32_t a = 0, b = 0, c = 0;
+        switch (sub) {
+        case 0: a = cores | (1u << 8) | (1u << 5) | 1; b = 63 | (7u << 22); c = 63; break;                                    /* L1 data    */
+        case 1: a = cores | (1u << 8) | (1u << 5) | 2; b = 63 | (7u << 22); c = 63; break;                                    /* L1 inst    */
+        case 2: a = cores | (1u << 8) | (2u << 5) | 3; b = 63 | (7u << 22); c = 1023; break;                                  /* L2 unified */
+        case 3: a = cores | ((uint32_t)(n - 1) << 14) | (1u << 8) | (3u << 5) | 3; b = 63 | (15u << 22); c = 16383; break;   /* L3         */
+        default: break;
+        }
+        *rax = a;
+        *rbx = b;
+        *rcx = c;
+        *rdx = 0;
+    } else if (leaf == 0x80000008u) {
+        if (n > 1) {                                    /* ECX[7:0] = cores per package - 1, ECX[15:12] = bits of the APIC id that name the core */
+            unsigned bits = 0;
+            while ((1u << bits) < n)
+                bits++;
+            *rcx = (*rcx & ~0xF0FFull) | ((uint64_t)bits << 12) | (n - 1);
+        }
+    } else if (leaf == 0x80000005u) {                   /* L1: 32 KiB data and instruction, 8-way, 64-byte lines */
+        *rax = 0xFF40FF40u;
+        *rbx = 0xFF40FF40u;
+        *rcx = (32u << 24) | (8u << 16) | (1u << 8) | 64;
+        *rdx = (32u << 24) | (8u << 16) | (1u << 8) | 64;
+    } else if (leaf == 0x80000006u) {                   /* L3: 4 MiB per core (Windows adds them up), 16-way */
+        *rdx = (8u << 18) | (8u << 12) | (1u << 8) | 64;
+    } else if (leaf == 0x80000001u) {
+        if (n > 1)                                      /* CmpLegacy: the logical-processor count in leaf 1 is valid */
+            *rcx |= 2;
+    } else if (leaf == 1) {
+        *rcx &= ~(1ull << 31);                          /* no hypervisor */
+    } else if (leaf >= 0x40000000u && leaf <= 0x400000FFu) {
+        *rax = 0;
+        *rbx = 0;
+        *rcx = 0;
+        *rdx = 0;
+    }
+}
+
 kern_return_t tVcpuRun(void *target, uint64_t arg)
 {
     note(HV_THREAD_TRAP, 0, arg);
@@ -640,7 +704,10 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
     /* 1. What the client changed since the last run: registers from the page, VMCS fields from the dirty slots. */
     /* HyperKit answers CPUID from the host's values, which on a Ryzen are AMD's; a Linux guest then trusts features HyperKit does not emulate
      * (MWAITX in its delay loop, SVM, extended topology, AMD counters, IBPB/IBRS/SSBD enumeration). Clean the answer it just wrote. */
-    if (v->cpuidPending) {
+    if (v->cpuidPending && v->vm->parallels) {
+        v->cpuidPending = false;
+        parallelsCpuidFixup(v);
+    } else if (v->cpuidPending) {
         v->cpuidPending = false;
         if (v->cpuidLeaf == 0x80000001u)
             *gprWord(v, R_RCX) &= ~((1ull << 2) | (1ull << 22) | (1ull << 23) | (1ull << 24) | (1ull << 26) | (1ull << 27) | (1ull << 29));
@@ -675,6 +742,13 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
         uint32_t field = rhv::hv::kSlotField[slot];
         /* A field the SVM core does not model is skipped, not fatal: the framework accepts any write to a slot. */
         if (field) {
+            if (field == 0x4016 && v->vm->parallels && (*slotWord(v, slot) >> 31)) {        /* the monitor injects an event: what and at which TPR */
+                static volatile SInt32 injected;
+                SInt32 ni = OSIncrementAtomic(&injected) + 1;
+                if (ni <= 60 || (ni % 500) == 0)
+                    RHV_INFO("hv front end: inject %#llx (#%d) at tpr %#llx rflags %#llx", (unsigned long long)*slotWord(v, slot), (int)ni,
+                             (unsigned long long)*gprWord(v, R_TPR), (unsigned long long)regs.rflags);
+            }
             IOReturn wr = cpu->vmcsWrite(field, *slotWord(v, slot));
             if (wr != kIOReturnSuccess) {
                 rejected++;
@@ -700,6 +774,17 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
             bcopy(v->vm->kva[0] + kRwFpOff + v->id * v->vm->fpStride, f->area, n);
         }
         f->xcr0 = *gprWord(v, R_XCR0);
+        if (flags & 0x80) {
+            /* Parallels writes XSTATE_BV=7 while XCR0 is still 1 (it enables AVX afterwards). XRSTOR with a component that XCR0 has not enabled
+             * faults, so the core refuses such an image; the shim cut those bits too. They are components still in their initial state. */
+            if (f->size >= 520) {
+                uint64_t bv;
+                __builtin_memcpy(&bv, f->area + 512, sizeof(bv));
+                const uint64_t keep = bv & (f->xcr0 | 3);          /* x87 and SSE are always allowed */
+                if (keep != bv)
+                    __builtin_memcpy(f->area + 512, &keep, sizeof(keep));
+            }
+        }
         IOReturn fr = cpu->setFpu(f);
         if (fr != kIOReturnSuccess)
             RHV_INFO("hv front end: FP state/XCR0 refused by the core (0x%x), xcr0 %#llx", fr, (unsigned long long)f->xcr0);
@@ -760,11 +845,49 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
     v->in.flags = RHV_RUN_REGS;
     v->in.nWrites = 0;
     v->in.regs = regs;
+    if (v->vm->parallels) {
+        /* HV_X86_TPR is the 8-bit APIC TPR (class in bits 7:4); the core's V_TPR is the 4-bit class. Parallels' monitor decides from it whether it may
+         * inject an interrupt and answers the guest's CR8 reads from it, so a write has to reach the core and read back (the shim's read<<4, write>>4). */
+        const uint64_t tpr = *gprWord(v, R_TPR);
+        if (tpr != v->tprPage) {
+            cpu->vmcsWrite(0xF004, (tpr >> 4) & 0xF);
+            v->tprPage = tpr;
+        }
+    }
+    const uint64_t inRax = regs.rax, inRcx = regs.rcx, inRdx = regs.rdx;       /* what the client set before this entry */
     IOReturn rc = cpu->runEx(&v->in, &v->out);
-    if (rc != kIOReturnSuccess)
+    if (rc != kIOReturnSuccess) {
+        static volatile SInt32 failed;
+        if (!v->vm->hyperkit && OSIncrementAtomic(&failed) < 30)
+            RHV_INFO("hv front end: run vcpu%u failed: 0x%x (rip %#llx)", v->id, rc, (unsigned long long)regs.rip);
         return hvFromIo(rc);
+    }
 
-    if (v->vm->hyperkit) {
+    if (!v->vm->hyperkit) {
+        /* What a client that is new to the native path does: the first exits, then one in 5000. Lets a stalled guest be read from rhv-info log. */
+        static volatile SInt32 runs;
+        SInt32 n = OSIncrementAtomic(&runs) + 1;
+        if (n <= 120 || (n % 5000) == 0) {
+            uint64_t reason = 0, qual = 0, ilen = 0, intr = 0, cr0 = 0;
+            for (unsigned i = 0; i < RHV_RUN_NFIELDS; i++) {
+                const uint64_t f = v->out.fields[i];
+                switch (kRunFields[i]) {
+                case 0x4402: reason = f; break;
+                case 0x6400: qual = f; break;
+                case 0x440c: ilen = f; break;
+                case 0x4824: intr = f; break;
+                case 0x6800: cr0 = f; break;
+                default: break;
+                }
+            }
+            RHV_INFO("hv front end: run %d vcpu%u exit reason %llu qual %#llx ilen %llu rip %#llx rflags %#llx rax %#llx rcx %#llx rdx %#llx in rax %#llx rcx %#llx rdx %#llx intr %#llx cr0 %#llx",
+                     (int)n, v->id, (unsigned long long)(reason & 0xffff), (unsigned long long)qual, (unsigned long long)ilen,
+                     (unsigned long long)v->out.regs.rip, (unsigned long long)v->out.regs.rflags, (unsigned long long)v->out.regs.rax,
+                     (unsigned long long)v->out.regs.rcx, (unsigned long long)v->out.regs.rdx, (unsigned long long)inRax, (unsigned long long)inRcx,
+                     (unsigned long long)inRdx, (unsigned long long)intr, (unsigned long long)cr0);
+        }
+    }
+    if (v->vm->hyperkit || v->vm->parallels) {
         uint64_t exitReason = 0;
         for (unsigned i = 0; i < RHV_RUN_NFIELDS; i++)
             if (kRunFields[i] == 0x4402)
@@ -772,6 +895,7 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
         if ((exitReason & 0xFFFF) == 10) {
             v->cpuidPending = true;
             v->cpuidLeaf = (uint32_t)v->out.regs.rax;
+            v->cpuidSub = (uint32_t)v->out.regs.rcx;
         }
     }
     fpuToPage(v);                                       /* the core's FP state and XCR0 after the run */
@@ -813,7 +937,12 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
         if (enc == 0xF000) {
             *gprWord(v, R_CR2) = val;                  /* CR2 and TPR are registers in the page, not VMCS slots */
         } else if (enc == 0xF004) {
-            *gprWord(v, R_TPR) = val;
+            if (v->vm->parallels) {
+                *gprWord(v, R_TPR) = (val & 0xF) << 4;
+                v->tprPage = (val & 0xF) << 4;
+            } else {
+                *gprWord(v, R_TPR) = val;
+            }
         } else if ((enc >> 1) < rhv::hv::kFieldSlotCount) {
             unsigned slot = rhv::hv::kFieldSlot[enc >> 1];
             if (slot && slot < kCacheSlots) {
@@ -885,6 +1014,14 @@ kern_return_t mapItem(HvVm *vm, uint64_t arg, MapItem *it)
     return kHvOk;
 }
 
+/* Parallels maps one page at GPA 0xFEE00000 as the "APIC page". Intel's hardware APIC virtualization intercepts it; here it would be plain
+ * guest RAM and the guest's LAPIC (timer, EOI) would do nothing. Left unmapped, the accesses fault to the client as exit 48, which its
+ * monitor emulates as LAPIC MMIO (the same fix the shim has: docs/PARALLELS.md). unmap/protect of that page are answered with success. */
+inline bool apicPageSkipped(const HvVm *vm, const MapItem &it)
+{
+    return vm->parallels && it.gpa == 0xFEE00000ull && it.size == 0x1000;
+}
+
 kern_return_t tVmMap(void *target, uint64_t arg)
 {
     note(HV_TASK_TRAP, 4, arg);
@@ -892,6 +1029,8 @@ kern_return_t tVmMap(void *target, uint64_t arg)
     kern_return_t k = mapItem(static_cast<HvVm *>(target), arg, &it);
     if (k)
         return k;
+    if (apicPageSkipped(static_cast<HvVm *>(target), it))
+        return kHvOk;
     return hvFromIo(static_cast<HvVm *>(target)->shared->map(current_task(), it.uva, it.gpa, it.size, (uint32_t)it.flags));
 }
 
@@ -902,6 +1041,8 @@ kern_return_t tVmUnmap(void *target, uint64_t arg)
     kern_return_t k = mapItem(static_cast<HvVm *>(target), arg, &it);
     if (k)
         return k;
+    if (apicPageSkipped(static_cast<HvVm *>(target), it))
+        return kHvOk;
     return hvFromIo(static_cast<HvVm *>(target)->shared->unmap(it.gpa, it.size));
 }
 
@@ -912,6 +1053,8 @@ kern_return_t tVmProtect(void *target, uint64_t arg)
     kern_return_t k = mapItem(static_cast<HvVm *>(target), arg, &it);
     if (k)
         return k;
+    if (apicPageSkipped(static_cast<HvVm *>(target), it))
+        return kHvOk;
     return hvFromIo(static_cast<HvVm *>(target)->shared->protect(it.gpa, it.size, (uint32_t)it.flags));
 }
 

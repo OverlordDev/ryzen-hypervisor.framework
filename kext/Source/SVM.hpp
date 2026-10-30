@@ -53,6 +53,19 @@ uint32_t activeCpuCount();
  */
 bool activeOnAllUsable();
 
+/*
+ * For VmRun, on the CPU it is about to VMRUN on, with interrupts off. VMRUN's first instruction here is CLGI, which is #UD (a
+ * kernel panic) when EFER.SVME is clear on this CPU; activeOnAllUsable() only counts what enableAll() did and cannot see a
+ * CPU whose EFER changed afterwards. This reads EFER and VM_HSAVE_PA on this CPU and, if either is not what enableAll() set,
+ * writes it back (the same writes as enableAll(), from the same save area).
+ *   0: both were right    1: something was wrong and has been restored    -1: this CPU cannot run SVM, do not VMRUN
+ * No logging (interrupts are off); the caller logs a 1 after it has turned them on again.
+ */
+int ensureThisCpu();
+
+/* How many times ensureThisCpu() had to restore something. */
+uint32_t healedCount();
+
 } // namespace svm
 } // namespace rhv
 

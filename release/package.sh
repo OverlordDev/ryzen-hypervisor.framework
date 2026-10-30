@@ -26,6 +26,9 @@ if [ ! -f build/hijack-link/libPrlXmlModel.1.dylib ]; then
     install_name_tool -id "@loader_path/libPrlXmlModel.1.orig.dylib" build/hijack-link/libPrlXmlModel.1.dylib
 fi
 make hijack >/dev/null
+cp build/libPrlXmlModel.1.dylib build/prl-shim.dylib
+make hijack-patchonly >/dev/null                     # the native-mode variant: only patches Parallels' vendor check
+cp build/libPrlXmlModel.1.dylib build/prl-native.dylib
 
 S="dist/ryzenhv-$VER"
 rm -rf "$S" "dist/ryzenhv-$VER-macos-x86_64.tar.gz"
@@ -34,7 +37,9 @@ cp release/rhv "$S/rhv"
 cp release/libexec/serial-drive.pl "$S/libexec/"
 cp scripts/parallels-shim.sh scripts/docker-desktop-shim.sh "$S/libexec/"
 cp -R build/RyzenHV.kext "$S/RyzenHV.kext"
-cp build/libryzenhv.dylib build/libPrlXmlModel.1.dylib "$S/lib/"
+cp build/libryzenhv.dylib "$S/lib/"
+cp build/prl-shim.dylib "$S/lib/libPrlXmlModel.1.dylib"
+cp build/prl-native.dylib "$S/lib/libPrlXmlModel.1.native.dylib"
 cp build/rhv-info "$S/bin/"
 cp -R "$QEMU_DIR" "$S/qemu"
 cp README.md "$S/"

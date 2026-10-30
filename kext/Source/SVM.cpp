@@ -33,6 +33,7 @@ IOBufferMemoryDescriptor *gHostSave[RHV_MAX_CPUS];
 uint64_t                  gHostSavePa[RHV_MAX_CPUS];
 uint32_t                  gNCpus;
 volatile SInt32           gActive;
+volatile SInt32           gHealed;    /* times ensureThisCpu() restored EFER.SVME or VM_HSAVE_PA */
 volatile SInt32           gSeen;      /* CPUs that ran probeAction */
 volatile SInt32           gMaxIndex;  /* highest cpu_number() seen */
 volatile bool             gReadMsrs = true;   /* set before the probe rendezvous */
@@ -367,6 +368,28 @@ uint32_t activeCpuCount()
 bool activeOnAllUsable()
 {
     return !gSuspended && gActive > 0 && (uint32_t)gActive == usableCount();
+}
+
+int ensureThisCpu()
+{
+    int cpu = cpu_number();
+    if (cpu < 0 || cpu >= RHV_MAX_CPUS || !cpuUsable(gProbe[cpu]) || !gHostSavePa[cpu])
+        return -1;
+    uint64_t efer = rhv_rdmsr(RHV_MSR_EFER);
+    uint64_t hsave = rhv_rdmsr(RHV_MSR_VM_HSAVE_PA);
+    if ((efer & RHV_EFER_SVME) && hsave == gHostSavePa[cpu])
+        return 0;
+    if (!(efer & RHV_EFER_SVME))
+        rhv_wrmsr(RHV_MSR_EFER, efer | RHV_EFER_SVME);
+    if (hsave != gHostSavePa[cpu])
+        rhv_wrmsr(RHV_MSR_VM_HSAVE_PA, gHostSavePa[cpu]);
+    OSIncrementAtomic(&gHealed);
+    return 1;
+}
+
+uint32_t healedCount()
+{
+    return (uint32_t)gHealed;
 }
 
 } // namespace svm

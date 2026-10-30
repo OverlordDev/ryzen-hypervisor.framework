@@ -11,7 +11,7 @@ BUILD := build
 CC    ?= cc
 CXX   ?= c++
 
-.PHONY: all test tools shim kext clean
+.PHONY: all test tools shim hijack hijack-patchonly kext clean
 
 all: tools shim kext
 
@@ -70,6 +70,14 @@ hijack: | $(BUILD)
 	$(CC) -arch x86_64 -Wall -Wextra -Wno-deprecated-declarations -Wno-nullability-completeness -O2 -dynamiclib -DRHV_HIJACK \
 		-install_name @rpath/$(HIJACK_NAME) -Wl,-reexport_library,$(HIJACK_ORIG) \
 		-o $(BUILD)/$(HIJACK_NAME) $(SHIM_SRC) shim/hijack.c -framework Hypervisor -framework IOKit -framework CoreFoundation
+
+# Native mode (rhv_hv=1): the same stand-in library, but it only patches Parallels' vendor check and replaces no hv_* call
+# (shim/hijack_patchonly.c). Needs the same build/hijack-link copy of the real library.
+hijack-patchonly: | $(BUILD)
+	@test -f "$(HIJACK_ORIG)" || { echo "run scripts/parallels-shim.sh prepare first (it makes $(HIJACK_ORIG))"; exit 1; }
+	$(CC) -arch x86_64 -Wall -Wextra -O2 -dynamiclib \
+		-install_name @rpath/$(HIJACK_NAME) -Wl,-reexport_library,$(HIJACK_ORIG) \
+		-o $(BUILD)/$(HIJACK_NAME) shim/hijack_patchonly.c shim/rhv_patch.c
 
 kext:
 	$(MAKE) -C kext

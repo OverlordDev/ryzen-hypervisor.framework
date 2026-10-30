@@ -885,6 +885,17 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             break;
         }
 
+        /* activeOnAllUsable() counts what enableAll() did; this looks at THIS cpu's EFER, because CLGI without SVME is a #UD panic. */
+        const int runCpu = (int)fRunCpu;
+        const int svmFix = svm::ensureThisCpu();
+        if (svmFix < 0) {
+            fRunCpu = -1;
+            ml_set_interrupts_enabled(ints);
+            RHV_ERR("VmRun: SVM cannot be used on cpu %d (not usable or no save area), not entering the guest", runCpu);
+            rc = kIOReturnNotReady;
+            break;
+        }
+
         /*
          * VMRUN does not touch x87/SSE/AVX state or XCR0. Swap them by hand, still with interrupts off, so
          * the calling process gets its registers back exactly as it left them.
@@ -961,6 +972,13 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 
         __asm__ volatile("movq %0, %%cr2" : : "r"(hostCr2));
         ml_set_interrupts_enabled(ints);   /* a pending host interrupt is taken right here */
+
+        if (svmFix > 0) {
+            static volatile SInt32 healLogged;
+            if (OSIncrementAtomic(&healLogged) < 20)
+                RHV_WARN("VmRun: EFER.SVME or VM_HSAVE_PA was wrong on cpu %d and was restored before VMRUN (%u times so far)", runCpu,
+                         svm::healedCount());
+        }
 
         code = v->control.exitCode;
         RHV_STAT_INC(vmExits);

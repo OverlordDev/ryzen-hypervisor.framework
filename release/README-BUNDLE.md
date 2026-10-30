@@ -29,6 +29,7 @@ xattr -dr com.apple.quarantine .      # if the archive was downloaded with a bro
      To reach a container port from the Mac: `./rhv docker up --port 8080`, then `docker run -p 8080:80 nginx` and `http://127.0.0.1:8080`. Stop it with `./rhv docker down`.
      The first start downloads about 150 MB (the Alpine kernel, packages, the docker CLI) and takes a few minutes.
    - **Parallels Desktop 26.5.0:** `./rhv parallels`, then the VM settings it prints. To undo: `./rhv parallels undo`.
+     With the kext in native mode (`./rhv kext --native`) there is also `./rhv parallels native` (experimental, see `docs/NATIVE.md`).
 
 ## What is inside
 
@@ -38,6 +39,7 @@ xattr -dr com.apple.quarantine .      # if the archive was downloaded with a bro
 | `RyzenHV.kext` | the kext (AMD-V / SVM), unsigned, loaded through OpenCore |
 | `lib/libryzenhv.dylib` | the `Hypervisor.framework` shim |
 | `lib/libPrlXmlModel.1.dylib` | stand-in for a Parallels library (build 57613 only) |
+| `lib/libPrlXmlModel.1.native.dylib` | the same stand-in for native mode: it only patches the CPU-vendor check |
 | `qemu/` | QEMU 11.1.2 with HVF and user networking (GPL, sources: `LICENSES/SOURCES.txt`) |
 | `bin/rhv-info` | kext diagnostics (`rhv-info`, `rhv-info log`) |
 | `docs/` | details: Parallels, Docker Desktop, the small Docker VM, installing on a Ryzentosh |

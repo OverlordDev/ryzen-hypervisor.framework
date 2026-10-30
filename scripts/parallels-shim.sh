@@ -3,6 +3,7 @@
 # Runs Parallels' VM process (prl_vm_app) with the Hypervisor.framework shim loaded.
 #
 #   ./scripts/parallels-shim.sh prepare          # builds a private copy of the VM app with the shim built in (no sudo)
+#   PATCHONLY=1 ./scripts/parallels-shim.sh prepare   # the same for native mode (kext booted with rhv_hv=1): only the vendor check is patched
 #   sudo ./scripts/parallels-shim.sh install     # prl_vm_app in /Applications becomes a wrapper that starts that copy
 #   sudo ./scripts/parallels-shim.sh uninstall   # puts Parallels' own prl_vm_app back
 #   ./scripts/parallels-shim.sh fix-vms           # turns 3D acceleration off in every stopped VM (it crashes prl_vm_app here)
@@ -71,19 +72,27 @@ prepare)
     cp -p "$APP/Contents/Frameworks/libPrlXmlModel.1.dylib" "$FARM/Contents/Frameworks/libPrlXmlModel.1.orig.dylib"
     if [ -f "$HERE/lib/libPrlXmlModel.1.dylib" ]; then
         # Release bundle: the stand-in library comes prebuilt (it only re-exports ...orig.dylib next to it), no compiler needed.
-        cp "$HERE/lib/libPrlXmlModel.1.dylib" "$FARM/Contents/Frameworks/libPrlXmlModel.1.dylib"
+        # PATCHONLY=1 (native mode, the kext booted with rhv_hv=1): the variant that only patches Parallels' vendor check.
+        LIB="$HERE/lib/libPrlXmlModel.1.dylib"
+        if [ -n "${PATCHONLY:-}" ]; then
+            LIB="$HERE/lib/libPrlXmlModel.1.native.dylib"
+            [ -f "$LIB" ] || { echo "this bundle has no native-mode library ($LIB)" >&2; exit 1; }
+        fi
+        cp "$LIB" "$FARM/Contents/Frameworks/libPrlXmlModel.1.dylib"
     else
         # For the linker only: a copy whose install name says where the real library will be.
         mkdir -p "$HERE/build/hijack-link"
         cp "$APP/Contents/Frameworks/libPrlXmlModel.1.dylib" "$HERE/build/hijack-link/libPrlXmlModel.1.dylib"
         install_name_tool -id "@loader_path/libPrlXmlModel.1.orig.dylib" "$HERE/build/hijack-link/libPrlXmlModel.1.dylib" 2>/dev/null
-        make -C "$HERE" hijack >/dev/null
+        # PATCHONLY=1: for native mode (kext booted with rhv_hv=1). The library only patches the vendor check, hv_* stay Apple's.
+        if [ -n "${PATCHONLY:-}" ]; then make -C "$HERE" hijack-patchonly >/dev/null; else make -C "$HERE" hijack >/dev/null; fi
         cp "$HERE/build/libPrlXmlModel.1.dylib" "$FARM/Contents/Frameworks/libPrlXmlModel.1.dylib"
     fi
     codesign --force --sign - "$FARM/Contents/Frameworks/libPrlXmlModel.1.dylib" 2>/dev/null
     # libMonitor (Parallels' hypervisor backend) also refuses a CPU whose CPUID vendor is not GenuineIntel. The shim finds that
     # branch by its bytes and patches it in memory when the library loads (shim/rhv_patch.c), so the library stays Parallels' own.
-    echo "prepared: $FARM"
+    if [ -n "${PATCHONLY:-}" ]; then echo native > "$OWNER_HOME/.ryzenhv/prl/MODE"; else echo shim > "$OWNER_HOME/.ryzenhv/prl/MODE"; fi
+    echo "prepared: $FARM ($(cat "$OWNER_HOME/.ryzenhv/prl/MODE") mode)"
     ;;
 install)
     [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 1; }
@@ -131,7 +140,7 @@ fix-vms)
     done
     ;;
 status)
-    if is_wrapper; then echo "wrapper installed (private copy: $([ -x "$FARM_BIN" ] && echo present || echo missing))"
+    if is_wrapper; then echo "wrapper installed (private copy: $([ -x "$FARM_BIN" ] && echo present || echo missing), mode: $(cat "$OWNER_HOME/.ryzenhv/prl/MODE" 2>/dev/null || echo unknown))"
     else echo "original prl_vm_app in place"; fi
     ;;
 *)
