@@ -131,6 +131,11 @@ const uint64_t kCaps[17] = {
  * callbacks must stay registered: unregistering is refused. */
 volatile SInt32 gLiveVms = 0;
 
+/* The TPR shadow (VMX control bit 21) is offered to every VM except HyperKit's: it lets Windows change its CR8 without a VM exit, which is most of the exits of
+ * a Windows boot (Parallels boots in about 19 s instead of 90, VirtualBox's Windows Setup runs at all). On by default since 0.7.3; the boot-arg
+ * rhv_tpr_shadow=0 or `rhv-info hv tpr 0` turns it off for the VMs created from then on. */
+volatile int gTprShadow = 1;
+
 volatile int *gSupportPtr = nullptr;                 /* the kernel's hv_support_available once located and written */
 int gSupportSaved = 0;
 bool gSupportSet = false;
@@ -152,7 +157,9 @@ struct HvVcpu {
     bool     cpuidPending;     /* the last exit was a CPUID: its answer is cleaned on the way back in (HyperKit only) */
     uint32_t cpuidLeaf;
     uint32_t cpuidSub;
-    uint64_t tprPage;          /* the TPR word of the page as this driver last left it (Parallels: the client's write is applied when it differs) */
+    uint64_t tprPage;          /* the TPR word of the page as this driver last left it (every client but HyperKit: the client's write is applied when it differs) */
+    uint64_t lastCtl[3];       /* the last pin-based, processor-based and secondary controls this client wrote, for the log */
+    bool     tprLogged;
     uint8_t  managedIdx[256];  /* position in the list -> MSR cache index, 0 = a hole */
     uint64_t applied[144];     /* the last value handed to the core for each MSR cache index */
     uint8_t  appliedKnown[144];
@@ -169,6 +176,7 @@ struct HvVm {
     bool     tscValid;
     bool     hyperkit;                         /* the creating process is Docker's HyperKit: its CPUID answers get the AMD-only features removed */
     bool     parallels;                        /* the creating process is Parallels' VM process: its LAPIC page (GPA 0xFEE00000) is not mapped */
+    uint64_t caps[17];                         /* the VMX capability words this VM's client was shown (HV_VMX_CAP_*), also what thread trap 12 answers from */
     HvVcpu *vcpu[kMaxVcpus];
     uint32_t nVcpus;
 };
@@ -271,8 +279,17 @@ HvVm *vmCreate(uint64_t *info)
     info[0x10 / 8] = fpStride;
     info[0x18 / 8] = roOffArr;
     info[0x20 / 8] = 0x1000;
+    uint64_t caps[17];
     for (unsigned c = 0; c < 17; c++)
-        info[(0x28 + 8 * c) / 8] = kCaps[c];
+        caps[c] = kCaps[c];
+    if (gTprShadow && !vm->hyperkit) {
+        caps[1] |= 1ull << (32 + 21);                /* PROCBASED and TRUE_PROCBASED: allowed-1 for "use TPR shadow" (the framework does not strip it) */
+        caps[7] |= 1ull << (32 + 21);
+    }
+    for (unsigned c = 0; c < 17; c++) {
+        info[(0x28 + 8 * c) / 8] = caps[c];
+        vm->caps[c] = caps[c];
+    }
     info[0x100 / 8] = vm->map[0]->getAddress();
     info[0x108 / 8] = vm->map[1]->getAddress();
     info[0x110 / 8] = vm->map[2]->getAddress();
@@ -325,8 +342,14 @@ kern_return_t tVmDestroy(void *target, uint64_t arg)
     IOLockUnlock(vm->lock);
     if (n)
         return kHvBusy;
+    const bool logIt = !vm->hyperkit;
     hv_set_task_target(nullptr);
     vmFree(vm);
+    if (logIt) {                                   /* the entry is in the trap log; this shows that the teardown came back (a hung exit has no such line) */
+        static volatile SInt32 doneLogged;
+        if (OSIncrementAtomic(&doneLogged) < 40)
+            RHV_INFO("hv front end: vm_destroy done (pid %d)", proc_selfpid());
+    }
     return kHvOk;
 }
 
@@ -409,6 +432,8 @@ kern_return_t tVcpuDestroy(void *target, uint64_t arg)
     if (!v)
         return kHvNoDev;
     HvVm *vm = v->vm;
+    const bool logIt = !vm->hyperkit;
+    const unsigned id = v->id;
     hv_set_thread_target(nullptr);
     IOLockLock(vm->lock);
     vm->vcpu[v->id] = nullptr;
@@ -416,6 +441,11 @@ kern_return_t tVcpuDestroy(void *target, uint64_t arg)
     IOLockUnlock(vm->lock);
     v->cpu->release();
     IOFree(v, sizeof(HvVcpu));
+    if (logIt) {
+        static volatile SInt32 doneLogged;
+        if (OSIncrementAtomic(&doneLogged) < 60)
+            RHV_INFO("hv front end: vcpu%u destroy done (pid %d)", id, proc_selfpid());
+    }
     return kHvOk;
 }
 
@@ -501,6 +531,24 @@ kern_return_t tCapWrite(void *target, uint64_t slot)
     if (slot >= kCacheSlots)
         return kHvBadArg;
     uint64_t lo = 0, hi = ~0ull, valid;
+    if (!v->vm->hyperkit) {
+        /* The control words of VMX have limits: the bits that must be 1 (allowed 0-settings, the low half of the capability word) and the bits that may be 1
+         * (allowed 1-settings, the high half), the same numbers hv_vmx_read_capability gives. VirtualBox's log shows it takes the two arrays as
+         * allowed_0 and allowed_1. Everything else (guest state, 64-bit fields) can be written freely. HyperKit keeps the answer it always got. */
+        int ci = -1;
+        switch (rhv::hv::kSlotField[slot]) {
+        case 0x4000: ci = 0; break;      /* pin-based */
+        case 0x4002: ci = 1; break;      /* processor-based */
+        case 0x401e: ci = 2; break;      /* secondary processor-based */
+        case 0x4012: ci = 3; break;      /* VM entry */
+        case 0x400c: ci = 4; break;      /* VM exit */
+        default: break;
+        }
+        if (ci >= 0) {
+            lo = v->vm->caps[ci] & 0xFFFFFFFFull;
+            hi = v->vm->caps[ci] >> 32;
+        }
+    }
     __builtin_memcpy(v->ro + kRoCapMin + slot * 8, &lo, 8);
     __builtin_memcpy(v->ro + kRoCapMax + slot * 8, &hi, 8);
     __builtin_memcpy(&valid, v->ro + kRoCapValid + (slot >> 6) * 8, 8);
@@ -742,6 +790,18 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
         uint32_t field = rhv::hv::kSlotField[slot];
         /* A field the SVM core does not model is skipped, not fatal: the framework accepts any write to a slot. */
         if (field) {
+            if (!v->vm->hyperkit && (field == 0x4000 || field == 0x4002 || field == 0x401e)) {      /* which controls does this client switch on? */
+                const unsigned which = field == 0x4000 ? 0 : field == 0x4002 ? 1 : 2;
+                const uint64_t val = *slotWord(v, slot);
+                static volatile SInt32 ctlLogged;
+                if (v->lastCtl[which] != val && OSIncrementAtomic(&ctlLogged) < 80) {
+                    char pn[32] = {0};
+                    proc_selfname(pn, sizeof(pn));
+                    RHV_INFO("hv front end: %s vcpu%u writes control %#x = %#llx (was %#llx)", pn, v->id, field, (unsigned long long)val,
+                             (unsigned long long)v->lastCtl[which]);
+                }
+                v->lastCtl[which] = val;
+            }
             if (field == 0x4016 && v->vm->parallels && (*slotWord(v, slot) >> 31)) {        /* the monitor injects an event: what and at which TPR */
                 static volatile SInt32 injected;
                 SInt32 ni = OSIncrementAtomic(&injected) + 1;
@@ -825,7 +885,12 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
      * to inject an NMI and clears the control when the exit arrives). Exit reason 8, qualification 0, no guest instruction runs. */
     {
         uint64_t procCtls = 0;
-        if (cpu->vmcsRead(0x4002, &procCtls) == kIOReturnSuccess && (procCtls & (1u << 22))) {
+        const bool haveCtls = cpu->vmcsRead(0x4002, &procCtls) == kIOReturnSuccess;
+        if (haveCtls && !v->tprLogged && !v->vm->hyperkit && (procCtls & (1u << 21)) && !(procCtls & (1u << 19))) {
+            v->tprLogged = true;
+            RHV_INFO("hv front end: vcpu%u of this client uses the TPR shadow (processor controls %#llx)", v->id, (unsigned long long)procCtls);
+        }
+        if (haveCtls && (procCtls & (1u << 22))) {
             const unsigned slotReason = rhv::hv::kFieldSlot[0x4402 >> 1], slotQual = rhv::hv::kFieldSlot[0x6400 >> 1];
             if (slotReason && slotReason < kCacheSlots) {
                 *slotWord(v, slotReason) = 8;
@@ -845,9 +910,10 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
     v->in.flags = RHV_RUN_REGS;
     v->in.nWrites = 0;
     v->in.regs = regs;
-    if (v->vm->parallels) {
-        /* HV_X86_TPR is the 8-bit APIC TPR (class in bits 7:4); the core's V_TPR is the 4-bit class. Parallels' monitor decides from it whether it may
-         * inject an interrupt and answers the guest's CR8 reads from it, so a write has to reach the core and read back (the shim's read<<4, write>>4). */
+    if (!v->vm->hyperkit) {
+        /* HV_X86_TPR is the 8-bit APIC TPR (class in bits 7:4); the core's V_TPR is the 4-bit class. Parallels' monitor (and VirtualBox's NEM) decide from it
+         * whether they may inject an interrupt and answer the guest's CR8 reads from it, so a write has to reach the core and read back (the shim's
+         * read<<4, write>>4). HyperKit never needed it and keeps the raw value. */
         const uint64_t tpr = *gprWord(v, R_TPR);
         if (tpr != v->tprPage) {
             cpu->vmcsWrite(0xF004, (tpr >> 4) & 0xF);
@@ -937,7 +1003,7 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
         if (enc == 0xF000) {
             *gprWord(v, R_CR2) = val;                  /* CR2 and TPR are registers in the page, not VMCS slots */
         } else if (enc == 0xF004) {
-            if (v->vm->parallels) {
+            if (!v->vm->hyperkit) {
                 *gprWord(v, R_TPR) = (val & 0xF) << 4;
                 v->tprPage = (val & 0xF) << 4;
             } else {
@@ -1058,6 +1124,14 @@ kern_return_t tVmProtect(void *target, uint64_t arg)
     return hvFromIo(static_cast<HvVm *>(target)->shared->protect(it.gpa, it.size, (uint32_t)it.flags));
 }
 
+/* hv_vmx_vcpu_set_apic_address: the client tells where its virtual-APIC page is when it uses the TPR shadow. The core keeps the TPR in V_TPR and never
+ * reads that page, so there is nothing to remember (the shim did the same); the argument block is not read, so a layout we do not know cannot hurt. */
+kern_return_t tSetApicAddress(void *target, uint64_t arg)
+{
+    note(HV_THREAD_TRAP, 9, arg);
+    return target ? kHvOk : kHvNoDev;
+}
+
 template <unsigned Type, unsigned Index>
 kern_return_t stub(void *target, uint64_t arg)
 {
@@ -1074,7 +1148,7 @@ const hv_trap_t kTaskTable[kTraps] = {tVmCreate, tVmDestroy, S(0, 2), S(0, 3), t
                                       S(0, 10), S(0, 11), tVcpuCreate, tVcpuInterrupt, S(0, 14), S(0, 15)};
 /* Thread traps: 0 run, 1 run_until (the deadline is not honoured yet), 2 invalidate_tlb, 3/4 managed MSRs on/off, 10 set_msr_access, 5 vcpu_destroy, 7 read slot, 11 sync special regs, 12 capability of a writable slot are real. */
 const hv_trap_t kThreadTable[kTraps] = {tVcpuRun, tVcpuRun, tInvalidateTlb, tEnableManaged, tDisableManaged, tVcpuDestroy, S(1, 6), tReadSlot, S(1, 8),
-                                        S(1, 9), tSetMsrAccess, tSyncSpecial, tCapWrite, S(1, 13), S(1, 14), S(1, 15)};
+                                        tSetApicAddress, tSetMsrAccess, tSyncSpecial, tCapWrite, S(1, 13), S(1, 14), S(1, 15)};
 #undef S
 
 } // namespace
@@ -1084,6 +1158,15 @@ namespace hv {
 
 bool registered() { return gRegistered; }
 uint32_t mode() { return gRegistered ? gMode : 0; }
+
+bool setTprShadow(bool on)
+{
+    gTprShadow = on ? 1 : 0;
+    RHV_SYNC("hv front end: TPR shadow is %s for the VMs created from now on (not HyperKit's)", on ? "offered" : "not offered");
+    return true;
+}
+
+bool tprShadow() { return gTprShadow != 0; }
 bool sysctlTaken() { return gSupportSet; }
 
 static bool registerTraps()
@@ -1242,6 +1325,9 @@ void start(com_overlorddev_RyzenHV *service)
 {
     gSvc = service;
     uint32_t v = 0;
+    uint32_t tprArg = 1;
+    if (PE_parse_boot_argn("rhv_tpr_shadow", &tprArg, sizeof(tprArg)))
+        gTprShadow = tprArg ? 1 : 0;
     if (!PE_parse_boot_argn("rhv_hv", &v, sizeof(v)) || v == 0)
         return;
     if (!setMode(v))

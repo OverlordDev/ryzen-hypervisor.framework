@@ -13,6 +13,7 @@ It is **opt-in** and experimental: add `rhv_hv=1` to the boot-args (`./rhv kext 
   30 containers at once, builds, pulls, 16 busy vCPUs, disk and memory tests passed (the author's Ryzen 7 5800H, 16 threads).
   `./rhv docker-desktop` only sets `UseVirtualizationFramework=false` in Docker's settings and removes the shim wrappers if
   an earlier version installed them.
+- **VirtualBox 7.2.22** (0.7.3, experimental): see "VirtualBox 7.x" below.
 - The public Hypervisor.framework API tests (`tools/hvf-smoke`): VM and vCPU lifecycle, memory mapping, register and
   VMCS access, MSRs, FP state, interrupts from another thread.
 - QEMU with `-accel hvf` boots Linux without the shim, if `kern.hv_support` is switched to 1 (see below).
@@ -52,10 +53,30 @@ calls the monitor's own port handler with 0, on the first guest access to the ke
 a saved state, once a second while the monitor's flag is still clear. Tested on Windows 10: keys sent with `prlctl send-key-event` reach the guest after a cold boot
 and after a resume. The offsets belong to Parallels 26.5.0 (57613); another build is left alone (the function prologue is checked). `RYZENHV_NO_KBD_ARM=1` switches it off.
 
-Limits: only Windows 10 was tried. TPR shadow is not offered, so every `CR8` access is an exit and a boot is
-about two to three times slower than with the shim (about 90 s to the desktop on the author's machine). Suspending and resuming the VM works (tested a few times);
-sleep/wake of the Mac, 3D acceleration, snapshots and long runs are untested. `kern.hv_support` is 0 after every reboot: `./rhv autostart install` (0.7.2, a launchd service that turns it on once the kext is up; also a button in the app) does it for you,
-otherwise run `rhv-info hv sysctl 1` before starting a VM. The service has been installed and run on the author's machine; a real boot with it had not been observed at the time of writing.
+Limits: only Windows 10 was tried. Since 0.7.3 the kext offers the TPR shadow (see below), which cut the Windows boot from about 90 s to about 20 s on the author's
+machine (the guest's tools answer after ~19 s; before, every `CR8` access of Windows was an exit). Suspending and resuming the VM works **when the Parallels Desktop app is running**;
+with only its background service (`prl_client_app --start-services`, what runs after a restart until you open the app) `prlctl suspend` hung twice in the author's tests (the
+state files were written, the VM stayed "suspending" and its process could not exit until a reboot); keep the app open, or shut the VM down instead. Sleep/wake of the Mac, 3D
+acceleration, snapshots and long runs are untested. `kern.hv_support` is 0 after every reboot: `./rhv autostart install` (0.7.2, a launchd service that turns it on once
+the kext is up; also a button in the app) does it for you (seen working on two real boots), otherwise run `rhv-info hv sysctl 1` before starting a VM.
+
+## The TPR shadow (0.7.3)
+
+Windows changes its interrupt priority through `CR8` all the time. Without the VMX "use TPR shadow" control every such access is a VM exit, and a Windows boot is mostly those
+exits (~70k to ~200k a second); VirtualBox's Windows Setup did not get past its first screen in minutes. The kext now offers the control (VMX capability bit 21 of the
+primary processor controls, which Apple's framework passes through) to every client except HyperKit's, keeps the guest's CR8 in the core's `V_TPR`, and lets the
+client read and write it as `HV_X86_TPR`, the 8-bit APIC task priority (`>>4` into `V_TPR`, `<<4` out). `hv_vmx_vcpu_set_apic_address` answers success (the core never
+reads the virtual-APIC page). Switch it off with the boot-arg `rhv_tpr_shadow=0`, or for the VMs created from then on with `rhv-info hv tpr 0` (`rhv-info hv` shows
+whether it is on). For VMX control words the kext also tells a client the real limits (the bits that must be 1 and the ones that may be) through thread trap 12, as
+`hv_vmx_read_capability` does; HyperKit keeps its old answer.
+
+## VirtualBox 7.x (0.7.3, experimental)
+
+VirtualBox 7 has no kernel driver on macOS: it runs its VMs through Hypervisor.framework (its "NEM" back end), so it uses the native front end like Docker and Parallels. Tested
+with 7.2.22: an EFI VM with 2 vCPUs boots the Windows 10 installer from an ISO and reaches the disk page in about a minute. It needs `rhv_hv=1`, `kern.hv_support` = 1 and the
+TPR shadow (on by default). Its log says `NEM: Failed to create ASID` and `Turtle execution mode`: `hv_vm_space_*` are not implemented yet, so it runs below its full speed
+and makes about six kernel calls per exit. No full installation to a disk has been run yet. **VirtualBox 6.x is a different story**: it loads its own driver, which wants to switch AMD-V
+on itself and stops with `VERR_SVM_IN_USE` while RyzenHV keeps `EFER.SVME` on every core (issue 2). 7.x has the override `VBOX_HWVIRTEX_IGNORE_SVM_IN_USE`; it has not been tried on 6.x.
 
 ## kern.hv_support
 
@@ -72,7 +93,7 @@ path has not been tested**, use the command.
   stale vCPU target after `exec()` with a live VM, no entitlement check (any local process can create a VM; with `rhv_allow_users=1`
   every user can). Do not use it on a machine where untrusted local code runs.
 - The kext patches the memory of the process that calls it. That is the whole point and also the reason to keep it opt-in.
-- `hv_vcpu_run_until`'s deadline is ignored (Docker and Parallels use `hv_vcpu_run`), TPR shadow and the in-kernel APIC are not offered; sleep/wake and long runs are untested.
+- `hv_vcpu_run_until`'s deadline is ignored (Docker, Parallels and VirtualBox use `hv_vcpu_run` or the Mac-side loop), the in-kernel APIC and `hv_vm_space_*` are not offered; sleep/wake and long runs are untested.
 - Keep a working EFI without the kext. A kernel extension that panics needs a way back.
 
 ## Going back

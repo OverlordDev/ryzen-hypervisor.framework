@@ -53,6 +53,16 @@ static uint64_t rvmcs(hv_vcpuid_t v, uint32_t f)
     return x;
 }
 
+/* hv_vcpu_run returns on every VM exit, and an external interrupt or a kick of the vCPU (hv_vm_map and hv_vm_unmap kick them) can arrive at any time, as
+ * stage 4 relies on. Runs again past those exits (a bounded number of times), so the checks that follow see the exit they are about. */
+static hv_return_t run_skip_irq(hv_vcpuid_t v)
+{
+    hv_return_t r = hv_vcpu_run(v);
+    for (int i = 0; i < 1000 && r == HV_SUCCESS && (rvmcs(v, VMCS_RO_EXIT_REASON) & 0xFFFF) == VMX_REASON_IRQ; i++)
+        r = hv_vcpu_run(v);
+    return r;
+}
+
 static void wvmcs(hv_vcpuid_t v, uint32_t f, uint64_t x)
 {
     hv_return_t r = hv_vmx_vcpu_write_vmcs(v, f, x);
@@ -177,7 +187,8 @@ int main(void)
     wvmcs(v, VMCS_CTRL_VMENTRY_CONTROLS, cap2ctrl(cap_entry, 0));
     wvmcs(v, VMCS_CTRL_EXC_BITMAP, 0);
     EXPECT((rvmcs(v, VMCS_CTRL_CPU_BASED) & CPU_BASED_HLT) != 0, "HLT exiting is on in the controls the capabilities allowed");
-    EXPECT((rvmcs(v, VMCS_CTRL_CPU_BASED) & CPU_BASED_TPR_SHADOW) == 0, "TPR shadow was not offered, so it is not set");
+    /* The TPR shadow is offered by default since 0.7.3 (`rhv-info hv tpr 0` or rhv_tpr_shadow=0 turns it off); when offered the helper above may set it, which is fine. */
+    EXPECT(((cap_proc >> 32) & CPU_BASED_TPR_SHADOW) || (rvmcs(v, VMCS_CTRL_CPU_BASED) & CPU_BASED_TPR_SHADOW) == 0, "TPR shadow: if it was not offered, it is not set");
 
     /* MSRs the guest kernel uses a lot, accessed natively. */
     static const uint32_t native[] = { 0xC0000081, 0xC0000082, 0xC0000083, 0xC0000084, 0xC0000100, 0xC0000101, 0xC0000102, 0x174, 0x175, 0x176 };
@@ -258,14 +269,15 @@ int main(void)
 
     printf("stage 3: EPT violation, hv_vm_map from the handler\n");
     setup_real_mode(v, 0x1200);
-    r = hv_vcpu_run(v);
+    r = run_skip_irq(v);
     EXPECT(r == HV_SUCCESS && (rvmcs(v, VMCS_RO_EXIT_REASON) & 0xFFFF) == VMX_REASON_EPT_VIOLATION, "the store to an unmapped page is an EPT violation");
     EXPECT(rvmcs(v, VMCS_GUEST_PHYSICAL_ADDRESS) == 0x101010, "guest-physical address 0x%" PRIx64, rvmcs(v, VMCS_GUEST_PHYSICAL_ADDRESS));
     uint8_t *extra = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     memset(extra, 0, PAGE);
     EXPECT(hv_vm_map(extra, 0x101000, PAGE, HV_MEMORY_READ | HV_MEMORY_WRITE) == HV_SUCCESS, "page mapped by the handler");
-    r = hv_vcpu_run(v);
-    EXPECT(r == HV_SUCCESS && (rvmcs(v, VMCS_RO_EXIT_REASON) & 0xFFFF) == VMX_REASON_HLT, "the guest continued to HLT");
+    r = run_skip_irq(v);
+    EXPECT(r == HV_SUCCESS && (rvmcs(v, VMCS_RO_EXIT_REASON) & 0xFFFF) == VMX_REASON_HLT, "the guest continued to HLT (run returned 0x%x, exit reason %" PRIu64 ", rip 0x%" PRIx64 ")",
+           (unsigned)r, rvmcs(v, VMCS_RO_EXIT_REASON) & 0xFFFF, rreg(v, HV_X86_RIP));
     EXPECT(extra[0x10] == 0x42, "the store landed in our page (0x%02x)", extra[0x10]);
     EXPECT(hv_vm_protect(0x101000, PAGE, HV_MEMORY_READ) == HV_SUCCESS, "hv_vm_protect");
     EXPECT(hv_vm_unmap(0x101000, PAGE) == HV_SUCCESS, "hv_vm_unmap");

@@ -25,6 +25,8 @@ void stop();
 /* Run-time control, used by the user client (rhv-info hv ...). Mode 0 unregisters, 1 and 2 register (or just change the mode). */
 bool setMode(uint32_t mode);
 bool setSysctl(bool on);
+bool setTprShadow(bool on);      /* offer the TPR shadow to VMs created afterwards (not HyperKit's) */
+bool tprShadow();
 uint32_t mode();
 bool registered();
 bool sysctlTaken();

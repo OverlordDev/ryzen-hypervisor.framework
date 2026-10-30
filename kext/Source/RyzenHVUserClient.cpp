@@ -251,11 +251,12 @@ IOReturn com_overlorddev_RyzenHVUserClient::sHvControl(OSObject *target, void *,
     if (cmd != kRHVHvGet) {
         RHV_ADMIN();
         bool ok = cmd == kRHVHvMode ? rhv::hv::setMode(value)
-                : cmd == kRHVHvSysctl ? rhv::hv::setSysctl(value != 0) : false;
+                : cmd == kRHVHvSysctl ? rhv::hv::setSysctl(value != 0)
+                : cmd == kRHVHvTpr ? rhv::hv::setTprShadow(value != 0) : false;
         if (!ok)
-            return cmd > kRHVHvSysctl ? kIOReturnBadArgument : (cmd == kRHVHvSysctl ? kIOReturnUnsupported : kIOReturnNotReady);
+            return cmd > kRHVHvTpr ? kIOReturnBadArgument : (cmd == kRHVHvSysctl ? kIOReturnUnsupported : kIOReturnNotReady);
     }
-    args->scalarOutput[0] = (rhv::hv::registered() ? kRHVHvStateRegistered : 0) | (rhv::hv::sysctlTaken() ? kRHVHvStateSysctl : 0);
+    args->scalarOutput[0] = (rhv::hv::registered() ? kRHVHvStateRegistered : 0) | (rhv::hv::sysctlTaken() ? kRHVHvStateSysctl : 0) | (rhv::hv::tprShadow() ? kRHVHvStateTpr : 0);
     args->scalarOutput[1] = rhv::hv::mode();
     return kIOReturnSuccess;
 }

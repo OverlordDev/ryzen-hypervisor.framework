@@ -129,7 +129,9 @@ static void arm_keyboard(unsigned vcpu, int periodic)
             plog(msg);
         }
     }
-    if (*armed || base[0x8686a0])
+    /* Both flags: the first is part of the monitor's saved state, so a restored VM has it set while this process's second one (a global of the library) is
+     * still clear, and the keys stay dropped until the handler has run in this process. */
+    if (*armed && base[0x8686a0])
         return;
     static volatile int busy;                    /* several vCPU threads may get here at once: one calls the handler */
     if (__sync_lock_test_and_set(&busy, 1))

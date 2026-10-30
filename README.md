@@ -16,6 +16,7 @@ that provides the same API.
 > **New in 0.7.1 (experimental): Parallels in native mode** (`./rhv parallels native`): Windows 10 boots on Apple's own Hypervisor.framework with 1 and
 > 4 vCPUs (no keyboard yet in 0.7.1). Also: the kext checks `EFER.SVME` on the CPU before every `VMRUN` (a panic report on macOS 26,
 > issue 1), and `./rhv doctor` says when it is not run from the unpacked archive. See `docs/NATIVE.md`.
+> **New in 0.7.3: native mode offers the TPR shadow** (Parallels boots Windows 10 to the desktop in ~20 s, VirtualBox 7.x runs through the kext, see `docs/NATIVE.md`).
 > **New in 0.7.2: the keyboard works in a native Parallels VM** (the kext is unchanged), **`./rhv autostart install`** turns `kern.hv_support` on at every
 > boot (a launchd service), and the RyzenHV app has an "Automatic start" page and a native-mode button for Parallels.
 > **How to install Parallels with this kext: `docs/PARALLELS.md`.** It works on the exact Parallels build 26.5.0 (57613).
@@ -67,7 +68,7 @@ sudo rhv-info level 0-5   log level on the fly
 sudo rhv-info selftest    check EFER/VM_HSAVE_PA on every core
 ```
 
-Boot-args: `-rhv_off`, `rhv_enable_svm`, `rhv_selftest`, `rhv_loglevel`, `rhv_iolog`, `rhv_stage`, `rhv_slow`, and for native mode `rhv_hv`, `rhv_hv_sysctl`, `rhv_clientpatch`. Details in `docs/DEBUGGING.md`.
+Boot-args: `-rhv_off`, `rhv_enable_svm`, `rhv_selftest`, `rhv_loglevel`, `rhv_iolog`, `rhv_stage`, `rhv_slow`, and for native mode `rhv_hv`, `rhv_hv_sysctl`, `rhv_clientpatch`, `rhv_tpr_shadow`. Details in `docs/DEBUGGING.md`.
 
 If step 5 says `SVM: supported`, `BIOS disable: no`, `NPT: [x]`, phase 0 is done
 and you can write a VMCB and `VMRUN` (see `docs/ROADMAP.md`).

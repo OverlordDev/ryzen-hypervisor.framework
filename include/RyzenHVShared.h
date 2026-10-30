@@ -134,10 +134,11 @@ enum { kRHVMemGuestRam = 0 };
 enum {
     kRHVHvGet     = 0,   /* value ignored */
     kRHVHvMode    = 1,   /* value 0: unregister the traps; 1: register, answer HV_UNSUPPORTED; 2: register, answer success */
-    kRHVHvSysctl  = 2    /* value 0/1: kern.hv_support shows 1 (needs the traps registered) */
+    kRHVHvSysctl  = 2,   /* value 0/1: kern.hv_support shows 1 (needs the traps registered) */
+    kRHVHvTpr     = 3    /* value 0/1: offer the TPR shadow to the VMs created from now on, except HyperKit's (default 1, boot-arg rhv_tpr_shadow) */
 };
 /* state bits returned in scalarOutput[0] */
-enum { kRHVHvStateRegistered = 1u << 0, kRHVHvStateSysctl = 1u << 1 };
+enum { kRHVHvStateRegistered = 1u << 0, kRHVHvStateSysctl = 1u << 1, kRHVHvStateTpr = 1u << 2 };
 
 #define RHV_GUEST_RAM_SIZE (1u << 20)   /* built-in RAM: 1 MiB at guest physical 0 */
 

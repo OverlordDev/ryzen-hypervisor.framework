@@ -194,8 +194,11 @@ static int cmd_hv(io_connect_t conn, int argc, char **argv)
     } else if (argc > 2 && !strcmp(argv[2], "sysctl") && argc > 3) {
         in[0] = kRHVHvSysctl;
         in[1] = strtoul(argv[3], NULL, 10);
+    } else if (argc > 2 && !strcmp(argv[2], "tpr") && argc > 3) {
+        in[0] = kRHVHvTpr;
+        in[1] = strtoul(argv[3], NULL, 10);
     } else if (argc > 2 && strcmp(argv[2], "status")) {
-        fprintf(stderr, "usage: rhv-info hv [status | mode 0|1|2 | sysctl 0|1]\n");
+        fprintf(stderr, "usage: rhv-info hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1]\n");
         return 2;
     }
     kern_return_t kr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, in, 2, out, &(uint32_t){ 2 });
@@ -203,8 +206,9 @@ static int cmd_hv(io_connect_t conn, int argc, char **argv)
         fprintf(stderr, "HvControl failed: 0x%x%s\n", kr, getuid() ? " (run with sudo)" : "");
         return 1;
     }
-    printf("hv front end: %s, mode %llu, kern.hv_support %s\n", (out[0] & kRHVHvStateRegistered) ? "registered" : "not registered",
-           (unsigned long long)out[1], (out[0] & kRHVHvStateSysctl) ? "replaced (shows 1)" : "untouched");
+    printf("hv front end: %s, mode %llu, kern.hv_support %s, TPR shadow %s\n", (out[0] & kRHVHvStateRegistered) ? "registered" : "not registered",
+           (unsigned long long)out[1], (out[0] & kRHVHvStateSysctl) ? "replaced (shows 1)" : "untouched",
+           (out[0] & kRHVHvStateTpr) ? "offered" : "not offered");
     return 0;
 }
 
@@ -233,7 +237,7 @@ int main(int argc, char **argv)
     const char *cmd = argc > 1 ? argv[1] : "info";
 
     if (!strcmp(cmd, "-h") || !strcmp(cmd, "--help") || !strcmp(cmd, "help")) {
-        puts("usage: rhv-info [info | log [-f] | stats | level <0-5> | selftest | hv [status | mode 0|1|2 | sysctl 0|1]]");
+        puts("usage: rhv-info [info | log [-f] | stats | level <0-5> | selftest | hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1]]");
         return 0;
     }
 

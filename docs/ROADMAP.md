@@ -79,7 +79,7 @@ patches the CPU-vendor check. What is missing, in the order it is worth doing:
    (the first-access trigger fires 2 s after the VM starts; for a restored VM a once-a-second check does it). Still to verify: typing from the VM window, other layouts.
 2. [~] `kern.hv_support` at every boot without a command (installed and run on the author's machine; a real boot with it is not yet observed): `./rhv autostart install` (launchd daemon, `scripts/hv-sysctl-daemon.sh`), a button in the app.
    Still to do there: remove a stale `hyperkit.pid` of Docker when the daemon runs (a leftover from the previous boot stops HyperKit).
-3. [ ] **TPR shadow in native mode** (speed: about half of the exits of a Windows boot are `CR8`). The framework does not strip the bit from the
+3. [x] **TPR shadow in native mode, on by default since 0.7.3** (speed: about half of the exits of a Windows boot are `CR8`). The framework does not strip the bit from the
    primary controls word (`fixup_capability` only touches the entry/exit/secondary words), so the kext can offer it per VM for Parallels (caps are filled in
    `vmCreate`, which knows `vm->parallels`) and make thread trap 9 (`hv_vmx_vcpu_set_apic_address`) succeed. The core already has the TPR shadow
    (exit 43). Needs a kext build and a reboot. Done when: a Windows 10 boot reaches the desktop in about the time the shim needs (~60 s) with no `CR8` exits.
@@ -91,6 +91,19 @@ patches the CPU-vendor check. What is missing, in the order it is worth doing:
    check have to be proven first; (b) a Lilu plugin (UserPatcher) with the same patterns; (c) leave the wrapper. This is a design decision, not just work.
 8. [ ] Release 0.7.2: the boot service and the native Parallels button in the app (the app zip is built by `app/build-app.sh`), `rhv` menu entries, docs.
 9. [ ] Issue 1 (Tahoe): wait for the reporter's `selftest` and `rhv-info log`; if SVM turns out to be cleared by the macOS 26 kernel, find out where.
+10. [~] **VirtualBox 7.x** (0.7.3 offers the TPR shadow by default, so the first point below is done) (no kernel driver on macOS, runs through Hypervisor.framework, so through the native front end): 7.2.22 starts, its BIOS/EFI and Windows
+    Setup run, no panic. Needs `rhv-info hv tpr 1` (the TPR shadow is off by default): without it the guest does ~70k `CR8` exits a second per vCPU and Setup
+    stays on its first screen for minutes; with it Setup reaches the disk page in about a minute and the `CR8` exits are gone from the sample. To do: decide the
+    default (a per-client policy or a boot-service call), `hv_vm_space_*` (VirtualBox says "Turtle execution mode"), fewer kernel calls per exit (about six now),
+    a run with a real disk. VirtualBox 6.1.x has its own driver that wants to switch AMD-V on itself and stops with `VERR_SVM_IN_USE` while RyzenHV holds SVME
+    (issue 2); 7.x has the override `VBOX_HWVIRTEX_IGNORE_SVM_IN_USE`, not tried on 6.1.
+11. [ ] **`prlctl suspend` of a native Parallels VM hung twice** (2026-10-30, 12:03 and 12:20, both on kext 4081E1B4 with only `prl_client_app --start-services`
+    running, not the Parallels Desktop app): the state files and `suspended.png` are written, the log ends at `Waiting the screenshot file to be written`, the VM
+    stays `suspending`, the process is in `U` and after `kill -9` a zombie (`?E`) with one thread in the kernel; the 8 GB stay pinned until a reboot. The spindump
+    of the whole system has no RyzenHV, NVIDIA or IOGPU image in any stack, so the cause is not known. Suspends that worked: 11:08 (window closed), three
+    `prlctl suspend` cycles around 11:20 and one at 11:31, all on kext C6CEE846 with the Parallels Desktop app open. Two things differ (kext version, app
+    open) and the test that separates them: open the app, cold-boot, `prlctl suspend` on 4081E1B4; if it hangs, repeat on C6CEE846 (the `.bak` on the EFI stick).
+    The kext now logs `vm_destroy done` and `vcpuN destroy done`, to see whether the teardown traps return. Until this is settled: shut the VM down, do not suspend it.
 
 ## Risks
 
