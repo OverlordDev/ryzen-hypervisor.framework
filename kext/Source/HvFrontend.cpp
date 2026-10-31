@@ -158,6 +158,7 @@ struct HvVcpu {
     bool     cpuidPending;     /* the last exit was a CPUID: its answer is cleaned on the way back in (HyperKit only) */
     uint32_t cpuidLeaf;
     uint32_t cpuidSub;
+    uint64_t cr2Page;          /* the CR2 word of the page as this driver last left it: a different value is the client's write (an injected #PF needs it) and is applied */
     uint64_t tprPage;          /* the TPR word of the page as this driver last left it (every client but HyperKit: the client's write is applied when it differs) */
     uint64_t lastCtl[3];       /* the last pin-based, processor-based and secondary controls this client wrote, for the log */
     bool     tprLogged;
@@ -184,6 +185,48 @@ struct HvVm {
 
 inline uint32_t roundPage(uint32_t v) { return (v + 0xfffu) & ~0xfffu; }
 
+/*
+ * Debugging of a stalled client (rhv-info hv debug N / flightdump / readguest). A switch at run time, off by default: when off, a run costs one load of gDbg.
+ * Bit 0 records the exit of every vCPU run into a ring of the last kFlightN exits. readGuest() needs a VM that is still alive: the last client that ran with the
+ * recording on is remembered in gDbgVm under gDbgLock, and vmFree takes it out under the same lock before it frees anything, so a reader never touches a VM that is going away.
+ */
+struct HvVm;
+struct Flight {
+    uint64_t seq;
+    uint32_t vcpu, reason;
+    uint64_t qual, rip, rsp, rflags, rax, rcx, rdx, cr0, cr3, cr4, efer, intr;
+    uint32_t csSel;
+    uint64_t cr2, gsBase, r9, kernGsBase;
+    uint32_t csAr, ssSel, ssAr;
+    uint8_t cpl;
+    uint8_t nw;                                   /* what the client wrote before this run (see dbgNoteWrite) */
+    uint64_t wid[6], wval[6];
+};
+/* The state of each vCPU at its last recorded exit: all registers, the controls, the TSC offset (what a stalled guest may be waiting for). */
+struct VcpuSnap {
+    uint64_t seq;                                 /* 0 = never recorded */
+    HvVm *vm;
+    uint64_t gpr[16];                             /* rax rcx rdx rbx rsp rbp rsi rdi r8..r15 */
+    uint64_t rip, rflags, cr0, cr3, cr4, efer;
+    uint64_t pin, proc, sec, tscOff, activity, intrState, entryIntr;
+    uint64_t gsBase, fsBase, kernGsBase, gsMsr, idtBase, excBitmap, cr2, trBase, star, lstar, sfmask, gdtBase;
+    uint32_t csSel, reason;
+    uint8_t  have;                                /* bit n: the VMCS read for field n of the list worked (pin, proc, sec, tsc offset, activity, interruptibility, entry event) */
+    uint8_t  have2;                               /* bit 0: KERNEL_GS_BASE read, 1: GS_BASE MSR read, 2: exception bitmap read */
+};
+constexpr unsigned kFlightN = 2048;               /* a power of two */
+volatile uint32_t gDbg = 0;
+Flight gFlight[kFlightN];
+VcpuSnap gSnap[64];                                /* by vCPU id (kMaxVcpus, defined further down, is 64) */
+volatile SInt32 gFlightPos = 0;                   /* the number of exits recorded so far */
+struct PendWrites { uint8_t n; uint64_t id[6], val[6]; };
+PendWrites gPend[64];                             /* per vCPU: what the client wrote before the run in progress, handed to the flight record after it */
+uint64_t gStuckPage[64];                          /* auto-freeze (debug bit 1): the page of the last exit's RIP per vCPU, and how many exits in a row stayed in it with interrupts off */
+uint32_t gStuckCount[64];
+volatile SInt32 gFrozen = 0;
+IOLock *gDbgLock = nullptr;
+HvVm *gDbgVm = nullptr;
+
 uint32_t xsaveBytes()
 {
     uint32_t a = 0xd, b, c = 0, d;
@@ -197,6 +240,15 @@ void vmFree(HvVm *vm)
 {
     if (!vm)
         return;
+    if (gDbgLock) {                                  /* a reader of the guest's memory is not inside while this runs */
+        IOLockLock(gDbgLock);
+        if (gDbgVm == vm)
+            gDbgVm = nullptr;
+        for (unsigned i = 0; i < 64; i++)
+            if (gSnap[i].vm == vm)
+                gSnap[i].vm = nullptr, gSnap[i].seq = 0;
+        IOLockUnlock(gDbgLock);
+    }
     if (vm->shared)
         vm->shared->release();                       /* unpins everything that is still mapped */
     for (unsigned i = 0; i < kMaxVcpus; i++) {
@@ -743,6 +795,131 @@ void parallelsCpuidFixup(HvVcpu *v)
     }
 }
 
+/* What the client changes before a run: segment registers and their bases/rights, RIP/RSP/RFLAGS and the MSRs that carry the GS state. Called only with the recording on. */
+inline void dbgNoteWrite(unsigned vcpu, uint64_t id, uint64_t val)
+{
+    if (vcpu >= 64)
+        return;
+    PendWrites &p = gPend[vcpu];
+    if (p.n < 6) {
+        p.id[p.n] = id;
+        p.val[p.n] = val;
+        p.n++;
+    }
+}
+
+inline bool dbgTrackedField(uint32_t f)
+{
+    return (f >= 0x0800 && f <= 0x0810) || (f >= 0x4814 && f <= 0x4822) || (f >= 0x6806 && f <= 0x6812) || (f >= 0x4016 && f <= 0x401a);   /* the last three: event injection */
+}
+
+/* What a vCPU run left in v->out, into the ring (only with the recording on). */
+void dbgRecord(HvVcpu *v)
+{
+    Flight f = {};
+    f.vcpu = v->id;
+    f.rip = v->out.regs.rip;
+    f.rsp = v->out.regs.rsp;
+    f.rflags = v->out.regs.rflags;
+    f.rax = v->out.regs.rax;
+    f.rcx = v->out.regs.rcx;
+    f.rdx = v->out.regs.rdx;
+    for (unsigned i = 0; i < RHV_RUN_NFIELDS; i++) {
+        const uint64_t x = v->out.fields[i];
+        switch (kRunFields[i]) {
+        case 0x4402: f.reason = (uint32_t)(x & 0xffff); break;
+        case 0x6400: f.qual = x; break;
+        case 0x6800: f.cr0 = x; break;
+        case 0x6802: f.cr3 = x; break;
+        case 0x6804: f.cr4 = x; break;
+        case 0x2806: f.efer = x; break;
+        case 0x4824: f.intr = x; break;
+        case 0x0802: f.csSel = (uint32_t)x; break;
+        case 0xF000: f.cr2 = x; break;
+        case 0x6810: f.gsBase = x; break;
+        case 0x4816: f.csAr = (uint32_t)x; break;
+        case 0x0804: f.ssSel = (uint32_t)x; break;
+        case 0x4818: f.ssAr = (uint32_t)x; break;
+        default: break;
+        }
+    }
+    f.r9 = v->out.regs.r9;
+    f.cpl = v->cpu->debugCpl();
+    if (v->id < 64) {
+        PendWrites &pw = gPend[v->id];
+        f.nw = pw.n;
+        for (unsigned i = 0; i < pw.n; i++) {
+            f.wid[i] = pw.id[i];
+            f.wval[i] = pw.val[i];
+        }
+        pw.n = 0;
+    }
+    {
+        uint64_t kg = 0;
+        if (v->cpu->msrOp(RHV_MSR_READ, 0xC0000102, 0, &kg) == kIOReturnSuccess)
+            f.kernGsBase = kg;
+    }
+    const SInt32 pos = OSIncrementAtomic(&gFlightPos);
+    f.seq = (uint32_t)pos + 1;
+    gFlight[(uint32_t)pos & (kFlightN - 1)] = f;
+
+    if (v->id < 64) {
+        VcpuSnap n = {};
+        const RHVRegs &o = v->out.regs;
+        n.seq = f.seq;
+        n.vm = v->vm;
+        const uint64_t g[16] = {o.rax, o.rcx, o.rdx, o.rbx, o.rsp, o.rbp, o.rsi, o.rdi, o.r8, o.r9, o.r10, o.r11, o.r12, o.r13, o.r14, o.r15};
+        for (unsigned i = 0; i < 16; i++)
+            n.gpr[i] = g[i];
+        n.rip = o.rip; n.rflags = o.rflags; n.cr0 = f.cr0; n.cr3 = f.cr3; n.cr4 = f.cr4; n.efer = f.efer; n.csSel = f.csSel; n.reason = f.reason;
+        /* in this vCPU's own thread, like the read of the processor controls in tVcpuRun */
+        static const uint32_t fields[7] = {0x4000, 0x4002, 0x401e, 0x2010, 0x4826, 0x4824, 0x4016};
+        uint64_t *dst[7] = {&n.pin, &n.proc, &n.sec, &n.tscOff, &n.activity, &n.intrState, &n.entryIntr};
+        for (unsigned i = 0; i < 7; i++) {
+            uint64_t x = 0;
+            if (v->cpu->vmcsRead(fields[i], &x) == kIOReturnSuccess) {
+                *dst[i] = x;
+                n.have |= 1u << i;
+            }
+        }
+        n.cr2 = f.cr2;
+        n.gsBase = f.gsBase;
+        for (unsigned i = 0; i < RHV_RUN_NFIELDS; i++) {
+            if (kRunFields[i] == 0x680e) n.fsBase = v->out.fields[i];
+            else if (kRunFields[i] == 0x6818) n.idtBase = v->out.fields[i];
+            else if (kRunFields[i] == 0x6814) n.trBase = v->out.fields[i];
+            else if (kRunFields[i] == 0x6816) n.gdtBase = v->out.fields[i];
+        }
+        uint64_t x = 0;
+        if (v->cpu->msrOp(RHV_MSR_READ, 0xC0000102, 0, &x) == kIOReturnSuccess) { n.kernGsBase = x; n.have2 |= 1; }
+        if (v->cpu->msrOp(RHV_MSR_READ, 0xC0000101, 0, &x) == kIOReturnSuccess) { n.gsMsr = x; n.have2 |= 2; }
+        if (v->cpu->vmcsRead(0x4004, &x) == kIOReturnSuccess) { n.excBitmap = x; n.have2 |= 4; }
+        if (v->cpu->msrOp(RHV_MSR_READ, 0xC0000081, 0, &x) == kIOReturnSuccess) { n.star = x; n.have2 |= 8; }
+        if (v->cpu->msrOp(RHV_MSR_READ, 0xC0000082, 0, &x) == kIOReturnSuccess) { n.lstar = x; n.have2 |= 16; }
+        if (v->cpu->msrOp(RHV_MSR_READ, 0xC0000084, 0, &x) == kIOReturnSuccess) { n.sfmask = x; n.have2 |= 32; }
+        gSnap[v->id] = n;
+
+        /* Debug bit 1: stop recording when the guest sits in one page of kernel code with interrupts off for 24 timeslice exits (reason 1) in a row, so that the ring still holds what led to it. */
+        if (gDbg & 2) {
+            const uint64_t page = f.rip >> 12;
+            if (f.reason == 1 && (f.rip >> 47) == 0x1ffff && !(f.rflags & 0x200) && page == gStuckPage[v->id])
+                gStuckCount[v->id]++;
+            else
+                gStuckCount[v->id] = 0;
+            gStuckPage[v->id] = page;
+            if (gStuckCount[v->id] >= 24 && OSCompareAndSwap(0, 1, &gFrozen)) {
+                gDbg &= ~1u;
+                RHV_INFO("flight: frozen, vcpu%u stuck in the page of rip %llx with interrupts off (use hv flightdump)", v->id, (unsigned long long)f.rip);
+            }
+        }
+    }
+    if (gDbgLock && gDbgVm != v->vm) {
+        IOLockLock(gDbgLock);
+        gDbgVm = v->vm;
+        IOLockUnlock(gDbgLock);
+    }
+}
+
 kern_return_t tVcpuRun(void *target, uint64_t arg)
 {
     note(HV_THREAD_TRAP, 0, arg);
@@ -785,6 +962,11 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
         regs.rip = *slotWord(v, kSlotRip);
     if (isDirty(kSlotRflags))
         regs.rflags = *slotWord(v, kSlotRflags);
+    if (gDbg & 1) {
+        if (isDirty(kSlotRip))    dbgNoteWrite(v->id, 0xF100, regs.rip);
+        if (isDirty(kSlotRsp))    dbgNoteWrite(v->id, 0xF101, regs.rsp);
+        if (isDirty(kSlotRflags)) dbgNoteWrite(v->id, 0xF102, regs.rflags);
+    }
     unsigned rejected = 0;
     for (unsigned slot = 1; slot < kCacheSlots; slot++) {
         if (!isDirty(slot) || slot == kSlotRsp || slot == kSlotRip || slot == kSlotRflags)
@@ -792,6 +974,8 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
         uint32_t field = rhv::hv::kSlotField[slot];
         /* A field the SVM core does not model is skipped, not fatal: the framework accepts any write to a slot. */
         if (field) {
+            if ((gDbg & 1) && dbgTrackedField(field))
+                dbgNoteWrite(v->id, field, *slotWord(v, slot));
             if (!v->vm->hyperkit && (field == 0x4000 || field == 0x4002 || field == 0x401e)) {      /* which controls does this client switch on? */
                 const unsigned which = field == 0x4000 ? 0 : field == 0x4002 ? 1 : 2;
                 const uint64_t val = *slotWord(v, slot);
@@ -872,6 +1056,8 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
             if (v->appliedKnown[idx] && v->applied[idx] == val)
                 continue;
             uint64_t unused = 0;
+            if ((gDbg & 1) && (msr == 0xC0000100 || msr == 0xC0000101 || msr == 0xC0000102 || msr == 0xC0000081 || msr == 0xC0000082 || msr == 0xC0000084))
+                dbgNoteWrite(v->id, 0x100000000ull | msr, val);
             IOReturn mr = cpu->msrOp(RHV_MSR_WRITE, msr, val, &unused);
             v->applied[idx] = val;
             v->appliedKnown[idx] = 1;
@@ -926,6 +1112,22 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
             v->tprPage = tpr;
         }
     }
+    {
+        /* CR2 is a register of the page, not a VMCS slot: a client that injects a #PF (VMware's instruction emulator does) writes it there first. */
+        const uint64_t cr2 = *gprWord(v, R_CR2);
+        if (cr2 != v->cr2Page) {
+            static volatile SInt32 cr2Logged;
+            if (OSIncrementAtomic(&cr2Logged) < 30) {
+                char pn[32] = {0};
+                proc_selfname(pn, sizeof(pn));
+                RHV_INFO("hv front end: %s vcpu%u writes CR2 = %#llx (was %#llx)", pn, v->id, (unsigned long long)cr2, (unsigned long long)v->cr2Page);
+            }
+            if (gDbg & 1)
+                dbgNoteWrite(v->id, 0xF000, cr2);
+            cpu->vmcsWrite(0xF000, cr2);
+            v->cr2Page = cr2;
+        }
+    }
     const uint64_t inRax = regs.rax, inRcx = regs.rcx, inRdx = regs.rdx;       /* what the client set before this entry */
     IOReturn rc = cpu->runEx(&v->in, &v->out);
     if (rc != kIOReturnSuccess) {
@@ -935,6 +1137,8 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
         return hvFromIo(rc);
     }
 
+    if (gDbg & 1)
+        dbgRecord(v);
     if (!v->vm->hyperkit) {
         /* What a client that is new to the native path does: the first exits, then one in 5000. Lets a stalled guest be read from rhv-info log. */
         static volatile SInt32 runs;
@@ -1008,6 +1212,7 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
         uint64_t val = v->out.fields[i];
         if (enc == 0xF000) {
             *gprWord(v, R_CR2) = val;                  /* CR2 and TPR are registers in the page, not VMCS slots */
+            v->cr2Page = val;
         } else if (enc == 0xF004) {
             if (!v->vm->hyperkit) {
                 *gprWord(v, R_TPR) = (val & 0xF) << 4;
@@ -1327,9 +1532,160 @@ bool setSysctl(bool on)
     return true;
 }
 
+void debugSet(uint32_t flags)
+{
+    if (flags & 1) {
+        gFlightPos = 0;
+        gFrozen = 0;
+        bzero(gFlight, sizeof(gFlight));
+        bzero(gStuckCount, sizeof(gStuckCount));
+    }
+    gDbg = flags;
+    RHV_INFO("hv front end: debug flags now %#x%s%s", flags, (flags & 1) ? " (recording the exits of every vCPU run)" : "", (flags & 2) ? " (freezing when a vCPU is stuck)" : "");
+}
+
+void flightDump(uint32_t arg)
+{
+    uint32_t count = arg & 0xffff;                   /* how many, and how many of the newest to leave out (arg >> 16) */
+    const uint32_t skip = arg >> 16;
+    const uint32_t saved = gDbg;
+    gDbg = saved & ~1u;                              /* the ring stands still while it is written out */
+    uint32_t total = (uint32_t)gFlightPos;
+    if (!total) {
+        gDbg = saved;
+        RHV_INFO("flight: nothing recorded (rhv-info hv debug 1 first)");
+        return;
+    }
+    const uint32_t recorded = total;
+    total = skip < total ? total - skip : 0;
+    if (count > kFlightN)
+        count = kFlightN;
+    if (count > total)
+        count = total;
+    RHV_INFO("flight: %u exits ending %u before the newest of %u recorded, oldest first (seq reason qual rip rsp rflags rax r9 cr2 gs kgs cs sel/ar ss sel/ar cpl)", count, skip, recorded);
+    for (uint32_t i = total - count; i < total; i++) {
+        const Flight f = gFlight[i & (kFlightN - 1)];
+        if (f.seq != i + 1)
+            continue;                                /* overwritten while reading */
+        RHV_INFO("f%u r%u c%u q%llx ip %llx sp %llx fl %llx ax %llx r9 %llx cr2 %llx gs %llx kg %llx cs %x/%x ss %x/%x", (unsigned)f.seq, f.reason, f.cpl,
+                 (unsigned long long)f.qual, (unsigned long long)f.rip, (unsigned long long)f.rsp, (unsigned long long)f.rflags,
+                 (unsigned long long)f.rax, (unsigned long long)f.r9, (unsigned long long)f.cr2, (unsigned long long)f.gsBase,
+                 (unsigned long long)f.kernGsBase, f.csSel, f.csAr, f.ssSel, f.ssAr);
+        if (f.nw) {
+            char w[200];
+            int n = 0;
+            for (unsigned k = 0; k < f.nw && n < (int)sizeof(w) - 40; k++)
+                n += snprintf(w + n, sizeof(w) - n, " %llx=%llx", (unsigned long long)f.wid[k], (unsigned long long)f.wval[k]);
+            RHV_INFO("w%u:%s", (unsigned)f.seq, w);
+        }
+    }
+    RHV_INFO("flight: the last state of each vCPU (5 lines each: regs; r8-r15; gs/fs/kernel gs/idt/exception bitmap; tr/gdt/syscall msrs; cr, controls, TSC offset)");
+    for (unsigned i = 0; i < 64; i++) {
+        const VcpuSnap n = gSnap[i];
+        if (!n.seq)
+            continue;
+        RHV_INFO("v%u seq %u reason %u rip %llx rsp %llx fl %llx ax %llx cx %llx dx %llx bx %llx bp %llx si %llx di %llx", i, (unsigned)n.seq, n.reason,
+                 (unsigned long long)n.rip, (unsigned long long)n.gpr[4], (unsigned long long)n.rflags, (unsigned long long)n.gpr[0], (unsigned long long)n.gpr[1],
+                 (unsigned long long)n.gpr[2], (unsigned long long)n.gpr[3], (unsigned long long)n.gpr[5], (unsigned long long)n.gpr[6], (unsigned long long)n.gpr[7]);
+        RHV_INFO("v%u r8 %llx r9 %llx r10 %llx r11 %llx r12 %llx r13 %llx r14 %llx r15 %llx", i, (unsigned long long)n.gpr[8], (unsigned long long)n.gpr[9],
+                 (unsigned long long)n.gpr[10], (unsigned long long)n.gpr[11], (unsigned long long)n.gpr[12], (unsigned long long)n.gpr[13],
+                 (unsigned long long)n.gpr[14], (unsigned long long)n.gpr[15]);
+        RHV_INFO("v%u gs %llx fs %llx kgs %llx gsmsr %llx idt %llx exc %llx cr2 %llx ok2 %x", i, (unsigned long long)n.gsBase, (unsigned long long)n.fsBase,
+                 (unsigned long long)n.kernGsBase, (unsigned long long)n.gsMsr, (unsigned long long)n.idtBase, (unsigned long long)n.excBitmap,
+                 (unsigned long long)n.cr2, n.have2);
+        RHV_INFO("v%u tr %llx gdt %llx star %llx lstar %llx sfmask %llx", i, (unsigned long long)n.trBase, (unsigned long long)n.gdtBase,
+                 (unsigned long long)n.star, (unsigned long long)n.lstar, (unsigned long long)n.sfmask);
+        RHV_INFO("v%u cr0 %llx cr3 %llx cr4 %llx efer %llx cs %x pin %llx proc %llx sec %llx tscoff %llx act %llx intr %llx evt %llx ok %x", i,
+                 (unsigned long long)n.cr0, (unsigned long long)n.cr3, (unsigned long long)n.cr4, (unsigned long long)n.efer, n.csSel,
+                 (unsigned long long)n.pin, (unsigned long long)n.proc, (unsigned long long)n.sec, (unsigned long long)n.tscOff,
+                 (unsigned long long)n.activity, (unsigned long long)n.intrState, (unsigned long long)n.entryIntr, n.have);
+    }
+    gDbg = saved;
+}
+
+/* A 64-bit guest virtual address -> guest physical, by walking the guest's own page tables (4 levels, the registers of the last recorded exit), then 256 bytes. */
+void readGuest(uint64_t va)
+{
+    if (!gDbgLock) {
+        RHV_INFO("readguest: not available");
+        return;
+    }
+    IOLockLock(gDbgLock);
+    HvVm *vm = gDbgVm;
+    if (!vm || !vm->shared) {
+        IOLockUnlock(gDbgLock);
+        RHV_INFO("readguest: no recorded exit of a live VM (rhv-info hv debug 1, then let the guest run)");
+        return;
+    }
+    /* The most recent vCPU of that VM that is in 64-bit paged mode: another may still be in real mode. */
+    const VcpuSnap *use = nullptr;
+    for (unsigned i = 0; i < 64; i++) {
+        const VcpuSnap &n = gSnap[i];
+        if (n.seq && n.vm == vm && (n.cr0 & 0x80000000u) && (n.efer & 0x400) && (n.cr4 & 0x20) && (!use || n.seq > use->seq))
+            use = &n;
+    }
+    if (!use) {
+        IOLockUnlock(gDbgLock);
+        RHV_INFO("readguest: no vCPU of the VM is in 64-bit paged mode at its last exit");
+        return;
+    }
+    Flight last = {};
+    last.seq = use->seq;
+    last.cr0 = use->cr0;
+    last.cr3 = use->cr3;
+    last.cr4 = use->cr4;
+    last.efer = use->efer;
+    com_overlorddev_RyzenHVVmShared *sh = vm->shared;
+    uint64_t table = last.cr3 & 0x000FFFFFFFFFF000ull, pa = 0;
+    bool ok = false;
+    for (int level = 3; level >= 0; level--) {
+        const uint64_t shift = 12 + 9 * (uint64_t)level;
+        const uint64_t at = table + ((va >> shift) & 511) * 8;
+        uint64_t e = 0;
+        const IOReturn rc = sh->readPhys(at, &e, sizeof(e));
+        if (rc != kIOReturnSuccess) {
+            RHV_INFO("readguest: level %d entry at gpa %llx cannot be read (0x%x)", level, (unsigned long long)at, rc);
+            break;
+        }
+        RHV_INFO("readguest: L%d entry at %llx = %llx", level, (unsigned long long)at, (unsigned long long)e);
+        if (!(e & 1)) {
+            RHV_INFO("readguest: not present at level %d", level);
+            break;
+        }
+        if (level == 0 || ((e & 0x80) && (level == 1 || level == 2))) {
+            const uint64_t mask = (1ull << shift) - 1;
+            pa = (e & 0x000FFFFFFFFFF000ull & ~mask) | (va & mask);
+            ok = true;
+            break;
+        }
+        table = e & 0x000FFFFFFFFFF000ull;
+    }
+    if (ok) {
+        uint8_t buf[256];
+        uint64_t start = pa & ~0xFull;
+        size_t n = sizeof(buf);
+        const size_t toPage = 4096 - (size_t)(start & 0xFFF);
+        if (n > toPage)
+            n = toPage;                              /* the next page of the guest need not follow in physical memory */
+        const IOReturn rc = sh->readPhys(start, buf, n);
+        if (rc != kIOReturnSuccess) {
+            RHV_INFO("readguest: gpa %llx cannot be read (0x%x)", (unsigned long long)start, rc);
+        } else {
+            RHV_INFO("readguest: va %llx = gpa %llx, %u bytes from the 16-byte boundary below it", (unsigned long long)va, (unsigned long long)pa, (unsigned)n);
+            for (size_t i = 0; i < n; i += 16)
+                RHV_INFO("g %llx: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                         (unsigned long long)((va & ~0xFull) + i), buf[i], buf[i+1], buf[i+2], buf[i+3], buf[i+4], buf[i+5], buf[i+6], buf[i+7],
+                         buf[i+8], buf[i+9], buf[i+10], buf[i+11], buf[i+12], buf[i+13], buf[i+14], buf[i+15]);
+        }
+    }
+    IOLockUnlock(gDbgLock);
+}
+
 void start(com_overlorddev_RyzenHV *service)
 {
     gSvc = service;
+    if (!gDbgLock)
+        gDbgLock = IOLockAlloc();
     uint32_t v = 0;
     uint32_t tprArg = 1;
     if (PE_parse_boot_argn("rhv_tpr_shadow", &tprArg, sizeof(tprArg)))
@@ -1347,6 +1703,7 @@ void stop()
 {
     setSysctl(false);
     setMode(0);
+    gDbg = 0;
 }
 
 } // namespace hv

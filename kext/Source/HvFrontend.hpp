@@ -31,6 +31,11 @@ uint32_t mode();
 bool registered();
 bool sysctlTaken();
 
+/* Debugging of a stalled client (rhv-info hv debug / flightdump / readguest). Everything goes to the kernel log. Off by default. */
+void debugSet(uint32_t flags);
+void flightDump(uint32_t count);
+void readGuest(uint64_t va);
+
 } // namespace hv
 } // namespace rhv
 

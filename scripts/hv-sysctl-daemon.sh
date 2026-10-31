@@ -45,6 +45,16 @@ install)
 #!/bin/sh
 # Installed by scripts/hv-sysctl-daemon.sh. Waits for the RyzenHV native front end, then turns kern.hv_support on.
 BIN="${RHV_BIN:-/usr/local/libexec/ryzenhv/rhv-info}"
+
+# Docker Desktop's HyperKit refuses to start ("Failed to set up pidfile") when the pid file of the previous boot is still there and its number
+# belongs to some other process now. Remove the pid files that do not name a running HyperKit.
+for f in "${RHV_USERS_DIR:-/Users}"/*/Library/Containers/com.docker.docker/Data/vms/*/hyperkit.pid; do
+    [ -f "$f" ] || continue
+    pid="$(tr -dc '0-9' < "$f")"
+    if [ -n "$pid" ] && ps -p "$pid" -o comm= 2>/dev/null | grep -q hyperkit; then continue; fi
+    rm -f "$f" && echo "$(date '+%F %T') removed the stale $f (pid ${pid:-none})"
+done
+
 i=0
 while [ "$i" -lt 90 ]; do
     if "$BIN" hv 2>/dev/null | grep -q "front end: registered"; then

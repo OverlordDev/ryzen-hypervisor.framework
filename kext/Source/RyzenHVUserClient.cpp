@@ -249,6 +249,18 @@ IOReturn com_overlorddev_RyzenHVUserClient::sHvControl(OSObject *target, void *,
 {
     RHV_ME();
     uint32_t cmd = (uint32_t)args->scalarInput[0], value = (uint32_t)args->scalarInput[1];
+    if (cmd == kRHVHvDebug || cmd == kRHVHvFlightDump || cmd == kRHVHvReadGuest) {
+        RHV_ADMIN();
+        if (cmd == kRHVHvDebug)
+            rhv::hv::debugSet(value);
+        else if (cmd == kRHVHvFlightDump)
+            rhv::hv::flightDump(value);
+        else
+            rhv::hv::readGuest(args->scalarInput[1]);       /* the whole 64 bits */
+        args->scalarOutput[0] = (rhv::hv::registered() ? kRHVHvStateRegistered : 0) | (rhv::hv::sysctlTaken() ? kRHVHvStateSysctl : 0) | (rhv::hv::tprShadow() ? kRHVHvStateTpr : 0);
+        args->scalarOutput[1] = rhv::hv::mode();
+        return kIOReturnSuccess;
+    }
     if (cmd == kRHVHvSvmLimit || cmd == kRHVHvSvmRescan) {
         RHV_ADMIN();
         uint32_t enabled = 0;

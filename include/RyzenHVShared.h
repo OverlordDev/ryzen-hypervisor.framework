@@ -137,7 +137,10 @@ enum {
     kRHVHvSysctl  = 2,   /* value 0/1: kern.hv_support shows 1 (needs the traps registered) */
     kRHVHvTpr     = 3,   /* value 0/1: offer the TPR shadow to the VMs created from now on, except HyperKit's (default 1, boot-arg rhv_tpr_shadow) */
     kRHVHvSvmLimit  = 4, /* debugging, value N: forget the CPUs from index N up, as if they were offline when the kext started (rescan brings them back) */
-    kRHVHvSvmRescan = 5  /* debugging: look for CPUs that came online late and turn SVM on there; state[1] is how many were enabled */
+    kRHVHvSvmRescan = 5, /* debugging: look for CPUs that came online late and turn SVM on there; state[1] is how many were enabled */
+    kRHVHvDebug     = 6, /* debugging, value = flags: bit 0 records the last 512 exits of every client's vCPUs (off by default), bit 1 freezes the recording when a vCPU stays in one page of kernel code with interrupts off for 24 timeslice exits */
+    kRHVHvFlightDump = 7, /* debugging, value N: writes N recorded exits to the kernel log (`rhv-info log`); value = N | (SKIP << 16): the newest SKIP exits are left out */
+    kRHVHvReadGuest  = 8  /* debugging, value = a 64-bit guest virtual address: walks the guest's page tables (CR3 of the last recorded exit) and logs 256 bytes there */
 };
 /* state bits returned in scalarOutput[0] */
 enum { kRHVHvStateRegistered = 1u << 0, kRHVHvStateSysctl = 1u << 1, kRHVHvStateTpr = 1u << 2 };

@@ -78,7 +78,7 @@ patches the CPU-vendor check. What is missing, in the order it is worth doing:
    User space only: no kext change, no reboot. Verified: keys sent with `prlctl send-key-event` open the Start menu after a cold boot and after a resume
    (the first-access trigger fires 2 s after the VM starts; for a restored VM a once-a-second check does it). Still to verify: typing from the VM window, other layouts.
 2. [~] `kern.hv_support` at every boot without a command (installed and run on the author's machine; a real boot with it is not yet observed): `./rhv autostart install` (launchd daemon, `scripts/hv-sysctl-daemon.sh`), a button in the app.
-   Still to do there: remove a stale `hyperkit.pid` of Docker when the daemon runs (a leftover from the previous boot stops HyperKit).
+   Done in 0.7.7: the boot service also removes a stale `hyperkit.pid` of Docker (a leftover of the previous boot whose number belongs to another process now made HyperKit stop with "Failed to set up pidfile"; seen again on 2026-10-31). An existing service has to be reinstalled once (`./rhv autostart install`) to get the new script.
 3. [x] **TPR shadow in native mode, on by default since 0.7.3** (speed: about half of the exits of a Windows boot are `CR8`). The framework does not strip the bit from the
    primary controls word (`fixup_capability` only touches the entry/exit/secondary words), so the kext can offer it per VM for Parallels (caps are filled in
    `vmCreate`, which knows `vm->parallels`) and make thread trap 9 (`hv_vmx_vcpu_set_apic_address`) succeed. The core already has the TPR shadow
@@ -118,6 +118,22 @@ patches the CPU-vendor check. What is missing, in the order it is worth doing:
     (a timer or the TSC are the first suspects: `hv_vm_sync_tsc` is only answered, VMware's TSC offset and `RDTSC` exiting toggling have not been checked). To look at the guest's code the kext
     needs to read guest memory by virtual address. The debug build used for this (a ring of the last 400 exits with CS:RIP and registers, a ring of the last 128 traps, a probe of the guest CS at
     every entry point, `rhv-info hv flightdump`) was not kept: it has to be written again, and it should be a runtime switch so that a question does not cost a reboot.
+
+13. [ ] **Docker Desktop in native mode on macOS 26 (issue 1).** On 26.7.1 (Ryzen 9 5900X) `com.docker.hyperkit` is killed right after the kext patched it (`Code Signature Invalid`, `Invalid Page`, at an address in the
+    patched page), with SIP enabled in the crash report and flags `HARD|KILL|ENFORCEMENT|REQUIRE_LV`. On the author's machine (15.8.1, `amfi_get_out_of_my_way=0x1`) HyperKit has `KILL` but no
+    `ENFORCEMENT`/`HARD`. The suspected cause (not confirmed): code signing is enforced for the process because AMFI is not relaxed there (SIP on, or a setting macOS 26 ignores). 0.7.7 logs the flags before the first patch
+    (`rhv-info log | grep "client fix-ups"`); the reporter was asked for `nvram boot-args` and `csrutil status`. A patch that does not invalidate the page would need another way to change HyperKit's two
+    branches, or the machine must have enforcement off.
+14. [ ] **Parallels: a Windows 7 VM shows a black screen (issue 3).** Windows 10 on the same machine (5700U, Zen 2, 15.8.2) boots; Windows 7 does not. VirtualBox 7.2 runs Windows 7 there. The patch log of the
+    Windows 7 start ends after `hv_vcpu_run_until is called by the monitor`: the vCPU hardly runs. The kext log of that start (ring wrapped before it was read) is needed.
+15. [ ] **Parallels: USB pass-through does not work (issue 6)**, in shim and native mode; the same scanner works in VirtualBox 7.2.22 (native). The kext does not touch USB, so the host side of Parallels
+    (its USB driver or service) is the first suspect; not looked at yet.
+16. [ ] **UTM (issue 4):** with `rhv_hv=1 rhv_hv_sysctl=1` UTM (QEMU) lets a VM be created, but a Windows VM gets no graphics (reported, not reproduced). Needs the UTM version, the VM's machine/CPU/display
+    device and the kext log.
+17. [ ] **Android Emulator:** one unverified report (Ryzen 7 7700X, RX 6800, macOS 26.7.2): it runs after changes the reporter made, and stops on a host OpenGL problem. Nothing tested here.
+18. [ ] **Parallels' keyboard fix is found by bytes** (0.7.6, `rhv_find_monitor_kbd`): only build 57613 has been tried. A Parallels update that changes that function needs a new pattern.
+
+19. [ ] **HyperKit sometimes aborts in `vcpu_thread`** (SIGABRT, seen once in about six Docker starts on 2026-10-31 and once on 2026-10-30 on an older build, same code offset in both crash reports; the other starts ran `hello-world` and `alpine`). Docker Desktop reports "hyperkit: process terminated unexpectedly ... signal code 6"; starting it again works. Not analysed yet (the abort comes from HyperKit itself; its message is not in the Docker logs).
 
 ## Risks
 
