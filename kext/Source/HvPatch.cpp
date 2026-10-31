@@ -12,6 +12,7 @@
 #include "Log.hpp"
 
 extern "C" vm_map_t get_task_map(task_t);
+extern "C" proc_t current_proc(void);
 
 namespace rhv {
 namespace hv {
@@ -121,6 +122,28 @@ void scanBuf(const uint8_t *buf, size_t len, size_t startLimit, const Pat &pat, 
     }
 }
 
+/* The client's code-signing state, logged once before its first patch (one log line holds 256 characters, so the messages are short). Seen so far: on a machine
+ * with AMFI relaxed (amfi_get_out_of_my_way=0x1, macOS 15.8.1) CS_ENFORCEMENT is clear for HyperKit; on a Tahoe 26.7.1 machine it was set and the process was killed
+ * with "Code Signature Invalid" right after the patch (issue 1). Whether that is the whole story is not known. */
+constexpr uint64_t kCsHard = 0x100, kCsKill = 0x200, kCsEnforcement = 0x1000, kCsRequireLv = 0x2000;
+
+void logSigningState(const char *name)
+{
+    uint64_t flags = 0;
+    const int rc = proc_csflags(current_proc(), &flags);
+    if (rc) {
+        RHV_INFO("client fix-ups: signing flags of %s not readable (%d)", name, rc);
+        return;
+    }
+    const bool enforced = (flags & kCsEnforcement) != 0;
+    RHV_INFO("client fix-ups: signing flags of %s: %#llx, enforcement %s, hard %s, kill %s, lv %s", name, (unsigned long long)flags, enforced ? "ON" : "off",
+             (flags & kCsHard) ? "on" : "off", (flags & kCsKill) ? "on" : "off", (flags & kCsRequireLv) ? "on" : "off");
+    if (enforced) {
+        RHV_WARN("client fix-ups: code signing is enforced for %s; such a process was killed after the patch on macOS 26.7.1 (issue 1)", name);
+        RHV_WARN("client fix-ups: AMFI should be relaxed for it (amfi_get_out_of_my_way=0x1), see docs/NATIVE.md");
+    }
+}
+
 bool nameMatches(const char *name, const char *prefix)
 {
     return strncmp(name, prefix, strlen(prefix)) == 0;
@@ -198,9 +221,14 @@ void fixCurrentClient()
             break;
     }
 
+    bool signingLogged = false;
     for (unsigned i = 0; i < nWanted; i++) {
         const Patch &pt = kPatches[wanted[i]];
         Search &s = srch[i];
+        if (!signingLogged && s.valid && s.nOrig == 1 && !s.nDone) {
+            signingLogged = true;
+            logSigningState(name);
+        }
         if (!s.valid) {
             RHV_WARN("client fix-ups: bad pattern for %s", pt.name);
         } else if (s.nOrig + s.nDone != 1) {

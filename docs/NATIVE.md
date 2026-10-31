@@ -28,6 +28,7 @@ branches **by the bytes around them** in that process's executable memory and ch
 (`kext/Source/HvPatch.cpp`). Nothing on disk changes, nothing is signed again. If the bytes are not found exactly once (another Docker
 Desktop build) the process is left alone and `rhv-info log` says so (`rhv-info log | grep "client fix-ups"`).
 This needs AMFI relaxed on the machine (`amfi_get_out_of_my_way=0x1`), like the shim. `rhv_clientpatch=0` switches the engine off.
+Before the first patch the kext logs the process's code-signing flags (`rhv-info log | grep "client fix-ups"`): `signing flags of com.docker.hyperkit: …, enforcement off` is what a machine with AMFI relaxed shows; `enforcement ON` comes with a warning, because on macOS 26.7.1 a HyperKit with enforcement on was killed (`Code Signature Invalid`) right after the patch (issue 1).
 HyperKit's CPUID answers are also cleaned of AMD-only features by the kext (only for HyperKit).
 
 ## Parallels in native mode (0.7.1, experimental; the keyboard and the boot service are new in 0.7.2)
