@@ -10,8 +10,10 @@ struct ParallelsView: View {
                     Row(level: .info, text: "Parallels Desktop is not installed")
                 } else if model.parallelsSupported {
                     Row(level: .ok, text: "Build \(model.parallelsBuild ?? "?") is supported")
+                } else if model.parallelsCodeOK {
+                    Row(level: .warn, text: "Build \(model.parallelsBuild ?? "?") is not the tested one (\(model.parallelsSupportedBuild)), but the code RyzenHV patches is there: it will be tried (untested).")
                 } else {
-                    Row(level: .warn, text: "Build \(model.parallelsBuild ?? "?"): only \(model.parallelsSupportedBuild) is tested. The patches are found by their bytes and may not fit.")
+                    Row(level: .fail, text: "Build \(model.parallelsBuild ?? "?"): the code RyzenHV patches was not found (tested: \(model.parallelsSupportedBuild)). The details are in the Log.")
                 }
                 Row(level: model.parallelsEnabled ? .ok : .info,
                     text: model.parallelsEnabled ? (model.parallelsNative ? "Running through RyzenHV (native mode)" : "Running through RyzenHV (shim)") : "Not enabled")
@@ -26,7 +28,7 @@ struct ParallelsView: View {
                         .buttonStyle(.borderedProminent)
                         .disabled(model.busy != nil || !model.parallelsInstalled || !model.kextLoaded)
                     Button("Enable, native mode (experimental)") { model.enableParallelsNative() }
-                        .disabled(model.busy != nil || !model.parallelsInstalled || !model.nativeMode || model.hvSupport != "1" || !model.parallelsSupported)
+                        .disabled(model.busy != nil || !model.parallelsInstalled || !model.nativeMode || model.hvSupport != "1" || !model.parallelsUsable)
                     Button("Turn off 3D in all VMs") { model.fix3D() }
                         .disabled(model.busy != nil || !model.parallelsInstalled)
                     Button("Undo") { model.undoParallels() }

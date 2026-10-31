@@ -131,7 +131,7 @@ patches the CPU-vendor check. What is missing, in the order it is worth doing:
 16. [ ] **UTM (issue 4):** with `rhv_hv=1 rhv_hv_sysctl=1` UTM (QEMU) lets a VM be created, but a Windows VM gets no graphics (reported, not reproduced). Needs the UTM version, the VM's machine/CPU/display
     device and the kext log.
 17. [ ] **Android Emulator:** one unverified report (Ryzen 7 7700X, RX 6800, macOS 26.7.2): it runs after changes the reporter made, and stops on a host OpenGL problem. Nothing tested here.
-18. [ ] **Parallels' keyboard fix is found by bytes** (0.7.6, `rhv_find_monitor_kbd`): only build 57613 has been tried. A Parallels update that changes that function needs a new pattern.
+18. [~] **Parallels builds other than 57613** (0.7.8 work tree): the vendor check is searched in four forms (je/jne, short/near, any register), the keyboard handler first by the exact bytes and then through its "POST CODE: 0x%x" string; `bin/rhv-patchcheck` and `./rhv parallels check` report what is found, and `./rhv parallels` goes on for an untested build only when everything is found exactly once. Only 57613 exists here, so the other forms are tested on synthetic code only. The stand-in library also assumes `Contents/Frameworks/libPrlXmlModel.1.dylib` exists.
 
 19. [ ] **HyperKit sometimes aborts in `vcpu_thread`** (SIGABRT, seen once in about six Docker starts on 2026-10-31 and once on 2026-10-30 on an older build, same code offset in both crash reports; the other starts ran `hello-world` and `alpine`). Docker Desktop reports "hyperkit: process terminated unexpectedly ... signal code 6"; starting it again works. Not analysed yet (the abort comes from HyperKit itself; its message is not in the Docker logs).
 

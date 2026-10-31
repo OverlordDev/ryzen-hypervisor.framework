@@ -6,7 +6,7 @@
 #   ./rhv doctor             what works and what is missing on this Mac
 #   ./rhv kext [--native]    put RyzenHV.kext into your OpenCore EFI and set the boot-args (--native: the kext itself is the hypervisor
 #                            provider, no shim and no patched app files for Docker Desktop, see docs/NATIVE.md)
-#   ./rhv parallels          make Parallels Desktop run through RyzenHV (and ./rhv parallels undo)
+#   ./rhv parallels          make Parallels Desktop run through RyzenHV (and ./rhv parallels undo; ./rhv parallels check: does the installed Parallels have the code it patches?)
 #   ./rhv autostart [install|remove|status]   turn kern.hv_support on at every boot (native mode; a launchd service, needs your password once)
 #   ./rhv parallels native   the same for native mode (kext booted with --native): Apple's own Hypervisor.framework, the vendor check patched and the keyboard armed
 #   ./rhv docker-desktop     Docker Desktop (the real one) running on your AMD CPU (native when the kext runs with --native, else the shim)
@@ -97,7 +97,8 @@ doctor() {
     if [ -d "$app" ]; then
         local build; build="$(defaults read "$app/Contents/Info" CFBundleVersion 2>/dev/null)"
         if [ "$build" = "$SUPPORTED_PARALLELS_BUILD" ]; then ok "Parallels Desktop build $build (supported)"
-        else warn "Parallels Desktop build $build: only build $SUPPORTED_PARALLELS_BUILD (26.5.0) is supported; ./rhv parallels will refuse"; fi
+        elif parallels_patchcheck >/dev/null 2>&1; then warn "Parallels Desktop build $build is not the tested one ($SUPPORTED_PARALLELS_BUILD), but its code matches what RyzenHV patches: ./rhv parallels will go on (untested)"
+        else warn "Parallels Desktop build $build: the code RyzenHV patches was not found (tested: build $SUPPORTED_PARALLELS_BUILD); ./rhv parallels will refuse. See ./rhv parallels check"; fi
     else
         echo "  [--]   Parallels Desktop is not installed (optional)"
     fi
@@ -243,13 +244,41 @@ autostart() {
     esac
 }
 
+# Is Parallels' code what the stand-in library patches? Decided by the bytes of the installed files, not by the build number: the checks are
+# searched by their code (bin/rhv-patchcheck), so a Parallels update that left that code alone still works. Prints what it found; returns 1 if
+# something was not found, 2 if there is nothing to check with.
+parallels_patchcheck() {
+    local app="/Applications/Parallels Desktop.app" vm bin lib
+    vm="$app/Contents/MacOS/Parallels VM.app/Contents/MacOS"
+    bin="$vm/prl_vm_app"
+    [ -f "$vm/prl_vm_app.orig" ] && bin="$vm/prl_vm_app.orig"
+    lib="$app/Contents/MacOS/libMonitor.dylib"
+    [ -x "$ROOT/bin/rhv-patchcheck" ] || return 2
+    [ -f "$app/Contents/Frameworks/libPrlXmlModel.1.dylib" ] || { echo "  [bad]  the library the stand-in replaces (Contents/Frameworks/libPrlXmlModel.1.dylib) is not in this Parallels"; return 1; }
+    "$ROOT/bin/rhv-patchcheck" "$bin" "$lib"
+}
+
+# For a build other than the tested one: go on only when its code matches.
+parallels_gate() {
+    local build="$1" out rc
+    [ "$build" = "$SUPPORTED_PARALLELS_BUILD" ] && return 0
+    echo "Parallels build $build is not the tested one (26.5.0, build $SUPPORTED_PARALLELS_BUILD); looking at its code..."
+    out="$(parallels_patchcheck)"; rc=$?
+    [ -n "$out" ] && echo "$out"
+    if [ $rc -eq 0 ]; then
+        warn "the code RyzenHV patches is there exactly as expected, so it goes on; this build is UNTESTED (please tell how it went)"
+        return 0
+    fi
+    die "this Parallels build cannot be patched: the code above was not found. RyzenHV needs 26.5.0 (build $SUPPORTED_PARALLELS_BUILD) or a build with the same code"
+}
+
 parallels() {
     local sub="${1:-setup}" app="/Applications/Parallels Desktop.app" build
     case "$sub" in
     setup)
         [ -d "$app" ] || die "Parallels Desktop is not installed"
         build="$(defaults read "$app/Contents/Info" CFBundleVersion 2>/dev/null)"
-        [ "$build" = "$SUPPORTED_PARALLELS_BUILD" ] || die "Parallels build $build is not supported; RyzenHV needs 26.5.0 (build $SUPPORTED_PARALLELS_BUILD)"
+        parallels_gate "$build"
         doctor >/dev/null 2>&1 || { doctor; die "fix the problems above first"; }
         say "Preparing a private copy of Parallels' VM process with the shim built in..."
         "$ROOT/libexec/parallels-shim.sh" prepare || die "prepare failed"
@@ -272,7 +301,7 @@ EOF
         # CPU-vendor check is patched in memory and its keyboard armed by a small stand-in library; the hv_* calls are Apple's own (hv_vcpu_run* only get a wrapper).
         [ -d "$app" ] || die "Parallels Desktop is not installed"
         build="$(defaults read "$app/Contents/Info" CFBundleVersion 2>/dev/null)"
-        [ "$build" = "$SUPPORTED_PARALLELS_BUILD" ] || die "Parallels build $build is not supported; RyzenHV needs 26.5.0 (build $SUPPORTED_PARALLELS_BUILD)"
+        parallels_gate "$build"
         doctor >/dev/null 2>&1 || { doctor; die "fix the problems above first"; }
         "$ROOT/bin/rhv-info" hv 2>/dev/null | grep -q "front end: registered" || die "the kext is not in native mode. Run ./rhv kext --native, reboot, then try again"
         if [ "$(sysctl -n kern.hv_support 2>/dev/null)" != 1 ]; then
@@ -291,6 +320,7 @@ Done (native mode). Experimental: tested with Windows 10 (1 and 4 vCPUs, keyboar
   - the log of the vendor patch is ~/.ryzenhv/prl-patch.log; ./rhv parallels undo removes the wrapper
 EOT
         ;;
+    check)  echo "The code RyzenHV patches, in the installed Parallels:"; parallels_patchcheck; [ $? -ne 2 ] || die "this bundle has no bin/rhv-patchcheck" ;;
     undo)   sudo "$ROOT/libexec/parallels-shim.sh" uninstall ;;
     fix-vms) "$ROOT/libexec/parallels-shim.sh" fix-vms ;;
     status) "$ROOT/libexec/parallels-shim.sh" status ;;

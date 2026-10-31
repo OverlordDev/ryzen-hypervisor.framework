@@ -62,8 +62,16 @@ rhv_patch_result rhv_find_monitor_kbd_image(const struct mach_header *mh, struct
 rhv_patch_result rhv_find_monitor_kbd_cached(const struct mach_header *mh, struct rhv_monitor_kbd *out, int *fresh);
 #endif
 
+/*
+ * A patch with several forms (the same check compiled with other registers or another kind of branch): exactly one form must be found, once, in total.
+ * *which is the index of the form that was found.
+ */
+rhv_patch_result rhv_patch_locate_any(const uint8_t *buf, size_t len, const struct rhv_patch *forms, unsigned n, size_t *offset, unsigned *which);
+rhv_patch_result rhv_patch_image_any(const struct mach_header *mh, const struct rhv_patch *forms, unsigned n);
+
 /* The patches themselves. */
-extern const struct rhv_patch rhv_patch_prl_vendor;        /* prl_vm_app and libMonitor.dylib: CPUID vendor check */
+extern const struct rhv_patch rhv_patch_prl_vendor[];      /* prl_vm_app and libMonitor.dylib: CPUID vendor check, in several forms */
+extern const unsigned rhv_patch_prl_vendor_count;
 extern const struct rhv_patch rhv_patch_hyperkit_vendor;
 extern const struct rhv_patch rhv_patch_hyperkit_gla;
 

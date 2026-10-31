@@ -139,7 +139,7 @@ static void on_image(const struct mach_header *mh, intptr_t slide)
  */
 static void patch_vendor_check(const struct mach_header *mh, const char *what)
 {
-    rhv_patch_result r = rhv_patch_image(mh, &rhv_patch_prl_vendor);
+    rhv_patch_result r = rhv_patch_image_any(mh, rhv_patch_prl_vendor, rhv_patch_prl_vendor_count);
     char msg[160];
     snprintf(msg, sizeof(msg), "vendor check in %s: %s", what, rhv_patch_result_name(r));
     rhv_hijack_log(msg);

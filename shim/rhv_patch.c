@@ -3,6 +3,7 @@
  */
 #include "rhv_patch.h"
 
+#include <stdbool.h>
 #include <string.h>
 
 #ifdef __APPLE__
@@ -12,14 +13,28 @@
 #endif
 
 /*
- * Parallels 26.5.0 (57613), prl_vm_app and libMonitor.dylib:
+ * Parallels, prl_vm_app and libMonitor.dylib: the check that refuses a CPU whose CPUID vendor is not GenuineIntel. Parallels 26.5.0 (57613) compares
+ * the last word of "GenuineIntel" ("ntel") together with the others:
  *     xor rdx, "ntel" ; or rdx, rax ; je <Intel path>      -> jmp
+ * The registers (the ModRM bytes) and the kind of branch may differ in another build, so the forms below take any register and the four branches
+ * (je/jne, short/near). Only the 57613 form (xor rdx / or rdx,rax / je rel8) has been seen; the others are what the same source would look like
+ * after another compile, and are accepted only when found exactly once in the image together.
  */
-const struct rhv_patch rhv_patch_prl_vendor = {
-    "Parallels CPUID vendor check",
-    "48 81 f2 6e 74 65 6c  48 09 c2  74 ??",
-    "?? ?? ?? ?? ?? ?? ??  ?? ?? ??  eb ??",
+const struct rhv_patch rhv_patch_prl_vendor[] = {
+    {"Parallels CPUID vendor check (je short)",
+     "48 81 ?? 6e 74 65 6c  48 09 ??  74 ??",
+     "?? ?? ?? ?? ?? ?? ??  ?? ?? ??  eb ??"},
+    {"Parallels CPUID vendor check (je near)",
+     "48 81 ?? 6e 74 65 6c  48 09 ??  0f 84 ?? ?? ?? ??",
+     "?? ?? ?? ?? ?? ?? ??  ?? ?? ??  90 e9 ?? ?? ?? ??"},
+    {"Parallels CPUID vendor check (jne short)",
+     "48 81 ?? 6e 74 65 6c  48 09 ??  75 ??",
+     "?? ?? ?? ?? ?? ?? ??  ?? ?? ??  90 90"},
+    {"Parallels CPUID vendor check (jne near)",
+     "48 81 ?? 6e 74 65 6c  48 09 ??  0f 85 ?? ?? ?? ??",
+     "?? ?? ?? ?? ?? ?? ??  ?? ?? ??  90 90 90 90 90 90"},
 };
+const unsigned rhv_patch_prl_vendor_count = sizeof(rhv_patch_prl_vendor) / sizeof(rhv_patch_prl_vendor[0]);
 
 /*
  * HyperKit v0.20210107-12-gadc4ea (Docker Desktop 4.97.0):
@@ -133,6 +148,36 @@ rhv_patch_result rhv_patch_locate(const uint8_t *buf, size_t len, const struct r
     return RHV_PATCH_NOT_FOUND;
 }
 
+rhv_patch_result rhv_patch_locate_any(const uint8_t *buf, size_t len, const struct rhv_patch *forms, unsigned n, size_t *offset, unsigned *which)
+{
+    unsigned found = 0;
+    rhv_patch_result keep = RHV_PATCH_NOT_FOUND;
+    size_t at = 0;
+    unsigned idx = 0;
+    for (unsigned i = 0; i < n; i++) {
+        size_t o = 0;
+        rhv_patch_result r = rhv_patch_locate(buf, len, &forms[i], &o);
+        if (r == RHV_PATCH_AMBIGUOUS || r == RHV_PATCH_BAD_PATTERN)
+            return r;
+        if (r == RHV_PATCH_APPLIED || r == RHV_PATCH_ALREADY) {
+            if (found && o == at && r == RHV_PATCH_ALREADY && keep == RHV_PATCH_ALREADY)
+                continue;                      /* the patched form of a longer branch also looks like the patched form of a shorter one at the same place */
+            found++;
+            keep = r;
+            at = o;
+            idx = i;
+        }
+    }
+    if (found > 1)
+        return RHV_PATCH_AMBIGUOUS;
+    if (!found)
+        return RHV_PATCH_NOT_FOUND;
+    *offset = at;
+    if (which)
+        *which = idx;
+    return keep;
+}
+
 int rhv_patch_apply(uint8_t *at, const struct rhv_patch *p)
 {
     uint8_t pv[MAXPAT], pw[MAXPAT];
@@ -186,7 +231,7 @@ static rhv_patch_result find_once(const uint8_t *buf, size_t len, const char *pa
     return RHV_PATCH_APPLIED;       /* "found once" */
 }
 
-rhv_patch_result rhv_find_monitor_kbd(const uint8_t *code, size_t len, struct rhv_monitor_kbd *out)
+static rhv_patch_result find_kbd_exact(const uint8_t *code, size_t len, struct rhv_monitor_kbd *out)
 {
     size_t head = 0, tail = 0;
     rhv_patch_result r = find_once(code, len, kbd_head, &head);
@@ -208,6 +253,105 @@ rhv_patch_result rhv_find_monitor_kbd(const uint8_t *code, size_t len, struct rh
     out->second = (size_t)second;
     out->armed = (size_t)armed;
     return RHV_PATCH_APPLIED;
+}
+
+
+/*
+ * The same handler in a build whose bytes differ from the ones above: found through its log string "POST CODE: 0x%x". The function is the one that
+ * loads that string (a rip-relative lea), its start the nearest 16-byte aligned `push rbp; mov rbp,rsp` before; the flags are the operands of the
+ * `lea rax,[rip+d] ; mov byte [rax+off],1` that sets the saved-state flag and of the `cmp byte [rip+d],0` that tests the library's own flag. Taken only if
+ * every one of these is found exactly once inside the function, and the function begins by comparing the count with 1 and the size with 2 / 1 (the
+ * 57613 handler does).
+ */
+static const uint8_t kPostStr[] = "POST CODE: 0x%x";
+
+static rhv_patch_result find_kbd_anchored(const uint8_t *code, size_t len, struct rhv_monitor_kbd *out)
+{
+    if (len < 0x1000)
+        return RHV_PATCH_NOT_FOUND;
+    size_t str = 0;
+    unsigned nstr = 0;
+    for (size_t i = 0; i + sizeof(kPostStr) <= len; i++) {
+        if (code[i] == 'P' && memcmp(code + i, kPostStr, sizeof(kPostStr)) == 0) {
+            if (!nstr++)
+                str = i;
+        }
+    }
+    if (nstr != 1)
+        return nstr ? RHV_PATCH_AMBIGUOUS : RHV_PATCH_NOT_FOUND;
+
+    /* lea r64,[rip+disp32] that points at the string */
+    size_t xref = 0;
+    unsigned nx = 0;
+    for (size_t i = 0; i + 7 <= len; i++) {
+        if ((code[i] == 0x48 || code[i] == 0x4c) && code[i + 1] == 0x8d && (code[i + 2] & 0xc7) == 0x05) {
+            const int64_t target = (int64_t)(i + 7) + rd32(code + i + 3);
+            if (target == (int64_t)str) {
+                if (!nx++)
+                    xref = i;
+            }
+        }
+    }
+    if (nx != 1)
+        return nx ? RHV_PATCH_AMBIGUOUS : RHV_PATCH_NOT_FOUND;
+
+    size_t fn = 0;
+    bool haveFn = false;
+    for (size_t a = xref & ~(size_t)0xf; xref - a < 0x300; a -= 0x10) {
+        if (code[a] == 0x55 && code[a + 1] == 0x48 && code[a + 2] == 0x89 && code[a + 3] == 0xe5) {
+            fn = a;
+            haveFn = true;
+            break;
+        }
+        if (a < 0x10)
+            break;
+    }
+    if (!haveFn || len - fn < 0x1c0)
+        return RHV_PATCH_NOT_FOUND;
+    const uint8_t *f = code + fn;
+    const size_t span = 0x1c0;
+
+    /* begins with: cmp rdx,1 ; ... cmp esi,2 (within the first 0x30 bytes) */
+    bool cmpCount = false, cmpSize = false;
+    for (size_t i = 0; i + 4 <= 0x30; i++) {
+        if (f[i] == 0x48 && f[i + 1] == 0x83 && f[i + 2] == 0xfa && f[i + 3] == 0x01) cmpCount = true;
+        if (f[i] == 0x83 && f[i + 1] == 0xfe && f[i + 2] == 0x02) cmpSize = true;
+    }
+    if (!cmpCount || !cmpSize)
+        return RHV_PATCH_NOT_FOUND;
+
+    /* lea rax,[rip+d] ; mov byte [rax+off],1   and   cmp byte [rip+d],0 */
+    size_t lea = 0;
+    unsigned nlea = 0, ncmp = 0;
+    size_t cmpAt = 0;
+    for (size_t i = 0; i + 14 <= span; i++) {
+        if (f[i] == 0x48 && f[i + 1] == 0x8d && f[i + 2] == 0x05 && f[i + 7] == 0xc6 && f[i + 8] == 0x80 && f[i + 13] == 0x01) {
+            if (!nlea++)
+                lea = i;
+        }
+        if (f[i] == 0x80 && f[i + 1] == 0x3d && f[i + 6] == 0x00) {
+            if (!ncmp++)
+                cmpAt = i;
+        }
+    }
+    if (nlea != 1 || ncmp != 1)
+        return (nlea > 1 || ncmp > 1) ? RHV_PATCH_AMBIGUOUS : RHV_PATCH_NOT_FOUND;
+    const int64_t armed = (int64_t)(fn + lea + 7) + rd32(f + lea + 3) + rd32(f + lea + 9);
+    const int64_t second = (int64_t)(fn + cmpAt + 7) + rd32(f + cmpAt + 2);
+    if (armed < 0 || second < 0)
+        return RHV_PATCH_NOT_FOUND;
+    out->handler = fn;
+    out->armed = (size_t)armed;
+    out->second = (size_t)second;
+    return RHV_PATCH_APPLIED;
+}
+
+rhv_patch_result rhv_find_monitor_kbd(const uint8_t *code, size_t len, struct rhv_monitor_kbd *out)
+{
+    rhv_patch_result r = find_kbd_exact(code, len, out);
+    if (r == RHV_PATCH_APPLIED || r == RHV_PATCH_AMBIGUOUS)      /* found, or found in two places: no second guess */
+        return r;
+    return find_kbd_anchored(code, len, out);
 }
 
 #ifdef __APPLE__
@@ -237,6 +381,34 @@ rhv_patch_result rhv_patch_image(const struct mach_header *mh, const struct rhv_
     if (vm_protect(mach_task_self(), page, span, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE | VM_PROT_COPY) != KERN_SUCCESS)
         return RHV_PATCH_NO_ACCESS;
     rhv_patch_apply(base + offset, p);
+    vm_protect(mach_task_self(), page, span, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+    return RHV_PATCH_APPLIED;
+}
+
+rhv_patch_result rhv_patch_image_any(const struct mach_header *mh, const struct rhv_patch *forms, unsigned n)
+{
+    if (!mh || mh->magic != MH_MAGIC_64)
+        return RHV_PATCH_NOT_FOUND;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+    const struct segment_command_64 *text = NULL;
+    const struct load_command *lc = (const struct load_command *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize))
+        if (lc->cmd == LC_SEGMENT_64 && strcmp(((const struct segment_command_64 *)lc)->segname, SEG_TEXT) == 0)
+            text = (const struct segment_command_64 *)lc;
+    if (!text)
+        return RHV_PATCH_NOT_FOUND;
+    uint8_t *base = (uint8_t *)mh;
+    size_t offset = 0;
+    unsigned which = 0;
+    rhv_patch_result r = rhv_patch_locate_any(base, (size_t)text->vmsize, forms, n, &offset, &which);
+    if (r != RHV_PATCH_APPLIED)
+        return r;
+    vm_address_t page = (vm_address_t)(base + offset) & ~(vm_address_t)(vm_page_size - 1);
+    vm_size_t span = (vm_address_t)(base + offset + 64) - page;
+    span = (span + vm_page_size - 1) & ~(vm_size_t)(vm_page_size - 1);
+    if (vm_protect(mach_task_self(), page, span, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE | VM_PROT_COPY) != KERN_SUCCESS)
+        return RHV_PATCH_NO_ACCESS;
+    rhv_patch_apply(base + offset, &forms[which]);
     vm_protect(mach_task_self(), page, span, 0, VM_PROT_READ | VM_PROT_EXECUTE);
     return RHV_PATCH_APPLIED;
 }

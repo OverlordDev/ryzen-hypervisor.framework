@@ -8,7 +8,7 @@ replacement of `prl_vm_app` with a wrapper (reversible).
 > From the ready-made release, everything below is done by `./rhv kext` and `./rhv parallels` (steps 4–5 and installing the wrapper); this document describes
 > what exactly happens.
 
-> This is an experiment, not a product. It works on the **exact Parallels build 26.5.0 (57613)**: the patches are found by the bytes around them, not by address, but only this build is tested; on another build they may not apply (the VM then simply does not start). After a Parallels update
+> This is an experiment, not a product. It was tested on the **exact Parallels build 26.5.0 (57613)**: the patches are found by the bytes around them, not by address, so a build that kept that code (the CPU-vendor check in several register/branch forms, the keyboard handler found through its "POST CODE" log string) is accepted by `./rhv parallels` after `bin/rhv-patchcheck` has found each place exactly once; another build may not match (the setup then stops and says what was not found). After a Parallels update
 > repeat steps 4–5. Patching a proprietary application on your own machine is your responsibility; the repository contains
 > nothing from Parallels, the copy is built from the application installed on your machine.
 
@@ -117,8 +117,7 @@ the guest state is printed (`TRIPLE FAULT`). For `prl_vm_app` crashes look in `/
 
 ## Known limitations
 
-- Only Parallels build 26.5.0 (57613); after an update run `prepare` and `install` again, and on another
-  build expect the address-based patches not to apply (the shim says so in the trace and touches nothing).
+- Tested only on Parallels build 26.5.0 (57613); after an update run `prepare` and `install` again. On another build the patches are searched by their bytes and applied only if found exactly once (`rhv-patchcheck <prl_vm_app> <libMonitor.dylib>` shows what is there); if not, the shim says so in its log and touches nothing.
 - Not verified: sleep/wake, `kextunload`, sustained load, guests other than Windows 11, snapshot/suspend
   with several vCPUs, the `hv_vm_space_*` address spaces.
 - The "Why did my PC restart?" window after unplanned stops: see the tips above.

@@ -168,19 +168,109 @@ static void real(const char *path, const struct rhv_patch *p, size_t expect_off)
     free(b);
 }
 
+static void real_any(const char *path, const struct rhv_patch *forms, unsigned n, size_t expect_off)
+{
+    size_t len, off = 0;
+    unsigned which = 0;
+    unsigned char *b = slurp(path, &len);
+    if (!b) {
+        printf("  skip %s (not installed)\n", forms[0].name);
+        return;
+    }
+    rhv_patch_result r = rhv_patch_locate_any(b, len, forms, n, &off, &which);
+    printf("  %s: %s at %#zx\n", forms[which].name, rhv_patch_result_name(r), off);
+    CHECK(r == RHV_PATCH_APPLIED);
+    if (expect_off)
+        CHECK(expect_off >= off && expect_off < off + 40);
+    free(b);
+}
+
+/* The Parallels vendor check in other registers and with the other branches; and two of them at once is refused. */
+static void test_vendor_forms(void)
+{
+    unsigned char buf[0x100];
+    size_t off = 0;
+    unsigned which = 9;
+    struct { const char *bytes; int len; int branch; unsigned form; } cases[] = {
+        { "\x48\x81\xf1\x6e\x74\x65\x6c\x48\x09\xc1\x74\x33", 12, 10, 0 },                          /* rcx, je short */
+        { "\x48\x81\xf3\x6e\x74\x65\x6c\x48\x09\xc3\x0f\x84\x10\x02\x00\x00", 16, 10, 1 },      /* rbx, je near */
+        { "\x48\x81\xf6\x6e\x74\x65\x6c\x48\x09\xc6\x75\x09", 12, 10, 2 },                          /* rsi, jne short */
+        { "\x48\x81\xf7\x6e\x74\x65\x6c\x48\x09\xc7\x0f\x85\x00\x01\x00\x00", 16, 10, 3 },      /* rdi, jne near */
+    };
+    for (unsigned i = 0; i < 4; i++) {
+        memset(buf, 0xcc, sizeof(buf));
+        memcpy(buf + 0x40, cases[i].bytes, (size_t)cases[i].len);
+        CHECK(rhv_patch_locate_any(buf, sizeof(buf), rhv_patch_prl_vendor, rhv_patch_prl_vendor_count, &off, &which) == RHV_PATCH_APPLIED);
+        CHECK(off == 0x40 && which == cases[i].form);
+        CHECK(rhv_patch_apply(buf + off, &rhv_patch_prl_vendor[which]) == 0);
+        /* the branch is now taken always (je -> jmp) or never (jne -> nops) */
+        if (i == 0) CHECK(buf[0x40 + 10] == 0xeb && buf[0x40 + 11] == 0x33);
+        if (i == 1) CHECK(buf[0x40 + 10] == 0x90 && buf[0x40 + 11] == 0xe9 && buf[0x40 + 12] == 0x10);
+        if (i == 2) CHECK(buf[0x40 + 10] == 0x90 && buf[0x40 + 11] == 0x90);
+        if (i == 3) for (int k = 10; k < 16; k++) CHECK(buf[0x40 + k] == 0x90);
+        CHECK(rhv_patch_locate_any(buf, sizeof(buf), rhv_patch_prl_vendor, rhv_patch_prl_vendor_count, &off, &which) == RHV_PATCH_ALREADY);
+    }
+    /* two places in one image: nothing is touched */
+    memset(buf, 0xcc, sizeof(buf));
+    memcpy(buf + 0x20, cases[0].bytes, 12);
+    memcpy(buf + 0x80, cases[2].bytes, 12);
+    CHECK(rhv_patch_locate_any(buf, sizeof(buf), rhv_patch_prl_vendor, rhv_patch_prl_vendor_count, &off, &which) == RHV_PATCH_AMBIGUOUS);
+    /* a different constant, or a different instruction after it: not found */
+    memset(buf, 0xcc, sizeof(buf));
+    memcpy(buf + 0x40, "\x48\x81\xf2\x6e\x74\x65\x6d\x48\x09\xc2\x74\x33", 12);
+    CHECK(rhv_patch_locate_any(buf, sizeof(buf), rhv_patch_prl_vendor, rhv_patch_prl_vendor_count, &off, &which) == RHV_PATCH_NOT_FOUND);
+    memcpy(buf + 0x40, "\x48\x81\xf2\x6e\x74\x65\x6c\x48\x31\xc2\x74\x33", 12);
+    CHECK(rhv_patch_locate_any(buf, sizeof(buf), rhv_patch_prl_vendor, rhv_patch_prl_vendor_count, &off, &which) == RHV_PATCH_NOT_FOUND);
+}
+
+/* The keyboard handler of a build whose bytes differ (here: a register other than ebx, so the exact pattern fails): found through its log string. */
+static void test_monitor_kbd_anchored(void)
+{
+    unsigned char buf[0x2000];
+    struct rhv_monitor_kbd k;
+    const size_t at = 0x300, second = 0x1800, armed_base = 0x1000, mov_off = 0x4a0, str = 0x1c00;
+    memset(buf, 0x90, sizeof(buf));
+    memcpy(buf + at, kbd_fn, sizeof(kbd_fn));
+    put32(buf + at + KBD_CMP + 2, (int32_t)(second - (at + KBD_CMP + 7)));
+    put32(buf + at + KBD_LEA + 3, (int32_t)(armed_base - (at + KBD_LEA + 7)));
+    put32(buf + at + KBD_LEA + 9, (int32_t)mov_off);
+    /* the lea rcx,[rip+d] that loads the string: bytes 48 8d 0d 67 de 0c 00 in the handler */
+    size_t x = 0;
+    for (size_t i = 0; i + 7 < sizeof(kbd_fn); i++)
+        if (kbd_fn[i] == 0x48 && kbd_fn[i + 1] == 0x8d && kbd_fn[i + 2] == 0x0d && kbd_fn[i + 3] == 0x67 && kbd_fn[i + 4] == 0xde) { x = i; break; }
+    CHECK(x != 0);
+    put32(buf + at + x + 3, (int32_t)(str - (at + x + 7)));
+    memcpy(buf + str, "POST CODE: 0x%x", 16);
+    buf[at + 7] = 0xb9;                    /* mov ebx,2 -> mov ecx,2: the exact pattern is gone */
+    CHECK(rhv_find_monitor_kbd(buf, sizeof(buf), &k) == RHV_PATCH_APPLIED);
+    CHECK(k.handler == at && k.second == second && k.armed == armed_base + mov_off);
+    /* without the string: not found; a second copy of the string: refused */
+    buf[str] = 'X';
+    CHECK(rhv_find_monitor_kbd(buf, sizeof(buf), &k) == RHV_PATCH_NOT_FOUND);
+    buf[str] = 'P';
+    memcpy(buf + str + 0x40, "POST CODE: 0x%x", 16);
+    CHECK(rhv_find_monitor_kbd(buf, sizeof(buf), &k) == RHV_PATCH_AMBIGUOUS);
+    memset(buf + str + 0x40, 0, 16);
+    /* the handler no longer compares the count with 1: refused */
+    buf[at + 14] = 0x02;
+    CHECK(rhv_find_monitor_kbd(buf, sizeof(buf), &k) == RHV_PATCH_NOT_FOUND);
+}
+
 int main(void)
 {
     test_basic();
     test_ambiguous_and_edges();
     test_branches();
     test_monitor_kbd();
+    test_vendor_forms();
+    test_monitor_kbd_anchored();
 
     const char *prl = "/Applications/Parallels Desktop.app/Contents/MacOS";
     char path[1024];
     snprintf(path, sizeof(path), "%s/libMonitor.dylib", prl);
-    real(path, &rhv_patch_prl_vendor, 0x207b5);
+    real_any(path, rhv_patch_prl_vendor, rhv_patch_prl_vendor_count, 0x207b5);
     snprintf(path, sizeof(path), "%s/Parallels VM.app/Contents/MacOS/prl_vm_app.orig", prl);
-    real(path, &rhv_patch_prl_vendor, 0xc1c61);
+    real_any(path, rhv_patch_prl_vendor, rhv_patch_prl_vendor_count, 0xc1c61);
     {
         size_t len;
         snprintf(path, sizeof(path), "%s/libMonitor.dylib", prl);

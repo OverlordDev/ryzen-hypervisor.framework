@@ -19,6 +19,8 @@ final class Model: ObservableObject {
     @Published var kextDone = false
 
     @Published var parallelsWrapper = ""
+    @Published var parallelsCodeCheck = ""      // output of `rhv parallels check`: is the code RyzenHV patches in the installed Parallels?
+    @Published var parallelsCodeOK = false
     @Published var dockerWrapper = ""
     @Published var nativeMode = false          // the kext is the hypervisor provider (booted with rhv_hv=1)
     @Published var hvSupport = ""              // sysctl kern.hv_support
@@ -69,6 +71,8 @@ final class Model: ObservableObject {
             checks = []
             kextLoaded = false
             parallelsWrapper = ""
+            parallelsCodeCheck = ""
+            parallelsCodeOK = false
             dockerWrapper = ""
             nativeMode = false
             hvSupport = ""
@@ -84,6 +88,14 @@ final class Model: ObservableObject {
         hvSupport = (await Shell.run("/usr/sbin/sysctl", ["-n", "kern.hv_support"])).output.trimmingCharacters(in: .whitespacesAndNewlines)
         autostartStatus = await Shell.run(dir.appendingPathComponent("libexec/hv-sysctl-daemon.sh").path, ["status"]).output
         parallelsWrapper = await Shell.run(dir.appendingPathComponent("libexec/parallels-shim.sh").path, ["status"]).output
+        if parallelsInstalled {
+            let code = await Shell.run(dir.appendingPathComponent("rhv").path, ["parallels", "check"])
+            parallelsCodeCheck = code.output
+            parallelsCodeOK = code.status == 0
+        } else {
+            parallelsCodeCheck = ""
+            parallelsCodeOK = false
+        }
         dockerWrapper = await Shell.run(dir.appendingPathComponent("libexec/docker-desktop-shim.sh").path, ["status"]).output
     }
 
@@ -192,6 +204,8 @@ final class Model: ObservableObject {
     var parallelsBuild: String? { Apps.build(of: Apps.parallels) }
     var parallelsSupportedBuild: String { bundleDir.flatMap { Store.value("parallels_build", in: $0) } ?? "57613" }
     var parallelsSupported: Bool { parallelsBuild == parallelsSupportedBuild }
+    /// The tested build, or another one whose code RyzenHV's patches are found in (`rhv parallels check`, searched by the bytes).
+    var parallelsUsable: Bool { parallelsSupported || parallelsCodeOK }
     var parallelsEnabled: Bool { parallelsWrapper.contains("wrapper installed") }
     var parallelsNative: Bool { parallelsWrapper.contains("mode: native") }
 
@@ -215,6 +229,7 @@ final class Model: ObservableObject {
     func enableParallelsNative() {
         guard let dir = bundleDir else { return }
         task("Enabling Parallels Desktop (native mode)") { [self] in
+            guard parallelsUsable else { say("This Parallels build cannot be patched: the code RyzenHV patches was not found.\n\(parallelsCodeCheck)"); return }
             guard nativeMode else { say("The kext is not in native mode: install it with “Native mode” on the Install page, restart, then try again."); return }
             guard hvSupport == "1" else { say("kern.hv_support is \(hvSupport.isEmpty ? "unknown" : hvSupport): Parallels would use its own engine. Open “Automatic start” first."); return }
             let script = dir.appendingPathComponent("libexec/parallels-shim.sh").path

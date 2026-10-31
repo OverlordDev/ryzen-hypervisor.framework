@@ -41,6 +41,7 @@ test: | $(BUILD)
 tools: | $(BUILD)
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-info tools/rhv-info/main.c \
 		-framework IOKit -framework CoreFoundation
+	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-patchcheck tools/rhv-patchcheck/main.c shim/rhv_patch.c
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-guest-test tools/rhv-guest-test/main.c \
 		-framework IOKit -framework CoreFoundation
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-map-test tools/rhv-map-test/main.c \

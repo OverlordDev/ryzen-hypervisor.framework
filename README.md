@@ -14,7 +14,7 @@ so the unmodified apps run.
 | software | state |
 |---|---|
 | **Docker Desktop 4.97.0** (the Intel build) | works with Docker's own, unmodified files: engine, `docker run`, builds, 16 vCPUs |
-| **Parallels Desktop 26.5.0** (build 57613 only) | **Windows 10 works**: 1–4 vCPUs, keyboard, network, shared folders, Parallels Tools, suspend and resume. A boot takes about 20 seconds. Windows 11 worked in the older (shim) mode |
+| **Parallels Desktop 26.5.0** (build 57613 tested; other builds are tried if their code matches, see below) | **Windows 10 works**: 1–4 vCPUs, keyboard, network, shared folders, Parallels Tools, suspend and resume. A boot takes about 20 seconds. Windows 11 worked in the older (shim) mode |
 | **VirtualBox 7.x** | experimental: version 7.2.22 runs a Windows 10 installation onto a disk (reported by a user, a second report would help). VirtualBox 6.x does **not** work (see below) |
 | **VMware Fusion 26** | **not working yet**: with 0.7.5 the BIOS and its SMM entry work and Windows starts, but the installer stops at the Windows boot logo |
 | **QEMU** with `-accel hvf` | boots Linux |
@@ -73,7 +73,7 @@ There is also a small app, **RyzenHV**, with buttons for the same steps (kext, a
 6. **Keep the Parallels Desktop app open** when you suspend a VM. With only its background service running, suspending hung twice in the author's tests and the VM
    could not be stopped until a restart. With the app open it worked every time. If you are not sure, shut Windows down instead of suspending.
 7. After you change the number of vCPUs, shut Windows down completely: `shutdown /s /full /t 0` (Windows' "fast startup" would remember the old count).
-8. After a Parallels update run `./rhv parallels native` again. Only build 57613 (26.5.0) is supported.
+8. After a Parallels update run `./rhv parallels native` again. Only build 57613 (26.5.0) has been tested. For another build `./rhv parallels` looks at the installed files (`./rhv parallels check` shows the same): the places RyzenHV patches (the CPU-vendor check in `prl_vm_app` and in `libMonitor.dylib`, and libMonitor's keyboard handler) are searched by their bytes, in the few forms the same code can take, and the setup goes on only if each is found exactly once, with a warning that the build is untested. If one is not found it stops and says which.
 
 ### VirtualBox 7.x
 
