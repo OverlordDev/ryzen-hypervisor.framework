@@ -46,8 +46,10 @@ prepare)
     [ "$(id -u)" != 0 ] || { echo "run prepare as yourself, not with sudo" >&2; exit 1; }
     [ -d "$APP" ] || { echo "Parallels is not installed at $APP" >&2; exit 1; }
     SRC_BIN="$(pristine)"
-    codesign -dv "$SRC_BIN" 2>&1 | grep -q "TeamIdentifier=4C6364ACXT" || \
-        { echo "$SRC_BIN is not Parallels' signed binary (a leftover of an older install?); run: sudo $0 uninstall" >&2; exit 1; }
+    # The file to copy must be a real executable, not a wrapper left by an install of ours (its first bytes are "#!"). Whose signature it carries does not matter.
+    if [ ! -f "$SRC_BIN" ] || head -c 2 "$SRC_BIN" | grep -q '#!'; then
+        echo "$SRC_BIN is not Parallels' own executable but a script (a leftover wrapper of an older install?); run: sudo $0 uninstall" >&2; exit 1
+    fi
     rm -rf "$OWNER_HOME/.ryzenhv/prl"
     mkdir -p "$FARM/Contents/Frameworks" "$FARM/Contents/MacOS"
     # Everything that is not ours points at the real app.

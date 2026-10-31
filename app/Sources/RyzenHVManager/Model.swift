@@ -66,6 +66,9 @@ final class Model: ObservableObject {
     }
 
     func refreshNow() async {
+        if let installed = await Store.installEmbedded() {
+            say("Installed the release bundle that comes with the app: version \(installed).")
+        }
         bundleVersion = Store.current?.version
         guard let dir = bundleDir else {
             checks = []

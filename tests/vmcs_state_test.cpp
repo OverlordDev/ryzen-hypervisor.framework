@@ -44,6 +44,10 @@ void testStateFields()
     CHECK(f.vmcb.save.rip == 0x1000 && rd(f, 0x681e) == 0x1000);
     CHECK(f.st.write(0x681c, 0xfff0) == R_OK && f.vmcb.save.rsp == 0xfff0);
     CHECK(f.st.write(0x6800, 0x80050033) == R_OK && f.vmcb.save.cr0 == 0x80050033);
+    CHECK(f.st.write(0x6800, 0x20000030) == R_OK && f.vmcb.save.cr0 == 0x30);     /* NW without CD is invalid on AMD ... */
+    { uint64_t c0 = 0; CHECK(f.st.read(0x6800, &c0) == R_OK && c0 == 0x20000030); }   /* ... but reads back */
+    CHECK(f.st.write(0x6800, 0x60000010) == R_OK && f.vmcb.save.cr0 == 0x60000010);   /* CD+NW is fine */
+    CHECK(f.st.write(0x6800, 0x80050033) == R_OK && f.vmcb.save.cr0 == 0x80050033);
     CHECK(f.st.write(0x6802, 0x1234000) == R_OK && f.vmcb.save.cr3 == 0x1234000);
     CHECK(f.st.write(0x6804, 0x2620) == R_OK && f.vmcb.save.cr4 == 0x620);   /* VMXE (bit 13) never reaches the VMCB ... */
     { uint64_t c4 = 0; CHECK(f.st.read(0x6804, &c4) == R_OK && c4 == 0x2620); }   /* ... but reads back */

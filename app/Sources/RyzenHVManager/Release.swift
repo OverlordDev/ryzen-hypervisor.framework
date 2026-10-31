@@ -108,6 +108,50 @@ enum Store {
 
     static var current: (version: String, dir: URL)? { bundles().first }
 
+    /// The release bundle shipped inside the app (Contents/Resources/bundle/ryzenhv-<version>), if this app was built with one.
+    static var embedded: (version: String, dir: URL)? {
+        guard let res = Bundle.main.resourceURL?.appendingPathComponent("bundle"),
+              let names = try? FileManager.default.contentsOfDirectory(atPath: res.path) else { return nil }
+        return names.filter { $0.hasPrefix("ryzenhv-") }
+            .map { res.appendingPathComponent($0) }
+            .filter { FileManager.default.fileExists(atPath: $0.appendingPathComponent("rhv").path) }
+            .map { (version(of: $0) ?? String($0.lastPathComponent.dropFirst(8)), $0) }
+            .sorted { $0.version.compare($1.version, options: .numeric) == .orderedDescending }
+            .first
+    }
+
+    /// Copies the embedded bundle to the store when it is newer than every bundle there (or there is none), so that the app works at once, offline, and runs the scripts
+    /// from a writable folder with a fixed path. Returns the version that was installed.
+    static func installEmbedded() async -> String? {
+        guard ProcessInfo.processInfo.environment["RHV_BUNDLE"] == nil, let emb = embedded else { return nil }
+        if let have = bundles().first {
+            let order = have.version.compare(emb.version, options: .numeric)
+            if order == .orderedDescending { return nil }
+            if order == .orderedSame {
+                // the same version rebuilt later (VERSION has built=<seconds>) replaces the copy that is in the store
+                let haveBuilt = Int(value("built", in: have.dir) ?? "") ?? 0
+                let embBuilt = Int(value("built", in: emb.dir) ?? "") ?? 0
+                if haveBuilt >= embBuilt { return nil }
+            }
+        }
+        let fm = FileManager.default
+        let dest = root.appendingPathComponent("ryzenhv-" + emb.version)
+        let partial = root.appendingPathComponent(".ryzenhv-\(emb.version).partial")
+        do {
+            try fm.createDirectory(at: root, withIntermediateDirectories: true)
+            try? fm.removeItem(at: partial)
+            try? fm.removeItem(at: dest)
+            try fm.copyItem(at: emb.dir, to: partial)
+            // the app came from a browser: its files carry the quarantine flag, which would stop the scripts and tools from running
+            _ = await Shell.run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", partial.path])
+            try fm.moveItem(at: partial, to: dest)
+            return emb.version
+        } catch {
+            try? fm.removeItem(at: partial)
+            return nil
+        }
+    }
+
     /// A value from the bundle's VERSION file (version=, abi=, parallels_build=).
     static func value(_ key: String, in dir: URL) -> String? {
         guard let text = try? String(contentsOf: dir.appendingPathComponent("VERSION"), encoding: .utf8) else { return nil }

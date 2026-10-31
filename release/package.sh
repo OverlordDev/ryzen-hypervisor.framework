@@ -47,7 +47,7 @@ cp docs/PARALLELS.md docs/DOCKER.md docs/DOCKER-DESKTOP.md docs/NATIVE.md docs/R
 cp release/README-BUNDLE.md "$S/START-HERE.md"
 cp release/LICENSES/* "$S/LICENSES/"
 cp LICENSE "$S/LICENSES/RyzenHV-LICENSE" 2>/dev/null || true
-printf 'version=%s\nabi=%s\nparallels_build=57613\n' "$VER" "$ABI" > "$S/VERSION"
+printf 'version=%s\nabi=%s\nparallels_build=57613\nbuilt=%s\n' "$VER" "$ABI" "$(date +%s)" > "$S/VERSION"
 find "$S" -name '.DS_Store' -delete
 find "$S" -name '*.dSYM' -prune -exec rm -rf {} \;
 

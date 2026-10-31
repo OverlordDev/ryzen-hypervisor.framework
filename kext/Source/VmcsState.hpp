@@ -36,6 +36,7 @@ enum : uint32_t {
     F_CPU_BASED2         = 0x401e,
     F_CR0_MASK           = 0x6000,
     F_CR4_MASK           = 0x6002,
+    F_GUEST_CR0          = 0x6800,
     F_GUEST_CR4          = 0x6804,
     F_RO_INSTR_ERROR     = 0x4400,
     F_RO_EXIT_REASON     = 0x4402,
@@ -90,6 +91,10 @@ enum : uint32_t { V4_RDTSCP_BIT = 1u << 7, V4_XSETBV_BIT = 1u << 13 };
 /* CR4.VMXE: Intel clients (QEMU's HVF backend) always set it in the guest CR4 and hide it with the CR4 mask/shadow. It
  * is reserved on AMD and makes VMRUN fail with VMEXIT_INVALID, so it never reaches the VMCB; the field remembers it. */
 static const uint64_t CR4_VMXE = 1ull << 13;
+/* CR0.NW without CD is illegal guest state on AMD (VMRUN fails with VMEXIT_INVALID); Intel accepts it in a VMCS, and
+ * the Android emulator (QEMU's HVF backend) writes exactly that on reset. NW is kept in the field and dropped from the VMCB. */
+static const uint64_t CR0_NW = 1ull << 29;
+static const uint64_t CR0_CD = 1ull << 30;
 static const uint64_t EFER_LME = 1ull << 8;
 static const uint64_t EFER_LMA = 1ull << 10;
 static const uint32_t INT_CTL_V_IRQ = 1u << 8;
@@ -150,6 +155,8 @@ public:
             uint64_t v = loadBytes(m.vmcbOff, m.vmcbSize);
             if (enc == F_GUEST_CR4)
                 v |= fShadow[idx] & CR4_VMXE;
+            else if (enc == F_GUEST_CR0)
+                v |= fShadow[idx] & CR0_NW;
             *out = v & mask(fieldBytes(enc));
             return R_OK;
         }
@@ -190,6 +197,10 @@ public:
             if (enc == F_GUEST_CR4) {
                 fShadow[idx] = value & CR4_VMXE;
                 value &= ~CR4_VMXE;
+            } else if (enc == F_GUEST_CR0) {
+                fShadow[idx] = value & CR0_NW;
+                if (!(value & CR0_CD))
+                    value &= ~CR0_NW;
             }
             storeBytes(m.vmcbOff, m.vmcbSize, value);
             return R_OK;
