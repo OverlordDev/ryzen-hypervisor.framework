@@ -103,6 +103,9 @@ SVM is turned off before sleep (`sleep: turning SVM off`) and turned on again af
 (`wake: SVM re-enabled on N CPUs`). To check: put the machine to sleep, wake it, then `rhv-info stats`
 (`sleepEvents` and `wakeEvents` must grow) and `sudo rhv-info selftest`.
 
+`sleep:` and `wake:` also log the TSC and the Mach clocks. If the TSC went back across the sleep (it can restart on wake) the log says
+`wake: the TSC went back by ...`; each running guest then gets that added to its TSC offset. A VM that is running during sleep waits in `VmRun` until the wake.
+
 If sleep does not work at all on a Ryzentosh laptop regardless of this kext, fix that first, it is a separate topic.
 
 ## If booting is broken

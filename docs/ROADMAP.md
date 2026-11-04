@@ -10,7 +10,7 @@ Each phase has a verifiable acceptance criterion. We do not move on until it is 
 - [x] The `rhv-info` tool (info, log, counters, log level, self-test)
 - [x] Kernel ring log with levels, event counters, `RHV_SYNC` before dangerous operations
 - [x] Emergency switch `-rhv_off`, the `rhv_selftest` self-test
-- [x] SVM disable/enable on sleep and wake (not verified on hardware)
+- [x] SVM disable/enable on sleep and wake (verified with Docker Desktop on one machine; a running VM waits for the wake and keeps its TSC continuous)
 - [x] The `collect-debug.sh` and `install-to-efi.sh` scripts
 - [x] **Build on a Ryzentosh**: `make test tools shim kext` passes on Sequoia 15.8.1 (SDK 26.2), the kext's symbols resolve against kernel 24.6 (`kmutil libraries`)
 - [x] Load the kext, `rhv-info` shows SVM supported and NPT (5800H: family 0x19 model 0x50, 16 cores, 32768 ASIDs)
@@ -63,7 +63,7 @@ Details and instructions: `docs/PHASE2.md`.
 
 - [ ] Front end A: interception at kernel level, applications work without `DYLD_INSERT_LIBRARIES`
 - [ ] Docker Desktop / Android Emulator
-- [ ] Sleep/wake (S3): verify on hardware (the code exists, see phase 0), add saving of VM state
+- [ ] Sleep/wake (S3): verified for Docker Desktop on one machine; other VM programs, sleeps of hours and saving of VM state remain
 - [ ] Access model (who may create VMs), resource limits
 - [ ] Compatibility with new AMD Vanilla patches
 

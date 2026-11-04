@@ -56,5 +56,6 @@ Undo: `./rhv docker-desktop undo` (or `./scripts/docker-desktop-shim.sh uninstal
 - The VM defaults to all cores and 8 GB (Docker Desktop > Settings > Resources). Idle it uses about 0.5% CPU and 370 MB.
 - A HyperKit that was killed leaves its pid file behind; the wrapper removes a stale one before starting, so a force-quit is harmless.
   HyperKit's own messages are appended to `~/.ryzenhv/hyperkit.log`.
-- Not tried: Kubernetes, Docker Desktop extensions, sleep/wake, running together with Parallels, other macOS versions.
+- Sleep/wake: a running Docker survives sleeps of about 2 and 10 minutes on a Ryzen 5 5600X (macOS 15.8.2); the guest clock stops during the sleep and the wall clock is correct after wake. Not tried: sleeps of hours, hibernation.
+- Not tried: Kubernetes, Docker Desktop extensions, running together with Parallels, other macOS versions.
 - Docker Desktop is Docker's product under Docker's licence. This repository contains nothing of it: the script patches the copy on your machine.

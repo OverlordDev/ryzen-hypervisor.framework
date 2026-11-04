@@ -23,7 +23,7 @@ Tested on one machine: **Ryzen 7 5800H, macOS Sequoia 15.8.1, OpenCore**. macOS 
 when the kext started, so SVM was switched on for that core only and VMs did not run. Version 0.7.4 looks for the late cores again when a VM starts; that user confirmed that
 Parallels (the older shim mode) then runs a fresh Windows 11 LTSC installation, also with 3D acceleration on an RX 6800.
 
-**Not verified:** sleep and wake of the Mac, runs of many hours, 3D acceleration in Parallels (it crashes with the third-party NVIDIA Metal driver on the author's machine, keep it
+**Not verified:** sleep and wake of the Mac for anything but Docker Desktop (see below), runs of many hours, 3D acceleration in Parallels (it crashes with the third-party NVIDIA Metal driver on the author's machine, keep it
 off there; it works on an AMD GPU according to a user), Windows 11 or Linux guests in Parallels' native mode, other Parallels builds.
 
 ## Install (the ready-made build)
@@ -96,7 +96,7 @@ There is also a small app, **RyzenHV**, with buttons for the same steps (kext, a
 
 ### For every VM
 
-- Shut the VMs down before you restart the Mac. Sleep and wake of the Mac with a running VM has not been tested.
+- Shut the VMs down before you restart the Mac. Sleep and wake with a running VM has only been tested with Docker Desktop (HyperKit) on one machine, for sleeps of up to about 10 minutes: the VM keeps running. Other VM programs and long sleeps are untested.
 - One VM program at a time is the safest. Docker next to a running Parallels VM worked in short tests.
 - If a VM does not start, first check `sysctl kern.hv_support`: it must print **1**. If it prints 0, run `./rhv autostart install` (once) or `./bin/rhv-info hv sysctl 1`.
 
