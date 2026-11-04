@@ -557,6 +557,7 @@ bool com_overlorddev_RyzenHVVm::init()
     fFpuSize       = 0;
     fKick          = 0;
     fHasTscAux     = false;
+    fTscApplied    = 0;
     fRunCpu        = -1;
     fFirstRun    = true;
     fHaveNextRip = false;
@@ -866,8 +867,17 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 
     bool rescanned  = false;          /* CPUs that came online after the kext started: look for them once per run */
     bool needRescan = false;
+    bool needWake   = false;          /* the host is going to sleep or just woke: wait for the SVM code to be back on */
 
     for (;;) {
+        if (needWake) {               /* interrupts on, no page-table lock held */
+            needWake = false;
+            rc = svm::waitResumed();
+            if (rc != kIOReturnSuccess) {
+                RHV_WARN("VmRun: wait for wake aborted, not entering the guest");
+                break;
+            }
+        }
         if (needRescan) {             /* outside the page-table lock and with interrupts on: it runs a rendezvous and may allocate */
             needRescan = false;
             svm::rescan();
@@ -914,6 +924,12 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             ml_set_interrupts_enabled(ints);
             continue;
         }
+        if (svm::suspended()) {           /* sleep: the guest resumes after wake instead of failing the client's hv_vcpu_run */
+            fRunCpu = -1;
+            ml_set_interrupts_enabled(ints);
+            needWake = true;
+            continue;
+        }
         if (!svm::activeOnAllUsable() && !rescanned) {
             fRunCpu = -1;
             ml_set_interrupts_enabled(ints);
@@ -927,6 +943,13 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             RHV_ERR("VmRun: SVM was turned off under us (sleep?), not entering the guest");
             rc = kIOReturnNotReady;
             break;
+        }
+
+        /* The host TSC went back across a sleep: move this guest's TSC offset by the same amount (interrupts are off, no sleep can start now). */
+        const uint64_t tscAdj = svm::tscAdjustment();
+        if (tscAdj != fTscApplied) {
+            v->control.tscOffset += tscAdj - fTscApplied;
+            fTscApplied = tscAdj;
         }
 
         /* activeOnAllUsable() counts what enableAll() did; this looks at THIS cpu's EFER, because CLGI without SVME is a #UD panic. */

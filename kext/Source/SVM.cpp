@@ -34,6 +34,7 @@ uint64_t                  gHostSavePa[RHV_MAX_CPUS];
 uint8_t                   gSeenCpu[RHV_MAX_CPUS];     /* this CPU has been probed */
 uint8_t                   gOn[RHV_MAX_CPUS];          /* SVM is on here (counted in gActive) */
 IOLock                   *gRescanLock;
+IOLock                   *gWakeLock;                 /* gSuspended changes and waitResumed() sleeps under it */
 volatile SInt32           gNewCpus;                   /* CPUs a rescan found */
 volatile SInt32           gRescanSeen;                /* CPUs a rescan's rendezvous reached */
 bool                      gWantEnabled;               /* enableAll() succeeded: CPUs that show up later get SVM too */
@@ -44,6 +45,8 @@ volatile SInt32           gSeen;      /* CPUs that ran probeAction */
 volatile SInt32           gMaxIndex;  /* highest cpu_number() seen */
 volatile bool             gReadMsrs = true;   /* set before the probe rendezvous */
 bool                      gSuspended;
+uint64_t                  gTscAtSleep;                /* host TSC when suspend() ran */
+uint64_t                  gTscAdjust;                 /* total the TSC was found behind after wakes, see tscAdjustment() */
 
 bool cpuUsable(const CpuProbe &p)
 {
@@ -257,6 +260,8 @@ void probe(RHVInfo *out, bool readMsrs)
 {
     if (!gRescanLock)
         gRescanLock = IOLockAlloc();
+    if (!gWakeLock)
+        gWakeLock = IOLockAlloc();
     bzero(gProbe, sizeof(gProbe));
     bzero(gSeenCpu, sizeof(gSeenCpu));
     gReadMsrs = readMsrs;
@@ -357,16 +362,31 @@ void disableAll()
     freeHostSave();
 }
 
+/* The clocks a guest's time depends on, to see what sleep did to them (a TSC that restarts on wake would put the guest's clock back). */
+static uint64_t logClocks(const char *what)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    RHV_INFO("%s: tsc 0x%llx, mach_absolute_time %llu, mach_continuous_time %llu", what,
+             (unsigned long long)(((uint64_t)hi << 32) | lo), (unsigned long long)mach_absolute_time(),
+             (unsigned long long)mach_continuous_time());
+    return ((uint64_t)hi << 32) | lo;
+}
+
 void suspend()
 {
     if (!gActive)
         return;
 
     RHV_SYNC("sleep: turning SVM off, host save areas are kept");
+    gTscAtSleep = logClocks("sleep");
+    /* Before the rendezvous, so a VmRun that finds SVM off can tell sleep from a failure and wait for resume(). */
+    IOLockLock(gWakeLock);
+    __atomic_store_n(&gSuspended, true, __ATOMIC_SEQ_CST);
+    IOLockUnlock(gWakeLock);
     mp_rendezvous_no_intrs(disableAction, nullptr);
     gActive    = 0;
     bzero(gOn, sizeof(gOn));
-    gSuspended = true;
 }
 
 uint32_t resume()
@@ -375,10 +395,26 @@ uint32_t resume()
         return 0;
 
     RHV_SYNC("wake: turning SVM back on");
-    gSuspended = false;
+    const uint64_t tscNow = logClocks("wake");
     gActive    = 0;
     bzero(gOn, sizeof(gOn));
     mp_rendezvous_no_intrs(enableAction, nullptr);
+    /* After the rendezvous: a VmRun waiting in waitResumed() must not run before every CPU has SVM on again. */
+    /*
+     * On this hardware the TSC can restart from zero across sleep. A guest's TSC is host TSC + offset, so it would then
+     * stand still (or go back) until the host TSC has caught up again, and a Linux guest's clock freezes for as long as
+     * the machine ran before it slept. Count how far behind the TSC is; each vCPU adds that to its offset before its next
+     * VMRUN (tscAdjustment()). A TSC that did not go back is left alone.
+     */
+    if (tscNow < gTscAtSleep) {
+        __atomic_store_n(&gTscAdjust, gTscAdjust + (gTscAtSleep - tscNow), __ATOMIC_SEQ_CST);
+        RHV_INFO("wake: the TSC went back by 0x%llx, guests get it added to their TSC offset",
+                 (unsigned long long)(gTscAtSleep - tscNow));
+    }
+    IOLockLock(gWakeLock);
+    __atomic_store_n(&gSuspended, false, __ATOMIC_SEQ_CST);
+    IOLockWakeup(gWakeLock, &gSuspended, false);        /* every VmRun waiting in waitResumed() */
+    IOLockUnlock(gWakeLock);
 
     uint32_t active = (uint32_t)gActive;
     if (active != usableCount())
@@ -430,9 +466,40 @@ uint32_t activeCpuCount()
     return (uint32_t)gActive;
 }
 
+uint64_t tscAdjustment()
+{
+    return __atomic_load_n(&gTscAdjust, __ATOMIC_SEQ_CST);
+}
+
+bool suspended()
+{
+    return __atomic_load_n(&gSuspended, __ATOMIC_SEQ_CST);
+}
+
+IOReturn waitResumed()
+{
+    /*
+     * No time limit on purpose. The machine stays awake for a while after the sleep notification (about 30 s were seen)
+     * and then stops completely, so any budget counted from suspend() either runs out before the machine is even off
+     * or is meaningless across the sleep. The wait ends when resume() has finished, or when the thread is aborted
+     * (the client process is killed): THREAD_ABORTSAFE makes the sleep interruptible.
+     */
+    IOReturn rc = kIOReturnSuccess;
+    IOLockLock(gWakeLock);
+    while (suspended()) {
+        int w = IOLockSleep(gWakeLock, &gSuspended, THREAD_ABORTSAFE);
+        if (w == THREAD_INTERRUPTED || w == THREAD_RESTART) {
+            rc = kIOReturnAborted;
+            break;
+        }
+    }
+    IOLockUnlock(gWakeLock);
+    return rc;
+}
+
 bool activeOnAllUsable()
 {
-    return !gSuspended && gActive > 0 && (uint32_t)gActive == usableCount();
+    return !suspended() && gActive > 0 && (uint32_t)gActive == usableCount();
 }
 
 int ensureThisCpu()
