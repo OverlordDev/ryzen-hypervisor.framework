@@ -96,7 +96,7 @@ There is also a small app, **RyzenHV**, with buttons for the same steps (kext, a
 
 ### For every VM
 
-- Shut the VMs down before you restart the Mac. Sleep and wake with a running VM has only been tested with Docker Desktop (HyperKit) on one machine, for sleeps of up to about 10 minutes: the VM keeps running. Other VM programs and long sleeps are untested.
+- Shut the VMs down before you restart the Mac. Sleep and wake with a running VM has only been tested with Docker Desktop (HyperKit) on one machine, for sleeps of up to about 10 minutes with a running container and once for 7 hours with an idle Docker VM: the VM keeps running. Other VM programs and a running container through a long sleep are untested.
 - One VM program at a time is the safest. Docker next to a running Parallels VM worked in short tests.
 - If a VM does not start, first check `sysctl kern.hv_support`: it must print **1**. If it prints 0, run `./rhv autostart install` (once) or `./bin/rhv-info hv sysctl 1`.
 

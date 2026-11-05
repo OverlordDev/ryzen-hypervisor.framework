@@ -63,7 +63,7 @@ Details and instructions: `docs/PHASE2.md`.
 
 - [ ] Front end A: interception at kernel level, applications work without `DYLD_INSERT_LIBRARIES`
 - [ ] Docker Desktop / Android Emulator
-- [ ] Sleep/wake (S3): verified for Docker Desktop on one machine; other VM programs, sleeps of hours and saving of VM state remain
+- [ ] Sleep/wake (S3): verified for Docker Desktop on one machine; other VM programs, a running VM through a sleep of hours and saving of VM state remain
 - [ ] Access model (who may create VMs), resource limits
 - [ ] Compatibility with new AMD Vanilla patches
 
