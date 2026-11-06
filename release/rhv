@@ -453,8 +453,13 @@ docker_desktop() {
             say "The kext runs as the hypervisor provider (native): Docker Desktop is used as Docker ships it."
             "$ROOT/libexec/docker-desktop-shim.sh" status 2>/dev/null | grep -q "^installed\|half" && "$ROOT/libexec/docker-desktop-shim.sh" uninstall
             local st="$HOME/Library/Group Containers/group.com.docker/settings-store.json"
-            mkdir -p "$(dirname "$st")"; [ -f "$st" ] || echo '{}' > "$st"
-            plutil -replace UseVirtualizationFramework -bool NO "$st" || die "cannot edit $st"
+            mkdir -p "$(dirname "$st")"
+            # plutil cannot write a file that is just '{}' (it takes it for the old OpenStep format), so a missing or empty one is written whole
+            if [ ! -s "$st" ] || [ "$(tr -d ' \t\r\n' < "$st")" = "{}" ]; then
+                printf '{\n  "UseVirtualizationFramework" : false\n}\n' > "$st" || die "cannot write $st"
+            else
+                plutil -replace UseVirtualizationFramework -bool NO "$st" || die "cannot edit $st"
+            fi
             ok "Docker Desktop is set to use HyperKit (UseVirtualizationFramework=false)"
             echo "Start Docker Desktop as usual. The kext fixes HyperKit's two CPU checks in memory when it starts a VM; nothing in Docker.app changes."
             echo "If something is off: rhv-info log | grep 'client fix-ups'"

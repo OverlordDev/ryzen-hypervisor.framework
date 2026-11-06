@@ -102,8 +102,12 @@ WRAP
 
     # --- settings: HyperKit instead of Apple's Virtualization framework
     mkdir -p "$(dirname "$SETTINGS")"
-    [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
-    plutil -replace UseVirtualizationFramework -bool NO "$SETTINGS"
+    # plutil cannot write a file that is just '{}' (it takes it for the old OpenStep format), so a missing or empty one is written whole
+    if [ ! -s "$SETTINGS" ] || [ "$(tr -d ' \t\r\n' < "$SETTINGS")" = "{}" ]; then
+        printf '{\n  "UseVirtualizationFramework" : false\n}\n' > "$SETTINGS"
+    else
+        plutil -replace UseVirtualizationFramework -bool NO "$SETTINGS"
+    fi
     echo "installed: Docker Desktop in $APP now runs HyperKit through the shim"
     echo "start it as usual (Launchpad, Dock, open -a Docker)"
     ;;

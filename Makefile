@@ -1,7 +1,7 @@
 # Top-level build. Run on the Ryzentosh (needs Xcode command line tools).
 #
 #   make test     host-side unit tests, works on any OS with a C compiler
-#   make tools    build/rhv-info, build/rhv-guest-test, build/rhv-map-test, build/rhv-vmx-test, build/rhv-long-test, build/hvf-smoke
+#   make tools    build/rhv-info, build/rhv-guest-test, build/rhv-map-test, build/rhv-vmx-test, build/rhv-long-test, build/hvf-smoke, build/hvf-ro-map-test
 #   make shim     build/libryzenhv.dylib
 #   make kext     build/RyzenHV.kext   (see kext/Makefile, best effort)
 #   make all      tools + shim + kext
@@ -52,6 +52,9 @@ tools: | $(BUILD)
 		-framework IOKit -framework CoreFoundation
 	$(CC) -arch x86_64 -Wall -Wextra -Wno-nullability-completeness -O2 -o $(BUILD)/hvf-smoke tools/hvf-smoke/main.c \
 		-framework Hypervisor
+	$(CC) -arch x86_64 -Wall -Wextra -Wno-nullability-completeness -O2 -o $(BUILD)/hvf-ro-map-test tools/hvf-ro-map-test/main.c \
+		-framework Hypervisor
+	codesign -s - --force --entitlements tools/hvf-ro-map-test/hypervisor.entitlements $(BUILD)/hvf-ro-map-test
 
 SHIM_SRC := shim/hv_shim.c shim/rhv_core.c shim/rhv_iokit.c shim/rhv_patch.c
 
