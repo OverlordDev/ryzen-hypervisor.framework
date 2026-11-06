@@ -162,6 +162,7 @@ private:
     rhv::PhysMem              fHostFpu, fGuestFpu, fScratchFpu;   /* XSAVE areas, 4 KiB aligned */
     uint64_t                  fGuestXcr0;
     uint64_t                  fXcr0Supported;    /* CPUID.0xD.0 EDX:EAX */
+    uint64_t                  fTscApplied;       /* svm::tscAdjustment() already added to this vCPU's TSC offset */
     bool                      fHasTscAux;        /* the CPU has RDTSCP, so IA32_TSC_AUX */
     uint32_t                  fFpuSize;
     volatile uint32_t         fKick;

@@ -71,5 +71,6 @@ If the system keeps working stably, phase 0 is done. If something breaks after e
 - **Spoofed CPUID.** The AMD Vanilla patches make the kernel believe an Intel CPU is installed. We read `cpuid` directly
   in the kext, so we see the real AMD. Still, check in `rhv-info` that it says `CPU: AMD family 0x19 model 0x50`.
 - **Sleep/wake.** SVM state is lost after S3, so the kext turns SVM off before sleep and on again after it.
-  This logic has not been verified on hardware: after sleep look at `rhv-info stats` and `sudo rhv-info selftest`.
+  A VM that is running during sleep waits for the wake instead of failing, and the guest TSC is kept continuous (the host TSC can restart on wake).
+  Verified only with Docker Desktop on one Ryzen 5 5600X: after sleep look at `rhv-info stats` and `sudo rhv-info selftest`.
 - **Unloading.** `kextunload` calls `disableAll()`, but with an OpenCore-injected kext unloading is usually unavailable. To reset, just reboot.

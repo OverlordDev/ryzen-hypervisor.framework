@@ -36,6 +36,22 @@ void     suspend();
 uint32_t resume();
 
 /*
+ * Total ticks the host TSC was behind after the wakes so far (0 if it never went back). A vCPU adds the difference between this and what it
+ * has added already to its TSC offset, so the guest's TSC keeps going across sleep. Wraps like the offset does.
+ */
+uint64_t tscAdjustment();
+
+/* True between suspend() and the end of resume(). Lock-free. */
+bool suspended();
+
+/*
+ * For a VMRUN caller that found SVM off while suspended() is true: sleeps (interrupts on) until resume() has finished.
+ * No time limit; returns kIOReturnAborted if the thread is aborted (the client is being killed). Success at once when
+ * not suspended.
+ */
+IOReturn waitResumed();
+
+/*
  * Reads EFER and VM_HSAVE_PA back on every CPU and checks they hold what
  * enableAll() wrote. Mismatches are logged. Returns false when SVM is not
  * active. Fills *ok with the number of CPUs that match and *total with the
