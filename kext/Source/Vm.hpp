@@ -76,6 +76,7 @@ public:
     struct Backing {
         IOMemoryDescriptor *md;
         uint64_t            live;
+        IODirection         dir;      /* what prepare() was called with: complete() must use the same */
     };
 
 private:

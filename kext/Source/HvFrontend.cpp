@@ -166,7 +166,7 @@ struct HvVcpu {
     RHVFpuState fpu;
     uint8_t *msrPage;          /* this vCPU's 4 KiB page in the ro area: the managed MSR list, entries of 16 bytes {msr, value} */
     uint32_t nManaged;
-    bool     cpuidPending;     /* the last exit was a CPUID: its answer is cleaned on the way back in (HyperKit only) */
+    bool     cpuidPending;     /* the last exit was a CPUID: its answer is cleaned on the way back in */
     uint32_t cpuidLeaf;
     uint32_t cpuidSub;
     uint64_t cr2Page;          /* the CR2 word of the page as this driver last left it: a different value is the client's write (an injected #PF needs it) and is applied */
@@ -1006,16 +1006,21 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
     /* 1. What the client changed since the last run: registers from the page, VMCS fields from the dirty slots. */
     /* HyperKit answers CPUID from the host's values, which on a Ryzen are AMD's; a Linux guest then trusts features HyperKit does not emulate
      * (MWAITX in its delay loop, SVM, extended topology, AMD counters, IBPB/IBRS/SSBD enumeration). Clean the answer it just wrote. */
+    /* Every client: no PKU/OSPKE. macOS never enables PKRU in XCR0, so the guest cannot get it in its XSAVE state; a Linux guest that sees PKU
+     * sets CR4.PKE anyway and then fails every signal frame (get_xsave_addr_user(PKRU) is NULL) - the Android Emulator passes the host's leaf 7 through. */
+    if (v->cpuidPending && v->cpuidLeaf == 7 && v->cpuidSub == 0)
+        *gprWord(v, R_RCX) &= ~((1ull << 3) | (1ull << 4));
     if (v->cpuidPending && v->vm->parallels) {
         v->cpuidPending = false;
         parallelsCpuidFixup(v);
-    } else if (v->cpuidPending) {
+    } else if (v->cpuidPending && v->vm->hyperkit) {
         v->cpuidPending = false;
         if (v->cpuidLeaf == 0x80000001u)
             *gprWord(v, R_RCX) &= ~((1ull << 2) | (1ull << 22) | (1ull << 23) | (1ull << 24) | (1ull << 26) | (1ull << 27) | (1ull << 29));
         else if (v->cpuidLeaf == 0x80000008u)
             *gprWord(v, R_RBX) = 0;
     }
+    v->cpuidPending = false;
     RHVRegs regs;
     cpu->getRegs(&regs);
     regs.rax = *gprWord(v, R_RAX);
@@ -1238,7 +1243,7 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
                      (unsigned long long)inRdx, (unsigned long long)intr, (unsigned long long)cr0);
         }
     }
-    if (v->vm->hyperkit || v->vm->parallels) {
+    {
         uint64_t exitReason = 0;
         for (unsigned i = 0; i < RHV_RUN_NFIELDS; i++)
             if (kRunFields[i] == 0x4402)

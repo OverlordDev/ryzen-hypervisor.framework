@@ -269,7 +269,7 @@ void com_overlorddev_RyzenHVVmShared::dropPage(Backing *b)
 {
     if (--b->live != 0)
         return;
-    b->md->complete(kIODirectionInOut);
+    b->md->complete(b->dir);
     b->md->release();
     IOFree(b, sizeof(*b));
 }
@@ -313,19 +313,34 @@ IOReturn com_overlorddev_RyzenHVVmShared::mapDescriptorLocked(IOMemoryDescriptor
         }
     }
 
-    IOReturn rc = md->prepare(kIODirectionInOut);
+    IODirection dir = kIODirectionInOut;
+    IOReturn rc = md->prepare(dir);
     if (rc != kIOReturnSuccess) {
-        RHV_WARN("VM map: cannot pin the buffer: 0x%x", rc);
+        /* A range the process itself can only read (a firmware image mapped read-only from a file) cannot be wired for writing: protection
+         * failure. Wire it for reading and take the write right away from the guest, which could not change that memory anyway (a write is
+         * an NPT exit for the client to handle). Only after the normal way failed, so no other client changes. */
+        const IOReturn first = rc;
+        dir = kIODirectionOut;
+        rc  = md->prepare(dir);
+        if (rc == kIOReturnSuccess) {
+            RHV_WARN("VM map: gpa 0x%llx cannot be pinned for writing (0x%x), mapped read-only (requested perm %u)",
+                     (unsigned long long)gpa, first, perm);
+            perm &= ~(uint32_t)rhv::npt::PERM_W;
+        }
+    }
+    if (rc != kIOReturnSuccess) {
+        RHV_WARN("VM map: cannot pin the buffer: 0x%x (perm %u)", rc, perm);
         return rc;
     }
     Backing *b = (Backing *)IOMalloc(sizeof(Backing));
     if (!b) {
-        md->complete(kIODirectionInOut);
+        md->complete(dir);
         return kIOReturnNoMemory;
     }
     md->retain();
     b->md   = md;
     b->live = 1;          /* the builder's own reference, dropped below */
+    b->dir  = dir;
 
     uint64_t done = 0;    /* bytes of the range that are mapped so far */
     rhv::npt::Status st = fNpt.mapRange(gpa, size, perm, b, &mdSegment, md, &done);
