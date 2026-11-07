@@ -4,8 +4,9 @@
 #
 #   ./rhv                    menu
 #   ./rhv doctor             what works and what is missing on this Mac
-#   ./rhv kext [--native]    put RyzenHV.kext into your OpenCore EFI and set the boot-args (--native: the kext itself is the hypervisor
-#                            provider, no shim and no patched app files for Docker Desktop, see docs/NATIVE.md)
+#   ./rhv kext [--native] [--no-amfi]    put RyzenHV.kext into your OpenCore EFI and set the boot-args (--native: the kext itself is the hypervisor
+#                            provider, no shim and no patched app files for Docker Desktop, see docs/NATIVE.md; --no-amfi: leave
+#                            amfi_get_out_of_my_way=0x1 out, the kext relaxes code signing for the VM client itself, Docker only)
 #   ./rhv parallels          make Parallels Desktop run through RyzenHV (and ./rhv parallels undo; ./rhv parallels check: does the installed Parallels have the code it patches?)
 #   ./rhv autostart [install|remove|status]   turn kern.hv_support on at every boot (native mode; a launchd service, needs your password once)
 #   ./rhv parallels native   the same for native mode (kext booted with --native): Apple's own Hypervisor.framework, the vendor check patched and the keyboard armed
@@ -24,6 +25,9 @@ ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 DATA="${RHV_HOME:-$HOME/.ryzenhv}"
 KDIR="$DATA/docker"
 BOOTARGS_WANTED="rhv_enable_svm=1 rhv_allow_users=1 amfi_get_out_of_my_way=0x1"
+# The kext relaxes code signing for the client process only (kext/Source/HvPatch.cpp), so Docker
+# Desktop no longer needs the AMFI boot-arg: ./rhv kext --native --no-amfi leaves it out. Parallels still
+# needs it (its stand-in library is injected with DYLD_INSERT_LIBRARIES, which AMFI otherwise refuses).
 NVRAM_GUID="7C436110-AB2A-4BBB-A880-FE41995C9F82"
 PB=/usr/libexec/PlistBuddy
 SUPPORTED_PARALLELS_BUILD=57613
@@ -67,9 +71,17 @@ doctor() {
 
     local args; args="$(nvram boot-args 2>/dev/null | sed 's/^boot-args[[:space:]]*//')"
     local missing=""
-    for b in $BOOTARGS_WANTED; do case " $args " in *" $b "*) ;; *) missing="$missing $b" ;; esac; done
+    for b in $BOOTARGS_WANTED; do
+        case " $args " in *" $b "*) ;; *)
+            if [ "$b" = "amfi_get_out_of_my_way=0x1" ]; then
+                # The kext relaxes code signing for the client process only, so Docker Desktop does not need
+                # this any more; Parallels (DYLD_INSERT_LIBRARIES) still does.
+                warn "boot-args do not contain amfi_get_out_of_my_way=0x1: fine for Docker Desktop (native), needed for Parallels"
+            else missing="$missing $b"; fi ;;
+        esac
+    done
     if "$ROOT/bin/rhv-info" hv 2>/dev/null | grep -q "front end: registered"; then ok "native front end: $("$ROOT/bin/rhv-info" hv 2>/dev/null | head -1)"; fi
-    if [ -z "$missing" ]; then ok "boot-args contain: $BOOTARGS_WANTED"
+    if [ -z "$missing" ]; then ok "boot-args contain the required RyzenHV ones"
     else bad "boot-args are missing:$missing   (fix: ./rhv kext)"; fails=$((fails+1)); fi
 
     local info rc
@@ -134,6 +146,7 @@ kext_install() {
     for a in "$@"; do
         case "$a" in
         --native) BOOTARGS_WANTED="$BOOTARGS_WANTED rhv_hv=1" ;;
+        --no-amfi) BOOTARGS_WANTED="$(printf '%s\n' "$BOOTARGS_WANTED" | sed 's/amfi_get_out_of_my_way=0x1 *//; s/ *$//')" ;;
         *) efi="$a" ;;
         esac
     done
@@ -418,6 +431,46 @@ docker_cmd() {
 }
 
 # ---------------------------------------------------------------- Docker Desktop
+# Set a boolean key in Docker Desktop's settings-store.json. That file is JSON, not a plist, and a plain
+# `plutil -replace` fails on macOS 26 (Tahoe): plutil reads the JSON through its OpenStep plist reader and
+# then cannot write it back -- "Conversion to OpenStep format is not supported" is OpenStep being the one
+# plist format CoreFoundation does not write. Edit the file as JSON with the tools that ship with macOS:
+# first osascript (JavaScript for Automation), then perl (JSON::PP is in the base system).
+json_set_bool() {                       # json_set_bool FILE KEY true|false
+    local f="$1" key="$2" val="$3" out
+    if [ "$(head -c 8 "$f" 2>/dev/null)" = "bplist00" ] || [ "$(head -c 5 "$f" 2>/dev/null)" = "<?xml" ]; then
+        plutil -convert json "$f" || return 1        # a plist from an older run: make it JSON first
+    fi
+    out="$(osascript -l JavaScript -e '
+        ObjC.import("Foundation");
+        function run(argv) {
+            const p = argv[0], k = argv[1], v = (argv[2] === "true");
+            const raw = $.NSString.stringWithContentsOfFileEncodingError(p, $.NSUTF8StringEncoding, $());
+            if (raw.isNil()) return "ERR: cannot read " + p;
+            const t = raw.js;
+            let o;
+            try { o = (t.trim() === "") ? {} : JSON.parse(t); }
+            catch (e) { return "ERR: not JSON: " + e.message; }
+            if (!o || typeof o !== "object" || Array.isArray(o)) return "ERR: not a JSON object";
+            o[k] = v;
+            const s = $.NSString.alloc.initWithUTF8String(JSON.stringify(o, null, 2) + "\n");
+            if (!s.writeToFileAtomicallyEncodingError(p, false, $.NSUTF8StringEncoding, $())) return "ERR: cannot write " + p;
+            return "OK";
+        }' "$f" "$key" "$val" 2>/dev/null)" && [ "$out" = "OK" ] && return 0
+    /usr/bin/perl -MJSON::PP -e '
+        my ($f, $k, $v) = @ARGV;
+        open(my $in, "<", $f) or die "cannot read $f: $!\n";
+        local $/; my $txt = <$in>; close $in;
+        $txt = "{}" if !defined($txt) || $txt =~ /^\s*$/;
+        my $d = JSON::PP->new->decode($txt);
+        die "not a JSON object\n" unless ref($d) eq "HASH";
+        $d->{$k} = $v eq "true" ? JSON::PP::true() : JSON::PP::false();
+        open(my $out, ">", $f) or die "cannot write $f: $!\n";
+        print $out JSON::PP->new->canonical(1)->encode($d);
+        close $out;
+    ' "$f" "$key" "$val" 2>/dev/null
+}
+
 docker_desktop() {
     local sub="${1:-setup}"
     case "$sub" in
@@ -454,7 +507,7 @@ docker_desktop() {
             "$ROOT/libexec/docker-desktop-shim.sh" status 2>/dev/null | grep -q "^installed\|half" && "$ROOT/libexec/docker-desktop-shim.sh" uninstall
             local st="$HOME/Library/Group Containers/group.com.docker/settings-store.json"
             mkdir -p "$(dirname "$st")"; [ -f "$st" ] || echo '{}' > "$st"
-            plutil -replace UseVirtualizationFramework -bool NO "$st" || die "cannot edit $st"
+            json_set_bool "$st" UseVirtualizationFramework false || die "cannot edit $st"
             ok "Docker Desktop is set to use HyperKit (UseVirtualizationFramework=false)"
             echo "Start Docker Desktop as usual. The kext fixes HyperKit's two CPU checks in memory when it starts a VM; nothing in Docker.app changes."
             echo "If something is off: rhv-info log | grep 'client fix-ups'"

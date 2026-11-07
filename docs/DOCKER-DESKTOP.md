@@ -17,7 +17,7 @@ HPET and virtio devices itself. That is exactly what the shim implements. A few 
 | HyperKit compares the guest linear address of an EPT violation with the one it decodes; AMD does not report that address | the "equal" branch of the comparison becomes unconditional, also in memory |
 | HyperKit insists on NMI-window exiting and virtual NMIs in the VMX capabilities | the shim offers both to HyperKit only and reports the NMI window as open (`rhv_vcpu_run`) |
 | the guest (Linux) trusts AMD-only CPUID bits HyperKit does not emulate: MWAITX (the delay loop takes a #UD), IBPB/IBRS (`wrmsr 0x49` is a #GP) | the shim clears them in the answers HyperKit writes (`cpuid_hyperkit_fixup`) |
-| HyperKit starts its vCPU threads concurrently and asserts that `hv_vcpu_create` returns the thread's own index | the shim reads the thread name (`vcpu:<n>`) and hands out that slot |
+| HyperKit starts its vCPU threads concurrently and asserts that `hv_vcpu_create` returns the thread's own index | the shim reads the thread name (`vcpu:<n>`) and hands out that slot; in native mode the kext parses the same name out of the caller's stack behind the `hv_vcpu_create` arguments and honours it (`rhv_vcpuhint=0` restores the old next-free-slot handout) |
 | the backend (`com.docker.backend`) quits with "Hypervisor check failed" unless `hv_vm_create()` works | the backend runs with the shim loaded too |
 
 Both patches find their place by the bytes around it (`shim/rhv_patch.c`, tested by `tests/patch_test.c`), not by an address, and are applied only when the pattern occurs exactly once; if it does not fit, HyperKit is left alone and says so in `~/.ryzenhv/hyperkit.log`. HyperKit is a copy (`com.docker.hyperkit.real`) with its bytes unchanged, ad-hoc signed with the hypervisor entitlement only: the app sandbox of
@@ -26,7 +26,9 @@ Docker's own signature would keep it away from the kext. Docker's original files
 ## Install
 
 You need the kext running (`docs/RYZENTOSH.md`, boot-args `rhv_enable_svm=1 rhv_allow_users=1 amfi_get_out_of_my_way=0x1`). AMFI has to
-be relaxed because the shim is loaded into signed, hardened Docker binaries.
+be relaxed because the shim is loaded into signed, hardened Docker binaries. In **native** mode (the kext is the hypervisor provider) none of
+this is needed: the kext relaxes code signing for the HyperKit process itself (see docs/NATIVE.md, "Without the AMFI boot-arg"),
+so `./rhv kext --native --no-amfi` boots without the AMFI boot-arg.
 
 From the release bundle:
 
@@ -44,6 +46,9 @@ What the script changes, all inside `/Applications/Docker.app` and your home fol
 - `Contents/Resources/bin/com.docker.hyperkit` becomes a wrapper; the patched binary is `com.docker.hyperkit.real`, Docker's own is `.orig`.
 - `Contents/MacOS/com.docker.backend` becomes a wrapper; Docker's binary is `com.docker.backend.real`.
 - `~/Library/Group Containers/group.com.docker/settings-store.json`: `UseVirtualizationFramework` is set to `false`.
+  That file is JSON, not a plist; it is edited with osascript/perl (`json_set_bool` in the scripts). A plain `plutil -replace`
+  fails on macOS 26 with `Conversion to OpenStep format is not supported`: plutil reads the JSON through its OpenStep plist
+  reader and OpenStep is the one plist format CoreFoundation cannot write.
 - `~/.ryzenhv/lib/libryzenhv.dylib`: the shim the wrappers load.
 
 Undo: `./rhv docker-desktop undo` (or `./scripts/docker-desktop-shim.sh uninstall`).

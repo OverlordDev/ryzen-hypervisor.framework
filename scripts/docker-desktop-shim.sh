@@ -41,6 +41,46 @@ SETTINGS="$OWNER_HOME/Library/Group Containers/group.com.docker/settings-store.j
 is_script() { [ -e "$1" ] && head -c 2 "$1" | grep -q '#!'; }
 bytes_at() { od -An -tx1 -j "$2" -N "$3" "$1" | tr -d ' \n'; }
 
+# Set a boolean key in Docker's settings-store.json. That file is JSON, not a plist, and a plain
+# `plutil -replace` fails on macOS 26 (Tahoe): plutil reads the JSON through its OpenStep plist reader
+# and then cannot write it back ("Conversion to OpenStep format is not supported" -- OpenStep is the one
+# plist format CoreFoundation does not write). Edit it as JSON: first osascript (JavaScript for
+# Automation), then perl (JSON::PP is in the base system). Same helper as in release/rhv.
+json_set_bool() {                       # json_set_bool FILE KEY true|false
+    local f="$1" key="$2" val="$3" out
+    if [ "$(head -c 8 "$f" 2>/dev/null)" = "bplist00" ] || [ "$(head -c 5 "$f" 2>/dev/null)" = "<?xml" ]; then
+        plutil -convert json "$f" || return 1        # a plist from an older run: make it JSON first
+    fi
+    out="$(osascript -l JavaScript -e '
+        ObjC.import("Foundation");
+        function run(argv) {
+            const p = argv[0], k = argv[1], v = (argv[2] === "true");
+            const raw = $.NSString.stringWithContentsOfFileEncodingError(p, $.NSUTF8StringEncoding, $());
+            if (raw.isNil()) return "ERR: cannot read " + p;
+            const t = raw.js;
+            let o;
+            try { o = (t.trim() === "") ? {} : JSON.parse(t); }
+            catch (e) { return "ERR: not JSON: " + e.message; }
+            if (!o || typeof o !== "object" || Array.isArray(o)) return "ERR: not a JSON object";
+            o[k] = v;
+            const s = $.NSString.alloc.initWithUTF8String(JSON.stringify(o, null, 2) + "\n");
+            if (!s.writeToFileAtomicallyEncodingError(p, false, $.NSUTF8StringEncoding, $())) return "ERR: cannot write " + p;
+            return "OK";
+        }' "$f" "$key" "$val" 2>/dev/null)" && [ "$out" = "OK" ] && return 0
+    /usr/bin/perl -MJSON::PP -e '
+        my ($f, $k, $v) = @ARGV;
+        open(my $in, "<", $f) or die "cannot read $f: $!\n";
+        local $/; my $txt = <$in>; close $in;
+        $txt = "{}" if !defined($txt) || $txt =~ /^\s*$/;
+        my $d = JSON::PP->new->decode($txt);
+        die "not a JSON object\n" unless ref($d) eq "HASH";
+        $d->{$k} = $v eq "true" ? JSON::PP::true() : JSON::PP::false();
+        open(my $out, ">", $f) or die "cannot write $f: $!\n";
+        print $out JSON::PP->new->canonical(1)->encode($d);
+        close $out;
+    ' "$f" "$key" "$val" 2>/dev/null
+}
+
 case "${1:-status}" in
 install)
     [ -d "$APP" ] || { echo "Docker Desktop is not installed at $APP" >&2; exit 1; }
@@ -103,7 +143,7 @@ WRAP
     # --- settings: HyperKit instead of Apple's Virtualization framework
     mkdir -p "$(dirname "$SETTINGS")"
     [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
-    plutil -replace UseVirtualizationFramework -bool NO "$SETTINGS"
+    json_set_bool "$SETTINGS" UseVirtualizationFramework false || { echo "cannot edit $SETTINGS" >&2; exit 1; }
     echo "installed: Docker Desktop in $APP now runs HyperKit through the shim"
     echo "start it as usual (Launchpad, Dock, open -a Docker)"
     ;;

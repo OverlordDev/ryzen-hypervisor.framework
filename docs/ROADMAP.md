@@ -119,11 +119,15 @@ patches the CPU-vendor check. What is missing, in the order it is worth doing:
     needs to read guest memory by virtual address. The debug build used for this (a ring of the last 400 exits with CS:RIP and registers, a ring of the last 128 traps, a probe of the guest CS at
     every entry point, `rhv-info hv flightdump`) was not kept: it has to be written again, and it should be a runtime switch so that a question does not cost a reboot.
 
-13. [ ] **Docker Desktop in native mode on macOS 26 (issue 1).** On 26.7.1 (Ryzen 9 5900X) `com.docker.hyperkit` is killed right after the kext patched it (`Code Signature Invalid`, `Invalid Page`, at an address in the
+13. [~] **Docker Desktop in native mode on macOS 26 (issue 1).** On 26.7.1 (Ryzen 9 5900X) `com.docker.hyperkit` is killed right after the kext patched it (`Code Signature Invalid`, `Invalid Page`, at an address in the
     patched page), with SIP enabled in the crash report and flags `HARD|KILL|ENFORCEMENT|REQUIRE_LV`. On the author's machine (15.8.1, `amfi_get_out_of_my_way=0x1`) HyperKit has `KILL` but no
     `ENFORCEMENT`/`HARD`. The suspected cause (not confirmed): code signing is enforced for the process because AMFI is not relaxed there (SIP on, or a setting macOS 26 ignores). 0.7.7 logs the flags before the first patch
     (`rhv-info log | grep "client fix-ups"`); the reporter was asked for `nvram boot-args` and `csrutil status`. A patch that does not invalidate the page would need another way to change HyperKit's two
     branches, or the machine must have enforcement off.
+    **Candidate fix in the tree (untested on a real machine):** the kill comes from the *process's own* flags — xnu's `cs_invalid_page()` (bsd/kern/kern_cs.c) sends the SIGKILL under `CS_KILL` and refuses the
+    page under `CS_HARD`, per process; a debugged process gets exactly those bits cleared by the kernel itself (`ptrace(PT_TRACE_ME)` → `cs_allow_invalid()`, which also sets `CS_DEBUGGED`). 0.7.9's `relaxSigning`
+    (kext/Source/HvPatch.cpp) gives the client that same per-process state in the `hv_vm_create` trap, so the patch should survive an enforced kernel without the global AMFI boot-arg; `./rhv kext --native --no-amfi`
+    installs without it. The issue can be closed when the macOS 26 reporter runs a kext with it (log line `signing of com.docker.hyperkit relaxed for this process only`) and Docker starts.
 14. [ ] **Parallels: a Windows 7 VM shows a black screen (issue 3).** Windows 10 on the same machine (5700U, Zen 2, 15.8.2) boots; Windows 7 does not. VirtualBox 7.2 runs Windows 7 there. The patch log of the
     Windows 7 start ends after `hv_vcpu_run_until is called by the monitor`: the vCPU hardly runs. The kext log of that start (ring wrapped before it was read) is needed.
 15. [ ] **Parallels: USB pass-through does not work (issue 6)**, in shim and native mode; the same scanner works in VirtualBox 7.2.22 (native). The kext does not touch USB, so the host side of Parallels

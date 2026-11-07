@@ -47,6 +47,12 @@ extern void hv_set_task_target(void *target);
 extern void hv_set_thread_target(void *target);
 extern void *hv_get_task_target(void);
 extern void *hv_get_thread_target(void);
+
+/* Note on thread names: xnu does have thread_get_thread_name(), which answers the pthread name
+ * (bsd_getthreadname(get_bsdthread_info(thread))), but no kext symbol set exports it -- config/*.exports
+ * of xnu-12377 list only thread_has_thread_name and thread_set_thread_name, and thread_info is in none
+ * either (scripts/check-kext-symbols.sh fails both against the running kernel). A kext therefore cannot
+ * read the name its caller gave itself, see the comment above tVcpuCreate. */
 }
 
 namespace {
@@ -136,6 +142,11 @@ volatile SInt32 gLiveVms = 0;
  * a Windows boot (Parallels boots in about 19 s instead of 90, VirtualBox's Windows Setup runs at all). On by default since 0.7.3; the boot-arg
  * rhv_tpr_shadow=0 or `rhv-info hv tpr 0` turns it off for the VMs created from then on. */
 volatile int gTprShadow = 1;
+
+/* The HyperKit vCPU-name hint (the comment above tVcpuCreate): the trap table parses "vcpu:<n>" out of the caller's stack
+ * behind the vcpu_create argument block and hands out that slot. On by default; the boot-arg rhv_vcpuhint=0
+ * switches it off and restores the plain next-free-slot handout. */
+volatile int gVcpuHint = 1;
 
 volatile int *gSupportPtr = nullptr;                 /* the kernel's hv_support_available once located and written */
 int gSupportSaved = 0;
@@ -408,6 +419,44 @@ kern_return_t tVmDestroy(void *target, uint64_t arg)
 
 void fpuToPage(HvVcpu *v);
 
+/* HyperKit names every vCPU thread "vcpu:<n>" before it calls hv_vcpu_create and asserts that it gets
+ * id <n> back. A thread that loses the creation race would otherwise be handed the next free slot, and
+ * HyperKit aborts right after the call (SIGABRT): observed on macOS 26.5.2 with Docker Desktop 4.97.0,
+ * where the thread "vcpu:2" received id 1, and again, deterministic, with 16 vCPUs on the same system
+ * (ROADMAP item 19 is the same abort, seen once in about six starts on an older macOS). The shim
+ * honours the contract in userland, where the name is readable (rhv_core.c asks the backend for the
+ * slot the thread name asks for); no KPI lets the trap table read the pthread name of a thread (see the
+ * note at the extern declarations above). What the trap table can read is the caller's own stack:
+ * HyperKit builds the name on the vCPU thread's stack right before the call, and the bytes sit a few
+ * words behind the pointer the vcpu_create trap already receives (26.5.2 / 4.97.0: "vcpu:2" at
+ * args+0x20, the same bytes the trap dump prints). For a HyperKit VM this front end therefore copies a
+ * small window from behind the argument pointer and parses the "vcpu:<n>" hint out of it, handing out
+ * exactly slot <n> when it is in range and free. Every other client keeps the next-free-slot behaviour,
+ * and so does HyperKit when no clear name is found (another build may keep the name elsewhere; the log
+ * says so, and the window start or size can follow). Boot-arg rhv_vcpuhint=0 switches the scan off. */
+
+/* Parses "vcpu:<n>" out of a window copied from the caller's stack behind the vcpu_create argument
+ * block: one or two digits after the colon (kMaxVcpus is 64, so a longer number is not a slot this
+ * front end hands out), the rest of the window does not matter. The bytes are untrusted user data: a
+ * match only ever selects a slot that is in range and free (checked under the VM lock), and -1 makes
+ * the caller fall back to the next free slot. */
+int vcpuNameHint(const uint8_t *w, unsigned len)
+{
+    for (unsigned i = 0; i + 7 < len; i++) {         /* room for "vcpu:" plus two digits and what ends the number */
+        if (w[i] != 'v' || w[i + 1] != 'c' || w[i + 2] != 'p' || w[i + 3] != 'u' || w[i + 4] != ':')
+            continue;
+        unsigned n = 0, digits = 0;
+        while (digits < 3 && i + 5 + digits < len && w[i + 5 + digits] >= '0' && w[i + 5 + digits] <= '9') {
+            n = n * 10 + (w[i + 5 + digits] - '0');
+            digits++;
+        }
+        if (digits == 0 || digits == 3)
+            continue;                                  /* "vcpu:", "vcpu:%d", or more digits than a slot can have */
+        return (int)n;
+    }
+    return -1;
+}
+
 kern_return_t tVcpuCreate(void *target, uint64_t arg)
 {
     note(HV_TASK_TRAP, 12, arg);
@@ -421,6 +470,15 @@ kern_return_t tVcpuCreate(void *target, uint64_t arg)
         return kHvBadArg;
     if (hv_get_thread_target())
         return kHvBusy;                              /* this thread owns a vCPU already */
+
+    /* The slot the calling thread's name asks for, -1 when there is none. Only HyperKit asserts the
+     * contract, so only its VMs are scanned; the window is the same user memory the trap log reads. */
+    int hint = -1;
+    if (vm->hyperkit && gVcpuHint && arg >= 0x1000 && arg < 0x00007fffffffffffULL && (arg & 7) == 0) {
+        uint8_t w[0x80];
+        if (copyin((user_addr_t)arg, w, sizeof(w)) == 0)
+            hint = vcpuNameHint(w, sizeof(w));
+    }
 
     if (!gSvc)
         return kHvNoDev;
@@ -440,9 +498,18 @@ kern_return_t tVcpuCreate(void *target, uint64_t arg)
         }
     }
     IOLockLock(vm->lock);
-    unsigned id = 0;
-    while (id < kMaxVcpus && vm->vcpu[id])
-        id++;
+    unsigned id;
+    bool usedHint = false, refusedHint = false;
+    if (hint >= 0 && (unsigned)hint < kMaxVcpus && !vm->vcpu[hint]) {
+        id = (unsigned)hint;                           /* the slot the thread name asks for */
+        usedHint = true;
+    } else {
+        if (hint >= 0)
+            refusedHint = true;                        /* in range but the slot is taken, or beyond kMaxVcpus */
+        id = 0;
+        while (id < kMaxVcpus && vm->vcpu[id])
+            id++;                                      /* the next free slot: no name hint to go by */
+    }
     if (id == kMaxVcpus) {
         IOLockUnlock(vm->lock);
         v->cpu->release();
@@ -463,6 +530,14 @@ kern_return_t tVcpuCreate(void *target, uint64_t arg)
     vm->vcpu[id] = v;
     vm->nVcpus++;
     IOLockUnlock(vm->lock);
+
+    if (usedHint)
+        RHV_INFO("hv front end: slot %u handed out for the name hint \"vcpu:%d\" (pid %d)", id, hint, proc_selfpid());
+    else if (refusedHint)
+        RHV_WARN("hv front end: name hint \"vcpu:%d\" not usable (slot taken or out of range), fell back to slot %u (pid %d)", hint, id,
+                 proc_selfpid());
+    else if (vm->hyperkit && gVcpuHint)
+        RHV_INFO("hv front end: no vcpu:<n> name hint behind the vcpu_create args, fell back to slot %u (pid %d)", id, proc_selfpid());
 
     uint32_t outId = id;
     if (copyout(&outId, (user_addr_t)a.idPtr, sizeof(outId))) {
@@ -1690,6 +1765,9 @@ void start(com_overlorddev_RyzenHV *service)
     uint32_t tprArg = 1;
     if (PE_parse_boot_argn("rhv_tpr_shadow", &tprArg, sizeof(tprArg)))
         gTprShadow = tprArg ? 1 : 0;
+    uint32_t hintArg = 1;
+    if (PE_parse_boot_argn("rhv_vcpuhint", &hintArg, sizeof(hintArg)))
+        gVcpuHint = hintArg ? 1 : 0;
     if (!PE_parse_boot_argn("rhv_hv", &v, sizeof(v)) || v == 0)
         return;
     if (!setMode(v))
