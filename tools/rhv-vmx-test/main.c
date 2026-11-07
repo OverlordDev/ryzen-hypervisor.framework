@@ -174,14 +174,15 @@ int main(void)
         return 1;
     }
 
-    uint64_t flags = RHV_VMCREATE_VMX, ramSize = 0;
-    uint32_t outCnt = 1;
-    kr = IOConnectCallScalarMethod(conn, kRHVMethodVmCreate, &flags, 1, &ramSize, &outCnt);
+    uint64_t flags = RHV_VMCREATE_VMX, vmOut[2] = { 0, 0 }; /* ABI 11: 2 scalars out (built-in RAM size, VM id); named vmOut: a scalar "out" is declared again further down in main() */
+    uint32_t outCnt = 2;
+    kr = IOConnectCallScalarMethod(conn, kRHVMethodVmCreate, &flags, 1, vmOut, &outCnt);
     if (kr != KERN_SUCCESS) {
         fprintf(stderr, "VmCreate(VMX) failed: 0x%x (root? rhv_enable_svm=1? ABI %d?)\n", kr, RHV_ABI_VERSION);
         return 1;
     }
-    printf("VMX-mode VM created, %" PRIu64 " KiB built-in RAM\n", ramSize / 1024);
+    uint64_t ramSize = vmOut[0];
+    printf("VMX-mode VM created, %" PRIu64 " KiB built-in RAM (VM id %" PRIu64 ")\n", ramSize / 1024, vmOut[1]);
 
     mach_vm_address_t ram = 0;
     mach_vm_size_t sz = 0;

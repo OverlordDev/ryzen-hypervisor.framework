@@ -116,10 +116,10 @@ static kern_return_t vm_reset_call(io_connect_t c, uint16_t cs, uint16_t ip)
 
 static kern_return_t vm_create_call(io_connect_t c, uint32_t flags, uint64_t *ramSize)
 {
-    uint64_t in = flags, out = 0;
-    uint32_t outCnt = 1;
-    kern_return_t kr = IOConnectCallScalarMethod(c, kRHVMethodVmCreate, &in, 1, &out, &outCnt);
-    *ramSize = out;
+    uint64_t in = flags, out[2] = { 0, 0 };   /* ABI 11: 2 scalars out (built-in RAM size, VM id) */
+    uint32_t outCnt = 2;
+    kern_return_t kr = IOConnectCallScalarMethod(c, kRHVMethodVmCreate, &in, 1, out, &outCnt);
+    *ramSize = out[0];
     return kr;
 }
 
