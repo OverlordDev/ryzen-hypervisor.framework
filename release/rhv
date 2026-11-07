@@ -503,13 +503,13 @@ docker_desktop() {
         "$ROOT/bin/rhv-info" >/dev/null 2>&1 || die "the RyzenHV kext does not answer. Run ./rhv doctor"
         pgrep -f "$DD_APP/Contents/MacOS/com.docker.backend" >/dev/null && die "quit Docker Desktop first (menu bar whale > Quit)"
         if "$ROOT/bin/rhv-info" hv 2>/dev/null | grep -q "front end: registered"; then
-            say "The kext runs as the hypervisor provider (native): Docker Desktop is used as Docker ships it."
-            "$ROOT/libexec/docker-desktop-shim.sh" status 2>/dev/null | grep -q "^installed\|half" && "$ROOT/libexec/docker-desktop-shim.sh" uninstall
-            local st="$HOME/Library/Group Containers/group.com.docker/settings-store.json"
-            mkdir -p "$(dirname "$st")"; [ -f "$st" ] || echo '{}' > "$st"
-            json_set_bool "$st" UseVirtualizationFramework false || die "cannot edit $st"
-            ok "Docker Desktop is set to use HyperKit (UseVirtualizationFramework=false)"
-            echo "Start Docker Desktop as usual. The kext fixes HyperKit's two CPU checks in memory when it starts a VM; nothing in Docker.app changes."
+            say "The kext runs as the hypervisor provider (native): HyperKit is patched on disk and re-signed, no shim, no AMFI boot-arg."
+            "$ROOT/libexec/docker-desktop-shim.sh" install-native || die "install failed. The two CPU checks must be in HyperKit's copy on disk
+for this mode; without them the kext patches HyperKit in memory, which on a kernel where the per-process signing relax does not
+decode needs amfi_get_out_of_my_way=0x1 (rhv-info log says whether it decodes). Keep the boot-arg and use install, or check
+~/.ryzenhv/hyperkit.log and rhv-info log for why the patterns did not fit."
+            ok "Docker Desktop is set to use HyperKit (UseVirtualizationFramework=false); its CPU checks are already in the copy's own bytes"
+            echo "Start Docker Desktop as usual. Nothing modifies HyperKit while it runs, so AMFI can stay on for Firefox and everything else."
             echo "If something is off: rhv-info log | grep 'client fix-ups'"
             return 0
         fi

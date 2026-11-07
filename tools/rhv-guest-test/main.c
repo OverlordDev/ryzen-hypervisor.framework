@@ -20,11 +20,15 @@
  *
  * Needs root and a kext booted with rhv_enable_svm=1:
  *     sudo ./build/rhv-guest-test
+ * When not run as root, the tool re-runs itself with sudo (in a terminal; a script only gets told the command).
  */
 #include <IOKit/IOKitLib.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../../include/RyzenHVShared.h"
 
@@ -80,8 +84,30 @@ static int call(io_connect_t conn, uint32_t sel, const char *name, const uint64_
     return 0;
 }
 
-int main(void)
+/* The kext accepts VM clients that are root, or the local console user when the kext was booted with
+ * rhv_allow_users=1 (an SSH session is neither, kext/Source/RyzenHVUserClient.cpp). This test wants
+ * root: re-run under sudo, or say the command when there is no terminal to answer the password prompt in. */
+static int need_root(char *const argv[])
 {
+    char *path = realpath(argv[0], NULL);
+    if (!path || isatty(2) == 0) {
+        fprintf(stderr, "need root: sudo %s\n", path ? path : argv[0]);
+        free(path);
+        return 1;
+    }
+    fprintf(stderr, "not root: re-running with sudo (the kext only accepts root or the local console user as a VM client)\n");
+    execlp("sudo", "sudo", path, (char *)NULL);
+    fprintf(stderr, "sudo failed (%s); run it yourself: sudo %s\n", strerror(errno), path);
+    free(path);
+    return 1;
+}
+
+int main(int argc, char **argv)
+{
+    (void)argc;
+    if (geteuid() != 0)
+        return need_root(argv);
+
     io_service_t svc = IOServiceGetMatchingService(0, IOServiceMatching(RHV_SERVICE_NAME));
     if (!svc) {
         fprintf(stderr, "RyzenHV service not found. Is the kext loaded?\n");
@@ -91,7 +117,8 @@ int main(void)
     kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
     IOObjectRelease(svc);
     if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "IOServiceOpen failed: 0x%x\n", kr);
+        fprintf(stderr, "IOServiceOpen failed: 0x%x%s\n", kr,
+                kr == kIOReturnNotPrivileged ? " (kIOReturnNotPrivileged: the kext refused this client; is rhv_allow_users=1 set and are you at the console?)" : "");
         return 1;
     }
 
@@ -102,14 +129,22 @@ int main(void)
 
     /* 1. Create the VM. Fails unless SVM is active (rhv_enable_svm=1) and we are root. */
     uint64_t createFlags = 0;     /* 0 = with the built-in 1 MiB of guest RAM */
-    uint64_t out[2] = { 0, 0 };
-    uint32_t outCnt = 1;
+    uint64_t out[2] = { 0, 0 };   /* ABI 11: 2 scalars out (built-in RAM size, VM id); the kernel's
+                                   * externalMethod check refuses fewer before the handler runs */
+    uint32_t outCnt = 2;
     kr = IOConnectCallScalarMethod(conn, kRHVMethodVmCreate, &createFlags, 1, out, &outCnt);
     if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "VmCreate failed: 0x%x (root? rhv_enable_svm=1? see `rhv-info log`)\n", kr);
+        if (kr == kIOReturnNotPrivileged)
+            fprintf(stderr, "VmCreate failed: 0x%x (kIOReturnNotPrivileged)\n"
+                            "  the kext refused this client as non-admin. Root always passes; the console user passes when the kext\n"
+                            "  was booted with rhv_allow_users=1 -- but that boot-arg covers the local console session only, not SSH.\n"
+                            "  `sudo rhv-info log | grep 'user client opened'` shows what the kext decided (admin=1 wanted).\n"
+                            "  (A rhv_enable_svm=1 problem returns a different code; see `rhv-info log` for it.)\n", kr);
+        else
+            fprintf(stderr, "VmCreate failed: 0x%x (root? rhv_enable_svm=1? see `rhv-info log`)\n", kr);
         goto done;
     }
-    printf("VM created, %" PRIu64 " KiB guest RAM\n", out[0] / 1024);
+    printf("VM created, %" PRIu64 " KiB guest RAM (VM id %" PRIu64 ")\n", out[0] / 1024, out[1]);
 
     /* 2. Map guest RAM and put the program in it. */
     kr = IOConnectMapMemory64(conn, kRHVMemGuestRam, mach_task_self(), &ram, &ramSize,

@@ -284,16 +284,36 @@ void relaxSigning(const char *name)
     if (now & kCsEnforcement)
         RHV_WARN("client fix-ups: csproc_disable_enforcement left CS_ENFORCEMENT set for %s (not the expected kernel)", name);
 
+    /* Where proc_csflags_update hides on this kernel, strongest anchor first. Every candidate is verified by
+     * effect (tryCandidate), so a wrong guess cannot damage the flags.
+     *
+     * macOS 26 note (Tahoe): the precise probe below found nothing on a 26.5.2 machine ("kernel not as expected"
+     * in the log) -- the compiler sets the CS_INVALID_ALLOWED argument up differently there, so the mov-esi probe
+     * misses. But csproc_disable_enforcement above demonstrably updated the flags on that machine (its effect is
+     * checked right before), so proc_csflags_update is among its calls, and the plain call-walks of both exported
+     * functions find it. */
     proc_csflags_update_t update = nullptr;
-    uint8_t *via = callAfterMovEsiImm(reinterpret_cast<const uint8_t *>(csproc_mark_invalid_allowed), 128, 0x20);
-    if (via) {
-        update = tryCandidate(p, via, want, now);  /* proc_csflags_update, when the kernel inlined it there */
-        if (!update) {
-            const uint8_t *cands[6];
-            unsigned n = allCalls(via, 128, cands, 6);
-            for (unsigned i = 0; i < n && !update; i++)
-                update = tryCandidate(p, const_cast<uint8_t *>(cands[i]), want, now);
+    const uint8_t *cands[6];
+    const uint8_t *anchors[2] = {
+        reinterpret_cast<const uint8_t *>(csproc_mark_invalid_allowed),
+        reinterpret_cast<const uint8_t *>(csproc_disable_enforcement),
+    };
+    for (unsigned a = 0; a < 2 && !update; a++) {
+        if (a == 0) {
+            /* The precise probe on csproc_mark_invalid_allowed first: `mov esi, CS_INVALID_ALLOWED (0x20)` followed
+             * by the call it feeds, which names proc_csflags_set or the inlined proc_csflags_update. */
+            uint8_t *via = callAfterMovEsiImm(anchors[0], 128, 0x20);
+            if (via) {
+                update = tryCandidate(p, via, want, now);   /* proc_csflags_update, when the kernel inlined it there */
+                if (update)
+                    continue;
+            }
         }
+        /* Then every call in the function's first 128 bytes, whatever the compiler did to the arguments. The
+         * mov-esi target above, when found, is among them (and is tried again harmlessly). */
+        const unsigned n = allCalls(anchors[a], 128, cands, 6);
+        for (unsigned i = 0; i < n && !update; i++)
+            update = tryCandidate(p, const_cast<uint8_t *>(cands[i]), want, now);
     }
     uint64_t done = 0;
     if (update && proc_csflags(p, &done) != 0)
