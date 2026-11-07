@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Turns kern.hv_support on by itself at every boot, so Parallels (which looks at it) and QEMU find the native front end without a manual
-# `rhv-info hv sysctl 1` after each reboot.
+# `rhv-info hv sysctl 1` after each reboot, and keeps Docker Desktop's pid files clean at boot and every 5 minutes.
 #
 #   sudo ./scripts/hv-sysctl-daemon.sh install      # a launchd daemon + a root-owned copy of rhv-info
 #   sudo ./scripts/hv-sysctl-daemon.sh remove
@@ -11,6 +11,11 @@
 # early, but not necessarily before launchd starts the daemon), then `rhv-info hv sysctl 1`, the same command you would type. That command
 # decodes the address of the kernel's hv_support variable from the kernel's own hv_get_support() and refuses if the code is not what it expects;
 # it does nothing when the kext was not booted with rhv_hv=1. The log is /var/log/ryzenhv-hvsysctl.log.
+#
+# launchd also runs the script every 5 minutes (StartInterval). Those runs only do the pid sweep and check kern.hv_support: when a HyperKit
+# was killed mid-session it cannot clean up its pid file, and the next one refuses to start with "Failed to set up pidfile" as soon as the
+# number belongs to some other process (pid numbers are reused within hours on a busy machine). Cleaning only at boot missed that window.
+# Nothing is logged when there is nothing to do.
 #
 # rhv-info is COPIED to /usr/local/libexec/ryzenhv (owned by root), not run from this checkout: a root daemon must not execute a file that a
 # normal user can replace.
@@ -43,11 +48,12 @@ install)
     cp "$SRC" "$T$LIBDIR/rhv-info"
     cat > "$T$LIBDIR/hv-sysctl.sh" <<'WRAPEND'
 #!/bin/sh
-# Installed by scripts/hv-sysctl-daemon.sh. Waits for the RyzenHV native front end, then turns kern.hv_support on.
+# Installed by scripts/hv-sysctl-daemon.sh. Turns kern.hv_support on at boot, and cleans the pid files of killed HyperKits here
+# and every 5 minutes (launchd runs this script again on StartInterval; nothing is logged when there is nothing to do).
 BIN="${RHV_BIN:-/usr/local/libexec/ryzenhv/rhv-info}"
 
-# Docker Desktop's HyperKit refuses to start ("Failed to set up pidfile") when the pid file of the previous boot is still there and its number
-# belongs to some other process now. Remove the pid files that do not name a running HyperKit.
+# Docker Desktop's HyperKit refuses to start ("Failed to set up pidfile") when the pid file of the previous run is still there and its
+# number belongs to some other process now. Remove the pid files that do not name a running HyperKit.
 for f in "${RHV_USERS_DIR:-/Users}"/*/Library/Containers/com.docker.docker/Data/vms/*/hyperkit.pid; do
     [ -f "$f" ] || continue
     pid="$(tr -dc '0-9' < "$f")"
@@ -55,18 +61,22 @@ for f in "${RHV_USERS_DIR:-/Users}"/*/Library/Containers/com.docker.docker/Data/
     rm -f "$f" && echo "$(date '+%F %T') removed the stale $f (pid ${pid:-none})"
 done
 
-i=0
-while [ "$i" -lt 90 ]; do
-    if "$BIN" hv 2>/dev/null | grep -q "front end: registered"; then
-        echo "$(date '+%F %T') front end registered, turning kern.hv_support on"
-        "$BIN" hv sysctl 1
-        echo "$(date '+%F %T') done, kern.hv_support = $(sysctl -n kern.hv_support)"
-        exit 0
-    fi
-    i=$((i + 1))
-    sleep 2
-done
-echo "$(date '+%F %T') the native front end did not register within 180 s (kext not loaded, or not booted with rhv_hv=1): kern.hv_support left alone"
+# kern.hv_support: turned on once at boot (the front end may register long after launchd starts this), and re-checked on the 5-minute
+# runs, which then exit immediately when it is already on.
+if [ "$(sysctl -n kern.hv_support 2>/dev/null)" != "1" ]; then
+    i=0
+    while [ "$i" -lt 90 ]; do
+        if "$BIN" hv 2>/dev/null | grep -q "front end: registered"; then
+            echo "$(date '+%F %T') front end registered, turning kern.hv_support on"
+            "$BIN" hv sysctl 1
+            echo "$(date '+%F %T') done, kern.hv_support = $(sysctl -n kern.hv_support)"
+            exit 0
+        fi
+        i=$((i + 1))
+        sleep 2
+    done
+    echo "$(date '+%F %T') the native front end did not register within 180 s (kext not loaded, or not booted with rhv_hv=1): kern.hv_support left alone"
+fi
 exit 0
 WRAPEND
     chmod 755 "$T$LIBDIR/rhv-info" "$T$LIBDIR/hv-sysctl.sh"
@@ -75,19 +85,21 @@ WRAPEND
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>Label</key>
-	<string>$LABEL</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>/bin/sh</string>
-		<string>$LIBDIR/hv-sysctl.sh</string>
-	</array>
-	<key>RunAtLoad</key>
-	<true/>
-	<key>StandardOutPath</key>
-	<string>$LOG</string>
-	<key>StandardErrorPath</key>
-	<string>$LOG</string>
+        <key>Label</key>
+        <string>$LABEL</string>
+        <key>ProgramArguments</key>
+        <array>
+                <string>/bin/sh</string>
+                <string>$LIBDIR/hv-sysctl.sh</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>StartInterval</key>
+        <integer>300</integer>
+        <key>StandardOutPath</key>
+        <string>$LOG</string>
+        <key>StandardErrorPath</key>
+        <string>$LOG</string>
 </dict>
 </plist>
 PLEND

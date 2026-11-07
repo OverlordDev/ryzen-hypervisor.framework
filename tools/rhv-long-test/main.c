@@ -238,13 +238,15 @@ int main(void)
         return 1;
     }
 
-    uint64_t flags = RHV_VMCREATE_VMX, ramSize = 0;
-    uint32_t cnt = 1;
-    kr = IOConnectCallScalarMethod(conn, kRHVMethodVmCreate, &flags, 1, &ramSize, &cnt);
+    uint64_t flags = RHV_VMCREATE_VMX, vmOut[2] = { 0, 0 }; /* ABI 11: 2 scalars out (built-in RAM size, VM id); named vmOut so the name "out" stays free further down in main() */
+    uint32_t cnt = 2;
+    kr = IOConnectCallScalarMethod(conn, kRHVMethodVmCreate, &flags, 1, vmOut, &cnt);
     if (kr != KERN_SUCCESS) {
         fprintf(stderr, "VmCreate failed: 0x%x (ABI %d: is the kext new enough?)\n", kr, RHV_ABI_VERSION);
         return 1;
     }
+    uint64_t ramSize = vmOut[0];
+    printf("VM created, %" PRIu64 " KiB built-in RAM (VM id %" PRIu64 ")\n", ramSize / 1024, vmOut[1]);
     mach_vm_address_t ramAddr = 0;
     mach_vm_size_t sz = 0;
     if (IOConnectMapMemory64(conn, kRHVMemGuestRam, mach_task_self(), &ramAddr, &sz, kIOMapAnywhere) != KERN_SUCCESS) {

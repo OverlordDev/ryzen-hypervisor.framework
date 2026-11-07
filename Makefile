@@ -1,7 +1,7 @@
 # Top-level build. Run on the Ryzentosh (needs Xcode command line tools).
 #
 #   make test     host-side unit tests, works on any OS with a C compiler
-#   make tools    build/rhv-info, build/rhv-guest-test, build/rhv-map-test, build/rhv-vmx-test, build/rhv-long-test, build/hvf-smoke, build/hvf-ro-map-test
+#   make tools    build/rhv-info, build/rhv-guest-test, build/rhv-map-test, build/rhv-vmx-test, build/rhv-long-test, build/rhv-hkpatch, build/hvf-smoke, build/hvf-ro-map-test
 #   make shim     build/libryzenhv.dylib
 #   make kext     build/RyzenHV.kext   (see kext/Makefile, best effort)
 #   make all      tools + shim + kext
@@ -35,6 +35,8 @@ test: | $(BUILD)
 	$(BUILD)/msr_map_test
 	$(CC) -Wall -Wextra -Werror -fsanitize=address,undefined -g -o $(BUILD)/patch_test tests/patch_test.c shim/rhv_patch.c
 	$(BUILD)/patch_test
+	$(CC) -Wall -Wextra -Werror -fsanitize=address,undefined -g -DRHV_HKPATCH_NO_MAIN -o $(BUILD)/hkpatch_test tests/hkpatch_test.c tools/rhv-hkpatch/main.c shim/rhv_patch.c
+	$(BUILD)/hkpatch_test
 	$(CC) -arch x86_64 -Wall -Wextra -Werror -Wno-nullability-completeness -fsanitize=address,undefined -g -o $(BUILD)/shim_core_test tests/shim_core_test.c shim/rhv_core.c -framework Hypervisor
 	$(BUILD)/shim_core_test
 
@@ -42,6 +44,7 @@ tools: | $(BUILD)
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-info tools/rhv-info/main.c \
 		-framework IOKit -framework CoreFoundation
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-patchcheck tools/rhv-patchcheck/main.c shim/rhv_patch.c
+	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-hkpatch tools/rhv-hkpatch/main.c shim/rhv_patch.c
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-guest-test tools/rhv-guest-test/main.c \
 		-framework IOKit -framework CoreFoundation
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-map-test tools/rhv-map-test/main.c \

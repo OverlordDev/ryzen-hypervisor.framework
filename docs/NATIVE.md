@@ -27,9 +27,49 @@ Both are single branches in HyperKit. When a process called `com.docker.hyper...
 branches **by the bytes around them** in that process's executable memory and changes them **in memory, once**
 (`kext/Source/HvPatch.cpp`). Nothing on disk changes, nothing is signed again. If the bytes are not found exactly once (another Docker
 Desktop build) the process is left alone and `rhv-info log` says so (`rhv-info log | grep "client fix-ups"`).
-This needs AMFI relaxed on the machine (`amfi_get_out_of_my_way=0x1`), like the shim. `rhv_clientpatch=0` switches the engine off.
+This needs code signing relaxed **for the client process** (0.7.9: the kext does that itself before the first patch, see below), which used to mean the global AMFI
+boot-arg (`amfi_get_out_of_my_way=0x1`). `rhv_clientpatch=0` switches the engine off.
 Before the first patch the kext logs the process's code-signing flags (`rhv-info log | grep "client fix-ups"`): `signing flags of com.docker.hyperkit: …, enforcement off` is what a machine with AMFI relaxed shows; `enforcement ON` comes with a warning, because on macOS 26.7.1 a HyperKit with enforcement on was killed (`Code Signature Invalid`) right after the patch (issue 1).
+Since 0.7.9 the kext also clears the kill state for the client itself, so the same patch survives on an enforced kernel (see "Without the AMFI boot-arg" below).
 HyperKit's CPUID answers are also cleaned of AMD-only features by the kext (only for HyperKit).
+HyperKit's vCPU threads are named "vcpu:&lt;n&gt;" before each of them calls `hv_vcpu_create`, and HyperKit asserts that the call returns that very index. Without that, a vCPU thread that loses the creation race gets the wrong id and HyperKit exits with 1 right after the call (seen on macOS 26.5.2 with 2 or more vCPUs; one vCPU always worked). The shim honours the contract in userland, where the thread name is readable: it hands the matching slot out in `rhv_vcpu_create` (shim/rhv_core.c), so Docker Desktop through the shim works with any number of vCPUs. The native front end cannot do the same: no kext symbol set exports a way to read the pthread name of a thread (`thread_info` is in none of them and neither is `thread_get_thread_name`, see kext/Source/HvFrontend.cpp), so the trap table keeps the next-free-slot behaviour and HyperKit in native mode is limited to one vCPU for now.
+
+## Without the AMFI boot-arg (0.7.9, experimental)
+
+`amfi_get_out_of_my_way=0x1` switches AMFI off for the **whole system**: no code-signing checks, no library validation, no restricted-entitlement checks, for every
+process. Docker Desktop in native mode does not need any of that — it needs exactly one thing: the two branches the kext fixes in HyperKit's memory must not get
+HyperKit killed.
+
+Why a patched page kills the process (xnu, `bsd/kern/kern_cs.c` and `osfmk/vm/vm_fault.c`): a page of a signed binary is re-validated when it is mapped writable and
+then executed again. The patched page then fails that check ("tainted"), and `cs_invalid_page()` acts on the **process's own flags**: `CS_KILL` sends the SIGKILL seen
+in issue 1, `CS_HARD` refuses the page. With both clear, the kernel only drops `CS_VALID` and the process goes on running the patched code — that is the same state
+the kernel itself gives a process being debugged (`ptrace(PT_TRACE_ME)` makes xnu call `cs_allow_invalid()`, which clears `CS_KILL`/`CS_HARD` and sets `CS_DEBUGGED`).
+
+The kext now gives the client that state itself, in its own `hv_vm_create` trap and only for the process it is about to patch (`rhv::hv::patch::relaxSigning` in
+`kext/Source/HvPatch.cpp`):
+
+- `csproc_disable_enforcement` (exported through `com.apple.kpi.private`) clears `CS_ENFORCEMENT` and the enforcement flag of the address space;
+- `CS_KILL` and `CS_HARD` are cleared through `proc_csflags_update`, which is **not** exported to kexts, so its address is decoded from the exported
+  `csproc_mark_invalid_allowed` (it calls `proc_csflags_set` right after `mov esi, CS_INVALID_ALLOWED`), and each candidate is verified by reading the flags back —
+  a wrong decode cannot remove a flag, it can at most set `CS_DEBUGGED`, the same bit a debugger sets;
+- `CS_DEBUGGED` is set with the rest, so the client is in the state xnu defines for "runs modified code".
+
+Everything else on the machine keeps full AMFI: library validation, notarization, restricted entitlements, unsigned-kext checks. That is the difference to the
+boot-arg, which disables all of it globally. On machines that run with the boot-arg anyway, nothing changes (the kext sees the flags already clear and does
+nothing).
+
+Consequences and limits:
+
+- `./rhv kext --native --no-amfi` leaves `amfi_get_out_of_my_way=0x1` out of the config.plist boot-args. `./rhv doctor` then warns about the missing AMFI
+  boot-arg only as a reminder that **Parallels** still needs it: its stand-in library is loaded with `DYLD_INSERT_LIBRARIES`, which AMFI refuses regardless of
+  the client's flags. AMFIPass.kext (the OpenCore Legacy Patcher kext, v1.4.1, in use on macOS 26) is an alternative there: it relaxes AMFI at runtime without
+  the boot-arg.
+- The client keeps running with a lost `CS_VALID` and `CS_DEBUGGED` set, like a debugged process. For HyperKit that is enough: it loads no further libraries
+  after its VM starts. Other clients with different needs were not tested.
+- The decode of `proc_csflags_update` is checked against the running kernel and refused when the code does not look as expected; the log then says so and the
+  patch behaves like 0.7.8 (boot-arg required). Tested kernels for this path: none yet beyond the sources of macOS 15.8.1 (xnu-11215) and 26.x (xnu-12377),
+  where the code has the expected shape.
+- Boot-arg `rhv_csrelax=0` switches the relaxation off (the old behavior: patch, and the client may be killed on an enforced kernel).
 
 ## Parallels in native mode (0.7.1, experimental; the keyboard and the boot service are new in 0.7.2)
 
